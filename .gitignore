@@ -1,8 +1,9 @@
 config/angel_credentials.json
-data/cache/
-data/memory/*.parquet
-data/initialized_expiries.json
-logs/*.log
+config/google_service_account.json
+.streamlit/secrets.toml
+data/*.json
+data/*.csv
+data/*.parquet
 __pycache__/
 *.pyc
-.venv/
+.env

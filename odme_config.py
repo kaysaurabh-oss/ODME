@@ -1,43 +1,25 @@
-"""Configuration for ODME Angel."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-
 APP_NAME = "ODME Angel — Options Decision & Monitoring Engine"
-BASE_DIR = Path(__file__).resolve().parent
-CONFIG_DIR = BASE_DIR / "config"
-DATA_DIR = BASE_DIR / "data"
-MEMORY_DIR = DATA_DIR / "memory"
-CACHE_DIR = DATA_DIR / "cache"
-LOG_DIR = BASE_DIR / "logs"
-CREDENTIALS_PATH = CONFIG_DIR / "angel_credentials.json"
-CREDENTIALS_TEMPLATE_PATH = CONFIG_DIR / "angel_credentials_TEMPLATE.json"
-INSTRUMENT_CACHE_PATH = CACHE_DIR / "angel_instruments.parquet"
-INIT_REGISTRY_PATH = DATA_DIR / "initialized_expiries.json"
-REFRESH_MINUTES = 60
 
-NSE_INDEX_UNDERLYINGS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
-MCX_UNDERLYINGS = [
-    "CRUDEOIL",
-    "CRUDEOILM",
-    "NATURALGAS",
-    "NATGASMINI",
-    "GOLD",
-    "GOLDM",
-    "SILVER",
-    "SILVERM",
-    "COPPER",
-    "ZINC",
+# Angel instrument master
+ANGEL_INSTRUMENT_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+
+# Supported instruments. token/exchange_token values for spot/index are intentionally optional.
+# For dashboard spot reference, app tries to infer from option chain/futures and falls back gracefully.
+NSE_INDEX_SYMBOLS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
+MCX_SYMBOLS = [
+    "CRUDEOIL", "CRUDEOILM", "NATURALGAS", "NATGASMINI",
+    "GOLD", "GOLDM", "SILVER", "SILVERM", "COPPER", "ZINC"
 ]
-ALL_UNDERLYINGS = NSE_INDEX_UNDERLYINGS + MCX_UNDERLYINGS
+SUPPORTED_INSTRUMENTS = NSE_INDEX_SYMBOLS + MCX_SYMBOLS
 
-# Default relevant range width around spot. App auto-tightens from observed strike spacing.
+# Relevant range settings around spot/future. Prevents useless far OTM max OI strikes.
 RELEVANT_RANGE_PCT = {
     "NIFTY": 0.08,
-    "BANKNIFTY": 0.08,
-    "FINNIFTY": 0.08,
-    "MIDCPNIFTY": 0.08,
+    "BANKNIFTY": 0.09,
+    "FINNIFTY": 0.09,
+    "MIDCPNIFTY": 0.10,
     "CRUDEOIL": 0.12,
     "CRUDEOILM": 0.12,
     "NATURALGAS": 0.18,
@@ -46,25 +28,37 @@ RELEVANT_RANGE_PCT = {
     "GOLDM": 0.08,
     "SILVER": 0.10,
     "SILVERM": 0.10,
-    "COPPER": 0.12,
-    "ZINC": 0.12,
+    "COPPER": 0.10,
+    "ZINC": 0.10,
 }
 
-# Used only when spot discovery from Angel index token is unavailable.
-FALLBACK_SPOT_FROM_CHAIN = True
+DEFAULT_RELEVANT_RANGE_PCT = 0.10
 
+# Hourly refresh while active. Streamlit only runs while the app is open.
+REFRESH_INTERVAL_SECONDS = 3600
 
-@dataclass(frozen=True)
-class InstrumentSpec:
-    exchange: str
-    option_exchange: str
-    instrument_type: str
+LOCAL_DATA_DIR = "data"
+LOCAL_CONFIG_PATH = "config/angel_credentials.json"
+GOOGLE_SHEET_DEFAULT_NAME = "ODME_Angel_Memory"
 
+SHEET_TABS = {
+    "initialized": "initialized_expiries",
+    "snapshots": "snapshots",
+    "chain": "chain_rows",
+}
 
-def instrument_spec(symbol: str) -> InstrumentSpec:
-    symbol = symbol.upper()
-    if symbol in NSE_INDEX_UNDERLYINGS:
-        return InstrumentSpec(exchange="NSE", option_exchange="NFO", instrument_type="OPTIDX")
-    if symbol in MCX_UNDERLYINGS:
-        return InstrumentSpec(exchange="MCX", option_exchange="MCX", instrument_type="OPTFUT")
-    raise ValueError(f"Unsupported underlying: {symbol}")
+INITIALIZED_COLUMNS = [
+    "key", "instrument", "exchange", "expiry", "initialized_at", "last_fetch_at",
+    "option_count", "usable_oi_count", "status", "notes"
+]
+
+SNAPSHOT_COLUMNS = [
+    "snapshot_id", "key", "ts", "instrument", "exchange", "expiry", "spot", "future",
+    "source", "chain_rows", "usable_oi_count", "notes"
+]
+
+CHAIN_COLUMNS = [
+    "snapshot_id", "key", "ts", "instrument", "exchange", "expiry", "symbol", "token",
+    "option_type", "strike", "ltp", "oi", "volume", "open", "high", "low", "close",
+    "bid", "ask", "feed_time", "trade_time"
+]

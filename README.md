@@ -1,22 +1,21 @@
 # ODME Angel — Options Decision & Monitoring Engine
 
-Fresh Streamlit app using **Angel One SmartAPI only**. There is no NSE scraping in this app.
+Angel SmartAPI-only Streamlit app for option-chain decisioning and monitoring. No NSE scraping.
 
 ## What this app does
 
-- Login screen asks only for the current Angel TOTP.
-- API key, client ID and PIN are stored locally in `config/angel_credentials.json`.
+- Page 1 asks only for current Angel TOTP.
+- API key, Client ID and PIN are read from Streamlit Secrets for URL deployment, or from local `config/angel_credentials.json`.
 - Loads Angel instrument master.
-- Supports NSE index options and MCX options:
-  - `NIFTY`, `BANKNIFTY`, `FINNIFTY`, `MIDCPNIFTY`
-  - `CRUDEOIL`, `CRUDEOILM`, `NATURALGAS`, `NATGASMINI`, `GOLD`, `GOLDM`, `SILVER`, `SILVERM`, `COPPER`, `ZINC`
-- User selects expiry from Angel master.
-- User clicks **Initialize Expiry** once for a new instrument + expiry.
-- The app saves full option-chain snapshots locally by instrument + expiry.
-- On future launches, it appends fresh snapshots and analyzes cumulative memory, not only the latest chain.
-- MCX active-expiry validation is included: if the selected expiry has no usable OI, the app tells the user to select another expiry.
+- Supports NSE index options and MCX commodity options.
+- User selects instrument and expiry.
+- User initializes expiry once; app fetches full option chain and stores memory.
+- Every analysis uses cumulative saved memory for that instrument+expiry.
+- Supports Google Sheets as persistent memory for Streamlit URL deployment.
 
-## Files
+## Repository files
+
+Commit these files:
 
 ```text
 app.py
@@ -27,110 +26,84 @@ odme_config.py
 requirements.txt
 README.md
 config/angel_credentials_TEMPLATE.json
+.streamlit/secrets_TEMPLATE.toml
+.gitignore
+data/.gitkeep
 ```
 
-Runtime-created local files:
+Do not commit real credentials or local data.
+
+## Streamlit Cloud Secrets
+
+In Streamlit Cloud, go to:
 
 ```text
-config/angel_credentials.json          # you create this locally; do not share it
-data/cache/angel_instruments.parquet   # instrument master cache
-data/initialized_expiries.json         # initialized expiry registry
-data/memory/*.parquet                  # option-chain memory snapshots
+App -> Settings -> Secrets
 ```
 
-## Setup
+Paste:
 
-1. Create and activate a Python environment.
+```toml
+ANGEL_API_KEY = "your_angel_api_key"
+ANGEL_CLIENT_ID = "your_angel_client_id"
+ANGEL_PIN = "your_angel_pin"
 
-```bash
-python -m venv .venv
-.venv\Scripts\activate      # Windows
-# source .venv/bin/activate  # macOS/Linux
+USE_GOOGLE_SHEETS = true
+GOOGLE_SHEET_NAME = "ODME_Angel_Memory"
+
+[gcp_service_account]
+type = "service_account"
+project_id = "your-project-id"
+private_key_id = "your-private-key-id"
+private_key = "-----BEGIN PRIVATE KEY-----\nPASTE_KEY_WITH_N_LINES\n-----END PRIVATE KEY-----\n"
+client_email = "your-service-account@your-project-id.iam.gserviceaccount.com"
+client_id = "your-client-id"
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/your-service-account%40your-project-id.iam.gserviceaccount.com"
+universe_domain = "googleapis.com"
 ```
 
-2. Install dependencies.
+## Google Sheet setup
 
-```bash
-pip install -r requirements.txt
-```
-
-3. Create credentials file.
-
-Copy:
+Create a Google Sheet named:
 
 ```text
-config/angel_credentials_TEMPLATE.json
+ODME_Angel_Memory
 ```
 
-Rename the copy to:
+Share it with the service account email, for example:
+
+```text
+your-service-account@your-project-id.iam.gserviceaccount.com
+```
+
+Give Editor access.
+
+The app will create these tabs automatically if missing:
+
+1. `initialized_expiries`
+2. `snapshots`
+3. `chain_rows`
+
+You do not need to manually create columns; the app creates them.
+
+## Local run
+
+Create this file from the template:
 
 ```text
 config/angel_credentials.json
 ```
 
-Fill it like this:
-
-```json
-{
-  "api_key": "YOUR_ANGEL_API_KEY",
-  "client_id": "YOUR_ANGEL_CLIENT_ID",
-  "pin": "YOUR_ANGEL_PIN"
-}
-```
-
-Do not enter or share these credentials in chat.
-
-4. Run the app.
+Then run:
 
 ```bash
+pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Daily workflow
+## Important note
 
-1. Open the app.
-2. Enter only current Angel TOTP on Page 1.
-3. Select instrument and expiry.
-4. If not initialized, click **Initialize Expiry**.
-5. Thereafter, the app uses local memory and appends fresh Angel snapshots roughly hourly while active.
-6. If Streamlit is closed, nothing runs in the background. On next launch, the app fetches the latest snapshot and appends it.
-7. Memory resets only when you initialize/reset a new expiry.
-
-## ODME logic included
-
-The engine uses cumulative memory and evaluates:
-
-- Tradable Option POC using combined CE + PE OI inside relevant range around spot/future.
-- Raw full-chain max OI is shown only as background, not used for strike decision.
-- HVN / friction and LVN / vacuum strikes.
-- CE wall and PE wall using a weighted score:
-  - current OI
-  - cumulative OI buildup from initialization
-  - volume
-  - persistence across snapshots
-  - proximity to spot
-- Wall migration:
-  - CE wall higher/lower/stable
-  - PE wall higher/lower/stable
-  - POC higher/lower/stable
-  - range narrowing/widening/stable
-- Matrix logic on key strikes:
-  - OI up + premium up = fresh buying / stress
-  - OI up + premium down = writing / control
-  - OI down + premium up = writer covering / failure risk
-  - OI down + premium down = long liquidation / interest fading
-
-Dashboard decision outputs:
-
-- `BULLISH POSITIONING`
-- `BEARISH POSITIONING`
-- `RANGE-BOUND THETA`
-- `EXPANSION / TRAP RISK`
-- `MIXED / NO CLEAN EDGE`
-
-## Important practical notes
-
-- The app estimates spot/future from option-chain parity if direct underlying LTP is unavailable. This is acceptable for ODME positioning, but for live execution you may later add a direct underlying token fetch.
-- Angel option-chain availability depends on Angel market data permission and active contracts.
-- Some MCX expiries may legitimately show zero OI; use another active expiry in that case.
-- Keep `config/angel_credentials.json` private.
+Streamlit Cloud file storage is not permanent. Use Google Sheets for persistent ODME memory.

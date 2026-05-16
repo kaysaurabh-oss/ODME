@@ -1,4 +1,3 @@
-"""Core ODME option-positioning engine."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,7 +6,11 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from odme_config import RELEVANT_RANGE_PCT
+from odme_config import DEFAULT_RELEVANT_RANGE_PCT, RELEVANT_RANGE_PCT
+
+
+def _num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").fillna(0.0)
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
@@ -19,354 +22,358 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return default
 
 
-def _nearest_step(strikes: pd.Series) -> float:
-    vals = np.sort(pd.Series(strikes).dropna().unique())
-    if len(vals) < 2:
-        return 1.0
-    diffs = np.diff(vals)
-    diffs = diffs[diffs > 0]
-    return float(np.median(diffs)) if len(diffs) else 1.0
+def infer_spot(chain: pd.DataFrame, manual_spot: float | None = None) -> float:
+    if manual_spot and manual_spot > 0:
+        return float(manual_spot)
+    df = chain.copy()
+    if df.empty:
+        return 0.0
+    df["strike"] = _num(df["strike"])
+    df["oi"] = _num(df["oi"])
+    # Practical fallback: weighted median of strikes by total OI.
+    agg = df.groupby("strike", as_index=False)["oi"].sum().sort_values("strike")
+    agg = agg[agg["oi"] > 0]
+    if agg.empty:
+        return float(df["strike"].median())
+    total = agg["oi"].sum()
+    csum = agg["oi"].cumsum()
+    return float(agg.loc[csum.ge(total / 2).idxmax(), "strike"])
 
 
-def _norm(s: pd.Series) -> pd.Series:
-    s = pd.to_numeric(s, errors="coerce").fillna(0.0)
-    mx = s.max()
-    if mx <= 0:
-        return pd.Series(0.0, index=s.index)
-    return s / mx
+def relevant_range(chain: pd.DataFrame, instrument: str, spot: float) -> Tuple[float, float]:
+    pct = RELEVANT_RANGE_PCT.get(str(instrument).upper(), DEFAULT_RELEVANT_RANGE_PCT)
+    if spot <= 0:
+        strikes = _num(chain.get("strike", pd.Series(dtype=float)))
+        if strikes.empty:
+            return 0.0, 0.0
+        return float(strikes.quantile(0.15)), float(strikes.quantile(0.85))
+    return spot * (1 - pct), spot * (1 + pct)
 
 
-def _migration(values: List[float], step: float) -> str:
-    clean = [v for v in values if v is not None and not pd.isna(v)]
-    if len(clean) < 2:
-        return "stable"
-    delta = clean[-1] - clean[0]
-    if abs(delta) < max(step * 0.75, 1e-9):
-        return "stable"
-    return "higher" if delta > 0 else "lower"
+def latest_snapshot(chain_memory: pd.DataFrame) -> pd.DataFrame:
+    if chain_memory.empty or "snapshot_id" not in chain_memory.columns:
+        return pd.DataFrame()
+    sid = chain_memory["snapshot_id"].astype(str).iloc[-1]
+    return chain_memory[chain_memory["snapshot_id"].astype(str).eq(sid)].copy()
 
 
-def _matrix_label(oi_change: float, premium_change: float) -> str:
-    if oi_change > 0 and premium_change > 0:
+def first_snapshot(chain_memory: pd.DataFrame) -> pd.DataFrame:
+    if chain_memory.empty or "snapshot_id" not in chain_memory.columns:
+        return pd.DataFrame()
+    sid = chain_memory["snapshot_id"].astype(str).iloc[0]
+    return chain_memory[chain_memory["snapshot_id"].astype(str).eq(sid)].copy()
+
+
+def build_strike_table(chain_memory: pd.DataFrame, instrument: str, manual_spot: float | None = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if chain_memory.empty:
+        return pd.DataFrame(), {"spot": 0.0, "notes": "No memory available."}
+    df = chain_memory.copy()
+    for c in ["strike", "ltp", "oi", "volume"]:
+        df[c] = _num(df.get(c, pd.Series(dtype=float)))
+    df["option_type"] = df["option_type"].astype(str).str.upper()
+    latest = latest_snapshot(df)
+    first = first_snapshot(df)
+    spot = infer_spot(latest, manual_spot)
+    lo, hi = relevant_range(latest, instrument, spot)
+    latest_rel = latest[(latest["strike"] >= lo) & (latest["strike"] <= hi)].copy()
+    first_rel = first[(first["strike"] >= lo) & (first["strike"] <= hi)].copy()
+
+    def agg_side(frame: pd.DataFrame, side: str, prefix: str) -> pd.DataFrame:
+        x = frame[frame["option_type"].eq(side)].groupby("strike", as_index=False).agg(
+            **{f"{prefix}_oi": ("oi", "sum"), f"{prefix}_ltp": ("ltp", "mean"), f"{prefix}_volume": ("volume", "sum")}
+        )
+        return x
+
+    ce_l = agg_side(latest_rel, "CE", "ce")
+    pe_l = agg_side(latest_rel, "PE", "pe")
+    ce_f = agg_side(first_rel, "CE", "first_ce")
+    pe_f = agg_side(first_rel, "PE", "first_pe")
+    strikes = pd.DataFrame({"strike": sorted(set(latest_rel["strike"].tolist()))})
+    for part in [ce_l, pe_l, ce_f, pe_f]:
+        strikes = strikes.merge(part, on="strike", how="left")
+    for c in strikes.columns:
+        if c != "strike":
+            strikes[c] = _num(strikes[c])
+
+    strikes["combined_oi"] = strikes["ce_oi"] + strikes["pe_oi"]
+    strikes["combined_volume"] = strikes["ce_volume"] + strikes["pe_volume"]
+    strikes["ce_buildup"] = strikes["ce_oi"] - strikes["first_ce_oi"]
+    strikes["pe_buildup"] = strikes["pe_oi"] - strikes["first_pe_oi"]
+    strikes["combined_buildup"] = strikes["ce_buildup"] + strikes["pe_buildup"]
+    strikes["distance_pct"] = (strikes["strike"] - spot).abs() / spot if spot else 0
+
+    persistence = df[(df["strike"] >= lo) & (df["strike"] <= hi)].copy()
+    persistence["has_oi"] = persistence["oi"] > 0
+    pers = persistence.groupby(["strike", "option_type"], as_index=False)["has_oi"].mean()
+    ce_p = pers[pers["option_type"].eq("CE")][["strike", "has_oi"]].rename(columns={"has_oi": "ce_persistence"})
+    pe_p = pers[pers["option_type"].eq("PE")][["strike", "has_oi"]].rename(columns={"has_oi": "pe_persistence"})
+    strikes = strikes.merge(ce_p, on="strike", how="left").merge(pe_p, on="strike", how="left")
+    strikes[["ce_persistence", "pe_persistence"]] = strikes[["ce_persistence", "pe_persistence"]].fillna(0)
+
+    # Normalized wall score: OI, buildup, volume, persistence, proximity.
+    def norm(col: str) -> pd.Series:
+        s = _num(strikes[col])
+        mx = s.max()
+        return s / mx if mx > 0 else s * 0
+
+    proximity = (1 - (strikes["distance_pct"] / max(strikes["distance_pct"].max(), 1e-9))).clip(0, 1)
+    strikes["ce_wall_score"] = (
+        0.38 * norm("ce_oi") + 0.22 * norm("ce_buildup").clip(lower=0) +
+        0.18 * norm("ce_volume") + 0.12 * strikes["ce_persistence"] + 0.10 * proximity
+    )
+    strikes["pe_wall_score"] = (
+        0.38 * norm("pe_oi") + 0.22 * norm("pe_buildup").clip(lower=0) +
+        0.18 * norm("pe_volume") + 0.12 * strikes["pe_persistence"] + 0.10 * proximity
+    )
+
+    meta = {"spot": spot, "range_low": lo, "range_high": hi, "latest_rows": len(latest), "relevant_rows": len(latest_rel)}
+    return strikes.sort_values("strike"), meta
+
+
+def value_area(strikes: pd.DataFrame, pct: float = 0.70) -> Tuple[float, float]:
+    if strikes.empty or strikes["combined_oi"].sum() <= 0:
+        return 0.0, 0.0
+    poc = float(strikes.sort_values("combined_oi", ascending=False).iloc[0]["strike"])
+    selected = set([poc])
+    total = strikes["combined_oi"].sum()
+    selected_oi = strikes[strikes["strike"].isin(selected)]["combined_oi"].sum()
+    ordered = strikes.copy().sort_values("strike").reset_index(drop=True)
+    idx = int(ordered.index[ordered["strike"].eq(poc)][0])
+    left, right = idx - 1, idx + 1
+    while selected_oi < total * pct and (left >= 0 or right < len(ordered)):
+        left_oi = ordered.loc[left, "combined_oi"] if left >= 0 else -1
+        right_oi = ordered.loc[right, "combined_oi"] if right < len(ordered) else -1
+        if right_oi >= left_oi:
+            selected.add(float(ordered.loc[right, "strike"])); selected_oi += max(right_oi, 0); right += 1
+        else:
+            selected.add(float(ordered.loc[left, "strike"])); selected_oi += max(left_oi, 0); left -= 1
+    return min(selected), max(selected)
+
+
+def classify_matrix(delta_oi: float, delta_premium: float) -> str:
+    if delta_oi > 0 and delta_premium > 0:
         return "fresh buying / stress"
-    if oi_change > 0 and premium_change <= 0:
+    if delta_oi > 0 and delta_premium <= 0:
         return "writing / control"
-    if oi_change <= 0 and premium_change > 0:
+    if delta_oi <= 0 and delta_premium > 0:
         return "writer covering / failure risk"
     return "long liquidation / interest fading"
 
 
-@dataclass
-class ODMEAnalysis:
-    decision: str
-    tilt: str
-    spot: float
-    poc: float
-    value_area_low: float
-    value_area_high: float
-    ce_wall: float
-    pe_wall: float
-    safer_sell_ce: float
-    safer_sell_pe: float
-    scores: Dict[str, float]
-    commentary: List[str]
-    tables: Dict[str, pd.DataFrame]
-    meta: Dict[str, Any]
+def movement(current: float, previous: float) -> str:
+    if not current or not previous:
+        return "stable"
+    diff = current - previous
+    if abs(diff) < max(current, previous) * 0.001:
+        return "stable"
+    return "higher" if diff > 0 else "lower"
 
 
-def analyze_memory(memory: pd.DataFrame, underlying: str) -> ODMEAnalysis:
-    if memory is None or memory.empty:
-        raise ValueError("No memory found. Initialize the expiry first.")
-
-    df = memory.copy()
-    required = ["snapshot_ts", "strike", "option_type", "ltp", "volume", "oi", "spot"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Memory missing required columns: {missing}")
-
-    df["snapshot_ts"] = pd.to_datetime(df["snapshot_ts"], errors="coerce", utc=True)
-    df = df.dropna(subset=["snapshot_ts", "strike", "option_type"])
-    for c in ["strike", "ltp", "volume", "oi", "spot"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    if df.empty:
-        raise ValueError("Memory has no valid option rows.")
-
-    latest_ts = df["snapshot_ts"].max()
-    first_ts = df["snapshot_ts"].min()
-    latest = df[df["snapshot_ts"].eq(latest_ts)].copy()
-    first = df[df["snapshot_ts"].eq(first_ts)].copy()
-    spot = _safe_float(latest["spot"].replace(0, np.nan).dropna().iloc[-1] if not latest["spot"].replace(0, np.nan).dropna().empty else latest["strike"].median())
-    step = _nearest_step(latest["strike"])
-
-    range_pct = RELEVANT_RANGE_PCT.get(underlying.upper(), 0.10)
-    min_width = step * 8
-    lo = min(spot * (1 - range_pct), spot - min_width)
-    hi = max(spot * (1 + range_pct), spot + min_width)
-    rel = latest[(latest["strike"] >= lo) & (latest["strike"] <= hi)].copy()
-    if rel.empty:
-        rel = latest.copy()
-
-    latest_piv = rel.pivot_table(index="strike", columns="option_type", values=["oi", "volume", "ltp"], aggfunc="sum").fillna(0.0)
-    latest_piv.columns = [f"{a}_{b}" for a, b in latest_piv.columns]
-    for col in ["oi_CE", "oi_PE", "volume_CE", "volume_PE", "ltp_CE", "ltp_PE"]:
-        if col not in latest_piv.columns:
-            latest_piv[col] = 0.0
-    latest_piv = latest_piv.reset_index()
-    latest_piv["combined_oi"] = latest_piv["oi_CE"] + latest_piv["oi_PE"]
-    latest_piv["combined_volume"] = latest_piv["volume_CE"] + latest_piv["volume_PE"]
-
-    raw_full = latest.pivot_table(index="strike", columns="option_type", values="oi", aggfunc="sum").fillna(0.0)
-    raw_full["combined_oi"] = raw_full.sum(axis=1)
-    raw_full_poc = float(raw_full["combined_oi"].idxmax()) if not raw_full.empty and raw_full["combined_oi"].max() > 0 else float("nan")
-
-    poc = float(latest_piv.loc[latest_piv["combined_oi"].idxmax(), "strike"]) if latest_piv["combined_oi"].max() > 0 else float(latest_piv["strike"].median())
-    value_low, value_high = _value_area(latest_piv, poc, target_share=0.70)
-
-    scored = _score_walls(df, latest, first, spot, step, lo, hi)
-    ce_walls = scored[(scored["option_type"] == "CE") & (scored["strike"] >= spot - step)].sort_values("wall_score", ascending=False)
-    pe_walls = scored[(scored["option_type"] == "PE") & (scored["strike"] <= spot + step)].sort_values("wall_score", ascending=False)
-    ce_wall = float(ce_walls.iloc[0]["strike"]) if not ce_walls.empty else float("nan")
-    pe_wall = float(pe_walls.iloc[0]["strike"]) if not pe_walls.empty else float("nan")
-    safer_sell_ce = _safer_strike(ce_walls, spot, step, "CE")
-    safer_sell_pe = _safer_strike(pe_walls, spot, step, "PE")
-
-    hvn, lvn = _hvn_lvn(latest_piv)
-    migrations = _migration_table(df, underlying, lo, hi, step)
-    matrix = _matrix_for_key_strikes(df, latest_ts, first_ts, key_strikes=_key_strikes(ce_walls, pe_walls, poc, value_low, value_high, spot, step))
-    scores = _decision_scores(latest_piv, matrix, migrations, spot, poc, value_low, value_high)
-    decision, tilt = _decision_from_scores(scores)
-
-    commentary = _commentary(decision, tilt, spot, poc, value_low, value_high, ce_wall, pe_wall, safer_sell_ce, safer_sell_pe, hvn, lvn, migrations, matrix, scores, step)
-
-    return ODMEAnalysis(
-        decision=decision,
-        tilt=tilt,
-        spot=spot,
-        poc=poc,
-        value_area_low=float(value_low),
-        value_area_high=float(value_high),
-        ce_wall=ce_wall,
-        pe_wall=pe_wall,
-        safer_sell_ce=safer_sell_ce,
-        safer_sell_pe=safer_sell_pe,
-        scores=scores,
-        commentary=commentary,
-        tables={
-            "latest_profile": latest_piv.sort_values("strike"),
-            "wall_scores": scored.sort_values("wall_score", ascending=False),
-            "key_matrix": matrix,
-            "hvn": hvn,
-            "lvn": lvn,
-            "migration": migrations,
-        },
-        meta={
-            "latest_snapshot": str(latest_ts),
-            "first_snapshot": str(first_ts),
-            "snapshots": int(df["snapshot_ts"].nunique()),
-            "rows": int(len(df)),
-            "strike_step": float(step),
-            "relevant_range_low": float(lo),
-            "relevant_range_high": float(hi),
-            "raw_full_chain_poc": raw_full_poc,
-        },
-    )
+def _poc_from_snapshot(frame: pd.DataFrame, instrument: str, spot: float) -> float:
+    if frame.empty:
+        return 0.0
+    lo, hi = relevant_range(frame, instrument, spot)
+    x = frame.copy()
+    x["strike"] = _num(x["strike"]); x["oi"] = _num(x["oi"])
+    x = x[(x["strike"] >= lo) & (x["strike"] <= hi)]
+    agg = x.groupby("strike", as_index=False)["oi"].sum()
+    if agg.empty or agg["oi"].max() <= 0:
+        return 0.0
+    return float(agg.sort_values("oi", ascending=False).iloc[0]["strike"])
 
 
-def _value_area(profile: pd.DataFrame, poc: float, target_share: float = 0.70) -> Tuple[float, float]:
-    p = profile[["strike", "combined_oi"]].sort_values("strike").copy()
-    if p.empty or p["combined_oi"].sum() <= 0:
-        return float(poc), float(poc)
-    total = p["combined_oi"].sum()
-    p["dist"] = (p["strike"] - poc).abs()
-    chosen = p.sort_values(["dist", "combined_oi"], ascending=[True, False]).copy()
-    chosen["cum"] = chosen["combined_oi"].cumsum()
-    selected = chosen[chosen["cum"] <= target_share * total]
-    if selected.empty:
-        selected = chosen.head(1)
-    return float(selected["strike"].min()), float(selected["strike"].max())
+def analyze_odme(chain_memory: pd.DataFrame, instrument: str, manual_spot: float | None = None) -> Dict[str, Any]:
+    strikes, meta = build_strike_table(chain_memory, instrument, manual_spot)
+    if strikes.empty:
+        return {"tilt": "MIXED / NO CLEAN EDGE", "error": "No option-chain memory available."}
 
+    spot = meta["spot"]
+    poc = float(strikes.sort_values("combined_oi", ascending=False).iloc[0]["strike"]) if strikes["combined_oi"].max() > 0 else 0.0
+    vah, val = 0.0, 0.0
+    val, vah = value_area(strikes)
 
-def _score_walls(df: pd.DataFrame, latest: pd.DataFrame, first: pd.DataFrame, spot: float, step: float, lo: float, hi: float) -> pd.DataFrame:
-    rel_latest = latest[(latest["strike"] >= lo) & (latest["strike"] <= hi)].copy()
-    first_key = first.groupby(["strike", "option_type"], as_index=False).agg(first_oi=("oi", "sum"), first_ltp=("ltp", "mean"))
-    latest_key = rel_latest.groupby(["strike", "option_type"], as_index=False).agg(current_oi=("oi", "sum"), volume=("volume", "sum"), ltp=("ltp", "mean"))
-    counts = df[(df["strike"] >= lo) & (df["strike"] <= hi)].groupby(["strike", "option_type"], as_index=False).agg(
-        snapshots_present=("oi", lambda s: int((s > 0).sum())), total_snapshots=("snapshot_ts", "nunique")
-    )
-    out = latest_key.merge(first_key, on=["strike", "option_type"], how="left").merge(counts, on=["strike", "option_type"], how="left")
-    out["first_oi"] = out["first_oi"].fillna(0)
-    out["buildup"] = (out["current_oi"] - out["first_oi"]).clip(lower=0)
-    out["persistence"] = (out["snapshots_present"] / out["total_snapshots"].replace(0, np.nan)).fillna(0)
-    out["proximity"] = 1 / (1 + ((out["strike"] - spot).abs() / max(step, 1.0)))
-    out["wall_score"] = (
-        0.36 * _norm(out["current_oi"])
-        + 0.24 * _norm(out["buildup"])
-        + 0.16 * _norm(out["volume"])
-        + 0.14 * out["persistence"]
-        + 0.10 * out["proximity"]
-    ) * 100
-    return out
+    ce_candidates = strikes[strikes["strike"] >= spot].sort_values("ce_wall_score", ascending=False).head(3)
+    pe_candidates = strikes[strikes["strike"] <= spot].sort_values("pe_wall_score", ascending=False).head(3)
+    ce_wall = float(ce_candidates.iloc[0]["strike"]) if not ce_candidates.empty else 0.0
+    pe_wall = float(pe_candidates.iloc[0]["strike"]) if not pe_candidates.empty else 0.0
+    safer_ce = float(ce_candidates.sort_values("strike", ascending=False).iloc[0]["strike"]) if not ce_candidates.empty else 0.0
+    safer_pe = float(pe_candidates.sort_values("strike", ascending=True).iloc[0]["strike"]) if not pe_candidates.empty else 0.0
 
+    first = first_snapshot(chain_memory)
+    latest = latest_snapshot(chain_memory)
+    previous = pd.DataFrame()
+    if "snapshot_id" in chain_memory.columns:
+        ids = chain_memory["snapshot_id"].astype(str).drop_duplicates().tolist()
+        if len(ids) >= 2:
+            previous = chain_memory[chain_memory["snapshot_id"].astype(str).eq(ids[-2])].copy()
+    prev_spot = infer_spot(previous, None) if not previous.empty else spot
+    prev_poc = _poc_from_snapshot(previous, instrument, prev_spot) if not previous.empty else poc
+    poc_move = movement(poc, prev_poc)
 
-def _safer_strike(walls: pd.DataFrame, spot: float, step: float, side: str) -> float:
-    if walls.empty:
-        return float("nan")
-    if side == "CE":
-        candidates = walls[walls["strike"] >= spot + 2 * step].sort_values(["strike", "wall_score"], ascending=[True, False])
+    # Wall migration uses previous scoring snapshot approximated by previous rows.
+    prev_strikes, _ = build_strike_table(pd.concat([first, previous], ignore_index=True), instrument, prev_spot) if not previous.empty else (strikes, meta)
+    prev_ce_wall = 0.0
+    prev_pe_wall = 0.0
+    if not prev_strikes.empty:
+        pc = prev_strikes[prev_strikes["strike"] >= prev_spot].sort_values("ce_wall_score", ascending=False).head(1)
+        pp = prev_strikes[prev_strikes["strike"] <= prev_spot].sort_values("pe_wall_score", ascending=False).head(1)
+        prev_ce_wall = float(pc.iloc[0]["strike"]) if not pc.empty else ce_wall
+        prev_pe_wall = float(pp.iloc[0]["strike"]) if not pp.empty else pe_wall
+
+    ce_move = movement(ce_wall, prev_ce_wall)
+    pe_move = movement(pe_wall, prev_pe_wall)
+    range_width = ce_wall - pe_wall if ce_wall and pe_wall else 0
+    prev_width = prev_ce_wall - prev_pe_wall if prev_ce_wall and prev_pe_wall else range_width
+    if abs(range_width - prev_width) < max(range_width, prev_width, 1) * 0.01:
+        range_move = "stable"
     else:
-        candidates = walls[walls["strike"] <= spot - 2 * step].sort_values(["strike", "wall_score"], ascending=[False, False])
-    if candidates.empty:
-        return float(walls.iloc[0]["strike"])
-    top = candidates.sort_values("wall_score", ascending=False).head(5)
-    # Choose a strong but slightly safer wall, not blindly the farthest strike.
-    return float(top.iloc[0]["strike"])
+        range_move = "widening" if range_width > prev_width else "narrowing"
 
+    # Key-strike matrix.
+    key_strikes = sorted(set(
+        ce_candidates["strike"].astype(float).tolist() + pe_candidates["strike"].astype(float).tolist() +
+        [poc, val, vah] + _atm_nearby_strikes(strikes, spot, count=2)
+    ))
+    matrix_rows = []
+    first_key = first.copy(); latest_key = latest.copy()
+    for k in key_strikes:
+        for side in ["CE", "PE"]:
+            f = first_key[(pd.to_numeric(first_key["strike"], errors="coerce").eq(k)) & (first_key["option_type"].astype(str).str.upper().eq(side))]
+            l = latest_key[(pd.to_numeric(latest_key["strike"], errors="coerce").eq(k)) & (latest_key["option_type"].astype(str).str.upper().eq(side))]
+            if l.empty:
+                continue
+            doi = _safe_float(l["oi"].sum()) - _safe_float(f["oi"].sum() if not f.empty else 0)
+            dltp = _safe_float(l["ltp"].mean()) - _safe_float(f["ltp"].mean() if not f.empty else 0)
+            matrix_rows.append({"strike": k, "side": side, "delta_oi": doi, "delta_premium": dltp, "read": classify_matrix(doi, dltp)})
+    matrix = pd.DataFrame(matrix_rows)
 
-def _hvn_lvn(profile: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    p = profile[["strike", "combined_oi", "combined_volume"]].copy()
-    if p.empty:
-        return p, p
-    q80 = p["combined_oi"].quantile(0.80)
-    q25 = p["combined_oi"].quantile(0.25)
-    hvn = p[p["combined_oi"] >= q80].sort_values("combined_oi", ascending=False).head(8)
-    lvn = p[p["combined_oi"] <= q25].sort_values("combined_oi", ascending=True).head(8)
-    return hvn, lvn
+    ce_stress = _side_condition_score(matrix, "CE", ["fresh buying / stress", "writer covering / failure risk"])
+    pe_stress = _side_condition_score(matrix, "PE", ["fresh buying / stress", "writer covering / failure risk"])
+    ce_control = _side_condition_score(matrix, "CE", ["writing / control"])
+    pe_control = _side_condition_score(matrix, "PE", ["writing / control"])
 
+    above_poc = spot > poc if poc else False
+    below_poc = spot < poc if poc else False
+    stretched = abs(spot - poc) / spot > 0.025 if spot and poc else False
 
-def _migration_table(df: pd.DataFrame, underlying: str, lo: float, hi: float, step: float) -> pd.DataFrame:
-    rows = []
-    for ts, snap in df.groupby("snapshot_ts"):
-        rel = snap[(snap["strike"] >= lo) & (snap["strike"] <= hi)].copy()
-        if rel.empty:
-            continue
-        prof = rel.pivot_table(index="strike", columns="option_type", values="oi", aggfunc="sum").fillna(0.0)
-        for c in ["CE", "PE"]:
-            if c not in prof.columns:
-                prof[c] = 0.0
-        prof["combined"] = prof["CE"] + prof["PE"]
-        ce_above = prof[prof.index >= _safe_float(snap["spot"].median()) - step]
-        pe_below = prof[prof.index <= _safe_float(snap["spot"].median()) + step]
-        rows.append({
-            "snapshot_ts": ts,
-            "spot": _safe_float(snap["spot"].median()),
-            "poc": float(prof["combined"].idxmax()) if prof["combined"].max() > 0 else np.nan,
-            "ce_wall": float(ce_above["CE"].idxmax()) if not ce_above.empty and ce_above["CE"].max() > 0 else np.nan,
-            "pe_wall": float(pe_below["PE"].idxmax()) if not pe_below.empty and pe_below["PE"].max() > 0 else np.nan,
-        })
-    out = pd.DataFrame(rows).sort_values("snapshot_ts")
-    if out.empty:
-        return out
-    out.attrs["poc_migration"] = _migration(out["poc"].tolist(), step)
-    out.attrs["ce_migration"] = _migration(out["ce_wall"].tolist(), step)
-    out.attrs["pe_migration"] = _migration(out["pe_wall"].tolist(), step)
-    first_width = abs(out["ce_wall"].iloc[0] - out["pe_wall"].iloc[0]) if len(out) else np.nan
-    last_width = abs(out["ce_wall"].iloc[-1] - out["pe_wall"].iloc[-1]) if len(out) else np.nan
-    if pd.isna(first_width) or pd.isna(last_width) or abs(last_width - first_width) < step:
-        out.attrs["range_migration"] = "stable"
-    else:
-        out.attrs["range_migration"] = "widening" if last_width > first_width else "narrowing"
-    return out
+    bullish = 0
+    bearish = 0
+    range_score = 0
+    expansion = 0
 
+    bullish += 20 if pe_wall and pe_move in ["higher", "stable"] else 0
+    bullish += 18 if pe_control >= ce_control else 0
+    bullish += 15 if above_poc and poc_move in ["higher", "stable"] else 0
+    bullish += 12 if ce_move == "higher" else 0
+    bullish -= 15 if ce_stress > pe_stress else 0
 
-def _key_strikes(ce_walls: pd.DataFrame, pe_walls: pd.DataFrame, poc: float, value_low: float, value_high: float, spot: float, step: float) -> List[float]:
-    vals = []
-    vals += ce_walls.head(3)["strike"].tolist() if not ce_walls.empty else []
-    vals += pe_walls.head(3)["strike"].tolist() if not pe_walls.empty else []
-    vals += [poc, value_low, value_high]
-    vals += [round((spot + i * step) / step) * step for i in range(-2, 3)]
-    return sorted({float(v) for v in vals if v is not None and not pd.isna(v)})
+    bearish += 20 if ce_wall and ce_move in ["lower", "stable"] else 0
+    bearish += 18 if ce_control >= pe_control else 0
+    bearish += 15 if below_poc and poc_move in ["lower", "stable"] else 0
+    bearish += 12 if pe_move == "lower" else 0
+    bearish -= 15 if pe_stress > ce_stress else 0
 
+    range_score += 25 if range_move == "narrowing" else 10 if range_move == "stable" else 0
+    range_score += 20 if ce_control > 0 and pe_control > 0 else 0
+    range_score += 20 if not stretched and poc_move == "stable" else 0
+    range_score += 10 if pe_wall < spot < ce_wall else 0
 
-def _matrix_for_key_strikes(df: pd.DataFrame, latest_ts: pd.Timestamp, first_ts: pd.Timestamp, key_strikes: List[float]) -> pd.DataFrame:
-    first = df[df["snapshot_ts"].eq(first_ts)].groupby(["strike", "option_type"], as_index=False).agg(first_oi=("oi", "sum"), first_ltp=("ltp", "mean"))
-    latest = df[df["snapshot_ts"].eq(latest_ts)].groupby(["strike", "option_type"], as_index=False).agg(current_oi=("oi", "sum"), current_ltp=("ltp", "mean"), volume=("volume", "sum"))
-    out = latest.merge(first, on=["strike", "option_type"], how="left")
-    out = out[out["strike"].isin(key_strikes)].copy()
-    out["first_oi"] = out["first_oi"].fillna(0)
-    out["first_ltp"] = out["first_ltp"].fillna(out["current_ltp"])
-    out["oi_change"] = out["current_oi"] - out["first_oi"]
-    out["premium_change"] = out["current_ltp"] - out["first_ltp"]
-    out["matrix"] = [_matrix_label(a, b) for a, b in zip(out["oi_change"], out["premium_change"])]
-    return out.sort_values(["strike", "option_type"])
+    expansion += 25 if range_move == "widening" else 0
+    expansion += 25 if ce_stress > 0 and pe_stress > 0 else 0
+    expansion += 20 if stretched and poc_move != "stable" else 0
+    expansion += 15 if "failure risk" in " ".join(matrix.get("read", pd.Series(dtype=str)).astype(str).tolist()) else 0
 
+    scores = {
+        "Bullish": max(0, min(100, bullish)),
+        "Bearish": max(0, min(100, bearish)),
+        "Range": max(0, min(100, range_score)),
+        "Expansion": max(0, min(100, expansion)),
+    }
+    tilt = _decide_tilt(scores)
+    hvn = strikes.sort_values("combined_oi", ascending=False).head(5)[["strike", "combined_oi"]].to_dict("records")
+    low = strikes[strikes["combined_oi"] > 0].sort_values("combined_oi", ascending=True).head(5)[["strike", "combined_oi"]].to_dict("records")
 
-def _decision_scores(profile: pd.DataFrame, matrix: pd.DataFrame, migrations: pd.DataFrame, spot: float, poc: float, val_low: float, val_high: float) -> Dict[str, float]:
-    ce_oi = profile["oi_CE"].sum()
-    pe_oi = profile["oi_PE"].sum()
-    total = max(ce_oi + pe_oi, 1.0)
-    pcr = pe_oi / max(ce_oi, 1.0)
-    # High PE walling below + controlled CE premium tends bullish/range; high CE walling above tends bearish/range.
-    ce_control = len(matrix[(matrix["option_type"] == "CE") & (matrix["matrix"] == "writing / control")])
-    pe_control = len(matrix[(matrix["option_type"] == "PE") & (matrix["matrix"] == "writing / control")])
-    ce_stress = len(matrix[(matrix["option_type"] == "CE") & (matrix["matrix"].isin(["fresh buying / stress", "writer covering / failure risk"]))])
-    pe_stress = len(matrix[(matrix["option_type"] == "PE") & (matrix["matrix"].isin(["fresh buying / stress", "writer covering / failure risk"]))])
-    poc_mig = migrations.attrs.get("poc_migration", "stable") if migrations is not None else "stable"
-    ce_mig = migrations.attrs.get("ce_migration", "stable") if migrations is not None else "stable"
-    pe_mig = migrations.attrs.get("pe_migration", "stable") if migrations is not None else "stable"
-    range_mig = migrations.attrs.get("range_migration", "stable") if migrations is not None else "stable"
-    stretch = abs(spot - poc) / max((val_high - val_low), 1.0)
-
-    bullish = 45 + 25 * min(max((pcr - 0.8) / 0.8, -1), 1) + 6 * pe_control - 7 * pe_stress
-    bearish = 45 + 25 * min(max((1.2 - pcr) / 0.8, -1), 1) + 6 * ce_control - 7 * ce_stress
-    if poc_mig == "higher":
-        bullish += 10
-    elif poc_mig == "lower":
-        bearish += 10
-    if pe_mig == "higher":
-        bullish += 6
-    if ce_mig == "lower":
-        bearish += 6
-
-    range_score = 50 + 8 * ce_control + 8 * pe_control - 10 * (range_mig == "widening") - 8 * min(stretch, 2)
-    expansion = 30 + 10 * (range_mig == "widening") + 8 * (poc_mig != "stable") + 5 * (ce_stress + pe_stress) + 8 * min(stretch, 2)
+    commentary = build_commentary(
+        tilt, spot, poc, val, vah, ce_wall, pe_wall, safer_ce, safer_pe,
+        poc_move, ce_move, pe_move, range_move, ce_stress, pe_stress, ce_control, pe_control, stretched, hvn, low
+    )
 
     return {
-        "Bullish": float(np.clip(bullish, 0, 100)),
-        "Bearish": float(np.clip(bearish, 0, 100)),
-        "Range": float(np.clip(range_score, 0, 100)),
-        "Expansion": float(np.clip(expansion, 0, 100)),
-        "PCR_OI": float(pcr),
-        "Stretch_From_POC": float(stretch),
+        "tilt": tilt,
+        "spot": spot,
+        "poc": poc,
+        "value_area_low": val,
+        "value_area_high": vah,
+        "ce_wall": ce_wall,
+        "pe_wall": pe_wall,
+        "safer_sell_ce": safer_ce,
+        "safer_sell_pe": safer_pe,
+        "scores": scores,
+        "poc_move": poc_move,
+        "ce_wall_move": ce_move,
+        "pe_wall_move": pe_move,
+        "range_move": range_move,
+        "hvn": hvn,
+        "lvn": low,
+        "matrix": matrix,
+        "strike_table": strikes,
+        "commentary": commentary,
+        "meta": meta,
     }
 
 
-def _decision_from_scores(scores: Dict[str, float]) -> Tuple[str, str]:
-    core = {k: scores[k] for k in ["Bullish", "Bearish", "Range", "Expansion"]}
-    best = max(core, key=core.get)
-    sorted_scores = sorted(core.items(), key=lambda x: x[1], reverse=True)
-    if sorted_scores[0][1] - sorted_scores[1][1] < 7:
-        return "MIXED / NO CLEAN EDGE", "Neutral"
-    mapping = {
-        "Bullish": ("BULLISH POSITIONING", "Bullish"),
-        "Bearish": ("BEARISH POSITIONING", "Bearish"),
-        "Range": ("RANGE-BOUND THETA", "Range"),
-        "Expansion": ("EXPANSION / TRAP RISK", "Expansion"),
-    }
-    return mapping[best]
+def _atm_nearby_strikes(strikes: pd.DataFrame, spot: float, count: int = 2) -> List[float]:
+    s = strikes.copy()
+    s["dist"] = (s["strike"] - spot).abs()
+    return s.sort_values("dist").head(count * 2 + 1)["strike"].astype(float).tolist()
 
 
-def _commentary(decision, tilt, spot, poc, val_low, val_high, ce_wall, pe_wall, safer_ce, safer_pe, hvn, lvn, migrations, matrix, scores, step) -> List[str]:
-    poc_mig = migrations.attrs.get("poc_migration", "stable") if migrations is not None else "stable"
-    ce_mig = migrations.attrs.get("ce_migration", "stable") if migrations is not None else "stable"
-    pe_mig = migrations.attrs.get("pe_migration", "stable") if migrations is not None else "stable"
-    range_mig = migrations.attrs.get("range_migration", "stable") if migrations is not None else "stable"
-    hvn_txt = ", ".join([str(int(x)) if float(x).is_integer() else f"{x:.2f}" for x in hvn["strike"].head(5).tolist()]) if not hvn.empty else "not clear"
-    lvn_txt = ", ".join([str(int(x)) if float(x).is_integer() else f"{x:.2f}" for x in lvn["strike"].head(5).tolist()]) if not lvn.empty else "not clear"
-    control = matrix[matrix["matrix"].eq("writing / control")]
-    stress = matrix[matrix["matrix"].isin(["fresh buying / stress", "writer covering / failure risk"])]
-    stretched = abs(spot - poc) > max(step * 2, (val_high - val_low) * 0.45)
+def _side_condition_score(matrix: pd.DataFrame, side: str, reads: List[str]) -> float:
+    if matrix.empty:
+        return 0.0
+    x = matrix[matrix["side"].eq(side) & matrix["read"].isin(reads)]
+    return float(len(x))
 
-    lines = []
-    lines.append(f"ODME reads this expiry as {decision}. Current tilt is {tilt.lower()} with spot/future near {spot:.2f} and tradable option POC at {poc:.2f}.")
-    lines.append(f"Option POC is shifting {poc_mig}; CE wall is shifting {ce_mig}; PE wall is shifting {pe_mig}; overall range is {range_mig}.")
-    lines.append(f"Value area is {val_low:.2f} to {val_high:.2f}. HVN/friction is concentrated near {hvn_txt}. LVN/vacuum pockets are near {lvn_txt}.")
-    if not control.empty:
-        lines.append(f"Writers are controlling {len(control)} key strike-side combinations. That supports theta decay only while price stays inside value area and POC is not migrating aggressively.")
-    if not stress.empty:
-        lines.append(f"Stress/covering is visible on {len(stress)} key strike-side combinations. Do not blindly short the active wall if premium is rising with OI or writers are covering.")
-    lines.append("POC can be treated as a positioning magnet only when it is stable. Since this engine tracks migration, a moving POC should be followed, not faded aggressively.")
-    if stretched:
-        lines.append("Price is stretched from option POC. That increases snap-back risk if POC is stable, but increases trend-continuation risk if POC keeps migrating with price.")
-    lines.append(f"Strike guidance: safer Sell CE {safer_ce:.2f}, active CE wall {ce_wall:.2f}; safer Sell PE {safer_pe:.2f}, active PE wall {pe_wall:.2f}.")
-    lines.append("For chart-engine contra trades: if short CE near supply but ODME shows CE stress rising, start with the safer higher CE. Shift down only after supply confirms and ODME shows writer control/premium decay. Reverse the same logic for PE near demand.")
-    return lines
+
+def _decide_tilt(scores: Dict[str, int]) -> str:
+    ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    if not ordered or ordered[0][1] < 25:
+        return "MIXED / NO CLEAN EDGE"
+    if len(ordered) > 1 and ordered[0][1] - ordered[1][1] < 8:
+        return "MIXED / NO CLEAN EDGE"
+    top = ordered[0][0]
+    return {
+        "Bullish": "BULLISH POSITIONING",
+        "Bearish": "BEARISH POSITIONING",
+        "Range": "RANGE-BOUND THETA",
+        "Expansion": "EXPANSION / TRAP RISK",
+    }.get(top, "MIXED / NO CLEAN EDGE")
+
+
+def _fmt_level(x: float) -> str:
+    return "NA" if not x else f"{x:,.0f}"
+
+
+def build_commentary(
+    tilt: str, spot: float, poc: float, val: float, vah: float, ce_wall: float, pe_wall: float,
+    safer_ce: float, safer_pe: float, poc_move: str, ce_move: str, pe_move: str, range_move: str,
+    ce_stress: float, pe_stress: float, ce_control: float, pe_control: float, stretched: bool,
+    hvn: List[Dict[str, Any]], lvn: List[Dict[str, Any]]
+) -> str:
+    hvn_txt = ", ".join(_fmt_level(_safe_float(r.get("strike"))) for r in hvn[:5]) or "NA"
+    lvn_txt = ", ".join(_fmt_level(_safe_float(r.get("strike"))) for r in lvn[:5]) or "NA"
+    control_txt = "CE writers look more in control." if ce_control > pe_control else "PE writers look more in control." if pe_control > ce_control else "Both sides show similar writer control."
+    stress_txt = "Call-side stress is rising." if ce_stress > pe_stress else "Put-side stress is rising." if pe_stress > ce_stress else "No clear one-sided stress is visible."
+    poc_txt = "POC is stable, so it can act as a positioning magnet." if poc_move == "stable" else f"POC is migrating {poc_move}; avoid fading aggressively against that migration."
+    stretch_txt = "Price is stretched from option POC." if stretched else "Price is not materially stretched from option POC."
+    return (
+        f"ODME reads the market as {tilt}. Spot/future proxy is near {_fmt_level(spot)} and tradable option POC is {_fmt_level(poc)}. "
+        f"Value area is roughly {_fmt_level(val)}–{_fmt_level(vah)}. {poc_txt} {stretch_txt}\n\n"
+        f"CE wall is {_fmt_level(ce_wall)} and has shifted {ce_move}; PE wall is {_fmt_level(pe_wall)} and has shifted {pe_move}. "
+        f"The option range is {range_move}. {control_txt} {stress_txt}\n\n"
+        f"HVN/friction zones: {hvn_txt}. LVN/vacuum zones: {lvn_txt}. "
+        f"Strike guidance: safer Sell CE around {_fmt_level(safer_ce)}, active CE wall {_fmt_level(ce_wall)}; "
+        f"safer Sell PE around {_fmt_level(safer_pe)}, active PE wall {_fmt_level(pe_wall)}. "
+        f"If chart engine gives a contra short CE near supply while ODME still shows call stress, prefer safer higher CE first. "
+        f"Shift down only after writer control and premium decay show up. Reverse the same logic for PE near demand."
+    )

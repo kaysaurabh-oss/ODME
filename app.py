@@ -1,261 +1,247 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 import pandas as pd
 import streamlit as st
 
-from angel_connector import AngelConfigError, AngelConnector
-from data_store import (
-    append_snapshot,
-    is_initialized,
-    list_initialized,
-    load_memory,
-    register_initialized,
-    reset_memory,
-    should_refresh,
-)
-from odme_config import APP_NAME, ALL_UNDERLYINGS, REFRESH_MINUTES
-from odme_engine import analyze_memory
+from angel_connector import AngelConnector, load_angel_credentials
+from data_store import get_store, make_key, make_snapshot_id, utc_now_iso
+from odme_config import APP_NAME, MCX_SYMBOLS, REFRESH_INTERVAL_SECONDS, SUPPORTED_INSTRUMENTS
+from odme_engine import analyze_odme
 
-st.set_page_config(page_title="ODME Angel", page_icon="📈", layout="wide")
+st.set_page_config(page_title="ODME Angel", layout="wide")
 
 
-def css() -> None:
-    st.markdown(
-        """
-<style>
-.block-container {padding-top: 1.4rem; padding-bottom: 2rem;}
-.metric-card {border:1px solid rgba(128,128,128,0.22); border-radius:16px; padding:14px 16px; background:rgba(128,128,128,0.06);}
-.good {color:#0a8f3c; font-weight:700;}
-.bad {color:#c62828; font-weight:700;}
-.warn {color:#b26a00; font-weight:700;}
-.small {font-size:0.85rem; opacity:0.8;}
-</style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def get_connector() -> AngelConnector:
-    if "angel" not in st.session_state:
-        st.session_state.angel = AngelConnector()
-    return st.session_state.angel
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_master(force_refresh: bool = False) -> pd.DataFrame:
-    return AngelConnector.load_instrument_master(force_refresh=force_refresh)
+def init_session() -> None:
+    defaults = {
+        "logged_in": False,
+        "angel": None,
+        "master": None,
+        "last_refresh_by_key": {},
+        "login_error": "",
+    }
+    for k, v in defaults.items():
+        st.session_state.setdefault(k, v)
 
 
 def login_page() -> None:
     st.title(APP_NAME)
     st.subheader("Angel login")
-    st.caption("Only current Angel TOTP is entered here. API key, client ID and PIN are read from local config/angel_credentials.json.")
+    st.info("Enter only the current Angel TOTP. API key, Client ID and PIN are read from Streamlit Secrets or local config.")
 
-    try:
-        connector = get_connector()
-    except AngelConfigError as e:
-        st.error(str(e))
-        st.code('Copy config/angel_credentials_TEMPLATE.json to config/angel_credentials.json and fill it locally.', language="text")
-        st.stop()
+    with st.form("login_form"):
+        totp = st.text_input("Current Angel TOTP", type="password", max_chars=8)
+        submitted = st.form_submit_button("Login")
 
-    with st.form("login_form", clear_on_submit=False):
-        totp = st.text_input("Current Angel TOTP", type="password", placeholder="6-digit TOTP")
-        submitted = st.form_submit_button("Login", type="primary")
     if submitted:
         try:
-            with st.spinner("Logging in to Angel SmartAPI..."):
-                info = connector.login(totp)
-                st.session_state.logged_in = True
-                st.session_state.client_id = info.get("client_id")
-            st.success("Angel login successful.")
+            creds = load_angel_credentials()
+            angel = AngelConnector(creds)
+            angel.login(totp)
+            master = angel.load_instrument_master()
+            st.session_state.logged_in = True
+            st.session_state.angel = angel
+            st.session_state.master = master
+            st.success("Angel login successful. Instrument master loaded.")
             st.rerun()
-        except Exception as e:
-            st.error(f"Login failed: {e}")
+        except Exception as exc:
+            st.session_state.login_error = str(exc)
+            st.error(str(exc))
+
+    with st.expander("Deployment check"):
+        st.markdown(
+            """
+            For URL deployment, keep real credentials only in **Streamlit Secrets**:
+
+            ```toml
+            ANGEL_API_KEY = "..."
+            ANGEL_CLIENT_ID = "..."
+            ANGEL_PIN = "..."
+            ```
+
+            For local testing, create `config/angel_credentials.json` from the template.
+            """
+        )
 
 
-def refresh_initialized(connector: AngelConnector, master: pd.DataFrame) -> None:
-    refreshed = []
-    skipped = []
-    for item in list_initialized():
-        symbol = item.get("symbol")
-        expiry = item.get("expiry")
-        if not symbol or not expiry:
-            continue
-        if should_refresh(symbol, expiry, REFRESH_MINUTES):
-            try:
-                chain, spot, meta = connector.fetch_option_chain(master, symbol, expiry)
-                append_snapshot(symbol, expiry, chain, spot)
-                refreshed.append(f"{symbol} {expiry} ({meta.get('non_zero_oi', 0)} non-zero OI)")
-            except Exception as e:
-                skipped.append(f"{symbol} {expiry}: {e}")
-    if refreshed:
-        st.toast("Refreshed: " + "; ".join(refreshed[:3]))
-    if skipped:
-        with st.expander("Some initialized expiries could not refresh", expanded=False):
-            for x in skipped:
-                st.warning(x)
+def app_header(store) -> None:
+    left, right = st.columns([3, 1])
+    with left:
+        st.title(APP_NAME)
+    with right:
+        if st.button("Logout"):
+            for k in ["logged_in", "angel", "master"]:
+                st.session_state[k] = False if k == "logged_in" else None
+            st.rerun()
+    mode = "Google Sheets" if store.__class__.__name__ == "GoogleSheetStore" else "Local files"
+    st.caption(f"Memory mode: {mode}. Streamlit refreshes only while the app is open.")
 
 
-def sidebar_controls(master: pd.DataFrame):
-    st.sidebar.header("Instrument")
-    symbol = st.sidebar.selectbox("Underlying", ALL_UNDERLYINGS, index=0)
-    expiries = AngelConnector.expiries(master, symbol)
-    if not expiries:
-        st.sidebar.error(f"No Angel expiries found for {symbol}.")
-        st.stop()
-    expiry = st.sidebar.selectbox("Expiry", expiries, index=0)
-    st.sidebar.divider()
-    force = st.sidebar.button("Force refresh selected expiry")
-    reset = st.sidebar.button("Reset selected memory", help="Deletes local memory for this instrument + expiry only.")
-    return symbol, expiry, force, reset
+def initialize_or_refresh(store, angel: AngelConnector, master: pd.DataFrame, instrument: str, expiry: str, force: bool = False) -> Optional[Dict[str, Any]]:
+    key = make_key(instrument, expiry)
+    now = datetime.now(timezone.utc)
+    last_map = st.session_state.get("last_refresh_by_key", {})
+    last = last_map.get(key)
+    if (not force) and last:
+        age = (now - last).total_seconds()
+        if age < REFRESH_INTERVAL_SECONDS:
+            return None
+
+    chain, info = angel.fetch_option_chain_snapshot(master, instrument, expiry)
+    snapshot_id = make_snapshot_id(key)
+    ts = utc_now_iso()
+    usable = int((pd.to_numeric(chain.get("oi", pd.Series(dtype=float)), errors="coerce").fillna(0) > 0).sum())
+    snapshot = {
+        "snapshot_id": snapshot_id,
+        "key": key,
+        "ts": ts,
+        "instrument": instrument,
+        "exchange": info.get("exchange", ""),
+        "expiry": expiry,
+        "spot": "",
+        "future": "",
+        "source": "Angel SmartAPI FULL",
+        "chain_rows": len(chain),
+        "usable_oi_count": usable,
+        "notes": f"unfetched={info.get('unfetched_count', 0)}",
+    }
+    store.append_snapshot(snapshot, chain)
+    status = "ACTIVE" if usable > 0 else "NO_USABLE_OI"
+    notes = "OK" if usable > 0 else "Selected expiry has no usable OI. Choose another active expiry."
+    store.upsert_initialized({
+        "key": key,
+        "instrument": instrument,
+        "exchange": info.get("exchange", ""),
+        "expiry": expiry,
+        "initialized_at": ts if not store.is_initialized(key) else "",
+        "last_fetch_at": ts,
+        "option_count": len(chain),
+        "usable_oi_count": usable,
+        "status": status,
+        "notes": notes,
+    })
+    last_map[key] = now
+    st.session_state.last_refresh_by_key = last_map
+    return {"snapshot": snapshot, "info": info, "usable": usable}
 
 
-def initialize_or_refresh(connector: AngelConnector, master: pd.DataFrame, symbol: str, expiry: str, force: bool, reset: bool) -> bool:
-    initialized = is_initialized(symbol, expiry)
-    if reset:
-        reset_memory(symbol, expiry)
-        st.warning(f"Local memory reset for {symbol} {expiry}.")
-        initialized = False
-
-    if not initialized:
-        st.info(f"{symbol} {expiry} is not initialized yet. Click Initialize Expiry to start memory from the current Angel chain.")
-        if st.button("Initialize Expiry", type="primary"):
-            try:
-                with st.spinner("Fetching full current option chain from Angel and starting memory..."):
-                    chain, spot, meta = connector.fetch_option_chain(master, symbol, expiry)
-                    non_zero = int((chain["oi"] > 0).sum())
-                    if non_zero <= 0:
-                        st.error("Selected expiry has no usable OI. Choose another active expiry.")
-                        return False
-                    rows = append_snapshot(symbol, expiry, chain, spot)
-                    register_initialized(symbol, expiry, {"spot_at_init": spot, **meta})
-                st.success(f"Initialized {symbol} {expiry}: {rows} rows saved, {non_zero} contracts with non-zero OI.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Initialization failed: {e}")
-                return False
-        return False
-
-    if force or should_refresh(symbol, expiry, REFRESH_MINUTES):
-        try:
-            with st.spinner("Fetching latest selected-expiry snapshot from Angel..."):
-                chain, spot, meta = connector.fetch_option_chain(master, symbol, expiry)
-                non_zero = int((chain["oi"] > 0).sum())
-                if non_zero <= 0:
-                    st.error("Selected expiry has no usable OI. Choose another active expiry.")
-                    return True
-                rows = append_snapshot(symbol, expiry, chain, spot)
-            st.success(f"Snapshot appended: {rows} rows, {non_zero} contracts with non-zero OI.")
-        except Exception as e:
-            st.warning(f"Refresh failed. Existing memory will still be analyzed. Error: {e}")
-    return True
-
-
-def badge(decision: str) -> str:
-    if "BULLISH" in decision:
-        return "good"
-    if "BEARISH" in decision or "TRAP" in decision:
-        return "bad"
-    if "RANGE" in decision:
-        return "warn"
-    return ""
-
-
-def render_dashboard(symbol: str, expiry: str) -> None:
-    memory = load_memory(symbol, expiry)
-    if memory.empty:
-        st.warning("No local memory found for this selection.")
+def render_dashboard(result: Dict[str, Any]) -> None:
+    if result.get("error"):
+        st.warning(result["error"])
         return
-    analysis = analyze_memory(memory, symbol)
-    st.markdown(f"## <span class='{badge(analysis.decision)}'>{analysis.decision}</span>", unsafe_allow_html=True)
-    st.caption(f"Analyzing cumulative memory for {symbol} {expiry}. Latest snapshot: {analysis.meta['latest_snapshot']}")
-
+    st.subheader(result["tilt"])
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("ODME Tilt", analysis.tilt)
-    c2.metric("Spot/Future", f"{analysis.spot:,.2f}")
-    c3.metric("Tradable Option POC", f"{analysis.poc:,.2f}")
-    c4.metric("Option Value Area", f"{analysis.value_area_low:,.2f} – {analysis.value_area_high:,.2f}")
+    c1.metric("Spot/Future Proxy", f"{result['spot']:,.2f}")
+    c2.metric("Tradable Option POC", f"{result['poc']:,.0f}", result.get("poc_move", ""))
+    c3.metric("Value Area", f"{result['value_area_low']:,.0f}–{result['value_area_high']:,.0f}")
+    c4.metric("Range", result.get("range_move", ""))
 
+    scores = result.get("scores", {})
     s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Bullish Score", f"{analysis.scores['Bullish']:.0f}")
-    s2.metric("Bearish Score", f"{analysis.scores['Bearish']:.0f}")
-    s3.metric("Range Score", f"{analysis.scores['Range']:.0f}")
-    s4.metric("Expansion Score", f"{analysis.scores['Expansion']:.0f}")
+    s1.metric("Bullish Score", scores.get("Bullish", 0))
+    s2.metric("Bearish Score", scores.get("Bearish", 0))
+    s3.metric("Range Score", scores.get("Range", 0))
+    s4.metric("Expansion Score", scores.get("Expansion", 0))
 
     g1, g2, g3, g4 = st.columns(4)
-    g1.metric("Safer Sell CE", f"{analysis.safer_sell_ce:,.2f}")
-    g2.metric("Active CE Wall", f"{analysis.ce_wall:,.2f}")
-    g3.metric("Safer Sell PE", f"{analysis.safer_sell_pe:,.2f}")
-    g4.metric("Active PE Wall", f"{analysis.pe_wall:,.2f}")
+    g1.metric("Safer Sell CE", f"{result['safer_sell_ce']:,.0f}")
+    g2.metric("Active CE Wall", f"{result['ce_wall']:,.0f}", result.get("ce_wall_move", ""))
+    g3.metric("Safer Sell PE", f"{result['safer_sell_pe']:,.0f}")
+    g4.metric("Active PE Wall", f"{result['pe_wall']:,.0f}", result.get("pe_wall_move", ""))
 
-    st.subheader("Plain-English ODME Commentary")
-    for line in analysis.commentary:
-        st.write("• " + line)
+    st.markdown("### Plain-English ODME commentary")
+    st.write(result["commentary"])
 
-    with st.expander("Profile chart: combined OI by strike", expanded=True):
-        prof = analysis.tables["latest_profile"].copy()
-        chart_df = prof.set_index("strike")[["combined_oi", "oi_CE", "oi_PE"]]
-        st.bar_chart(chart_df)
-        st.caption(f"Raw full-chain max OI background only: {analysis.meta.get('raw_full_chain_poc')}")
-
-    t1, t2 = st.tabs(["Key Strike Matrix", "Wall / HVN / LVN Details"])
-    with t1:
-        df = analysis.tables["key_matrix"].copy()
-        if not df.empty:
-            show = df[["strike", "option_type", "current_oi", "oi_change", "current_ltp", "premium_change", "volume", "matrix"]]
-            st.dataframe(show, use_container_width=True, hide_index=True)
+    tab1, tab2, tab3 = st.tabs(["Key Matrix", "Strike Table", "HVN / LVN"])
+    with tab1:
+        matrix = result.get("matrix", pd.DataFrame())
+        if matrix.empty:
+            st.info("Matrix will build after at least one saved snapshot. More useful after multiple snapshots.")
         else:
-            st.info("Not enough history for key-strike matrix yet. It becomes stronger after more snapshots.")
-    with t2:
-        st.write("Top wall scores")
-        walls = analysis.tables["wall_scores"][["strike", "option_type", "current_oi", "buildup", "volume", "persistence", "proximity", "wall_score"]].head(20)
-        st.dataframe(walls, use_container_width=True, hide_index=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.write("HVN / friction")
-            st.dataframe(analysis.tables["hvn"], use_container_width=True, hide_index=True)
-        with c2:
-            st.write("LVN / vacuum")
-            st.dataframe(analysis.tables["lvn"], use_container_width=True, hide_index=True)
+            st.dataframe(matrix, use_container_width=True, hide_index=True)
+    with tab2:
+        cols = ["strike", "combined_oi", "ce_oi", "pe_oi", "ce_buildup", "pe_buildup", "combined_volume", "ce_wall_score", "pe_wall_score"]
+        table = result.get("strike_table", pd.DataFrame())
+        st.dataframe(table[[c for c in cols if c in table.columns]].sort_values("strike"), use_container_width=True, hide_index=True)
+    with tab3:
+        st.write("HVN/friction zones")
+        st.dataframe(pd.DataFrame(result.get("hvn", [])), use_container_width=True, hide_index=True)
+        st.write("LVN/vacuum zones")
+        st.dataframe(pd.DataFrame(result.get("lvn", [])), use_container_width=True, hide_index=True)
 
-    with st.expander("Local memory status", expanded=False):
-        st.json(analysis.meta)
-        st.write(f"Snapshots saved: {memory['snapshot_ts'].nunique()} | Rows: {len(memory):,}")
+
+def main_page() -> None:
+    store = get_store()
+    app_header(store)
+    angel: AngelConnector = st.session_state.angel
+    master: pd.DataFrame = st.session_state.master
+
+    with st.sidebar:
+        st.header("Instrument")
+        instrument = st.selectbox("Select instrument", SUPPORTED_INSTRUMENTS, index=0)
+        option_rows = angel.get_option_rows(master, instrument)
+        expiries = angel.get_expiries(master, instrument)
+        if not expiries:
+            st.error("No expiries found in Angel master for this instrument.")
+            st.stop()
+        expiry = st.selectbox("Select expiry", expiries, index=0)
+        key = make_key(instrument, expiry)
+        manual_spot = st.number_input("Optional manual spot/future override", min_value=0.0, value=0.0, step=1.0)
+        st.caption(f"Contracts found: {len(option_rows[option_rows['expiry'].astype(str).eq(str(expiry))])}")
+        init = st.button("Initialize Expiry / Fetch Snapshot", type="primary")
+        refresh = st.button("Manual Refresh Snapshot")
+        st.divider()
+        st.write("Initialized expiries")
+        init_df = store.list_initialized()
+        if init_df.empty:
+            st.caption("None yet.")
+        else:
+            st.dataframe(init_df.tail(10), use_container_width=True, hide_index=True)
+
+    if init or refresh:
+        with st.spinner("Fetching Angel option-chain FULL data and saving snapshot..."):
+            try:
+                res = initialize_or_refresh(store, angel, master, instrument, expiry, force=True)
+                if res and res["usable"] > 0:
+                    st.success(f"Snapshot saved. Usable OI contracts: {res['usable']}.")
+                elif res:
+                    st.warning("Snapshot saved, but this expiry has no usable OI. Select another active expiry.")
+            except Exception as exc:
+                st.error(str(exc))
+
+    # Auto hourly refresh for initialized selected key while app is active.
+    if store.is_initialized(key):
+        try:
+            auto_res = initialize_or_refresh(store, angel, master, instrument, expiry, force=False)
+            if auto_res:
+                st.toast("Hourly ODME snapshot refreshed.")
+        except Exception as exc:
+            st.warning(f"Auto refresh failed: {exc}")
+
+    st.markdown("---")
+    st.subheader(f"Selected: {instrument} / {expiry}")
+    if not store.is_initialized(key):
+        st.info("This instrument+expiry is not initialized yet. Click Initialize Expiry / Fetch Snapshot.")
+        return
+
+    chain_memory = store.load_chain_memory(key)
+    snapshots = store.load_snapshots(key)
+    if chain_memory.empty:
+        st.warning("No chain memory rows found yet. Fetch a snapshot again.")
+        return
+    st.caption(f"Memory rows: {len(chain_memory):,} | Snapshots: {len(snapshots):,}")
+    result = analyze_odme(chain_memory, instrument, manual_spot if manual_spot > 0 else None)
+    render_dashboard(result)
 
 
 def main() -> None:
-    css()
-    if not st.session_state.get("logged_in"):
+    init_session()
+    if not st.session_state.logged_in:
         login_page()
-        return
-
-    st.title(APP_NAME)
-    st.caption(f"Logged in as {st.session_state.get('client_id', 'Angel user')}. Data source: Angel SmartAPI only. No NSE scraping.")
-
-    connector = get_connector()
-    try:
-        master = load_master(force_refresh=False)
-    except Exception as e:
-        st.error(f"Could not load Angel instrument master: {e}")
-        if st.button("Retry instrument master"):
-            load_master.clear()
-            st.rerun()
-        st.stop()
-
-    refresh_initialized(connector, master)
-    symbol, expiry, force, reset = sidebar_controls(master)
-    ok = initialize_or_refresh(connector, master, symbol, expiry, force, reset)
-    if ok:
-        render_dashboard(symbol, expiry)
-
-    st.sidebar.divider()
-    if st.sidebar.button("Reload Angel instrument master"):
-        load_master.clear()
-        AngelConnector.load_instrument_master(force_refresh=True)
-        st.rerun()
-    st.sidebar.caption(f"Hourly refresh rule: app appends a new snapshot when the last saved snapshot is older than {REFRESH_MINUTES} minutes. Streamlit does not run when closed.")
+    else:
+        main_page()
 
 
 if __name__ == "__main__":
