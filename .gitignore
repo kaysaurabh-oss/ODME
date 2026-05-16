@@ -1,0 +1,8 @@
+config/angel_credentials.json
+data/cache/
+data/memory/*.parquet
+data/initialized_expiries.json
+logs/*.log
+__pycache__/
+*.pyc
+.venv/
