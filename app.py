@@ -469,15 +469,23 @@ def style_chain_table(df: pd.DataFrame, result: Dict[str, Any]):
         return "color: #777777;"
 
     styler = df.style.apply(row_style, axis=1)
+
+    def apply_element_style(styler_obj, func, subset):
+        # pandas 2.1+ uses Styler.map; older versions use Styler.applymap.
+        # Streamlit Cloud may install a pandas version where applymap is removed.
+        if hasattr(styler_obj, "map"):
+            return styler_obj.map(func, subset=subset)
+        return styler_obj.applymap(func, subset=subset)
+
     if "CE OI" in df.columns:
-        styler = styler.applymap(lambda v: oi_tint(v, "CE"), subset=["CE OI"])
+        styler = apply_element_style(styler, lambda v: oi_tint(v, "CE"), subset=["CE OI"])
     if "PE OI" in df.columns:
-        styler = styler.applymap(lambda v: oi_tint(v, "PE"), subset=["PE OI"])
+        styler = apply_element_style(styler, lambda v: oi_tint(v, "PE"), subset=["PE OI"])
     if "Combined OI" in df.columns:
-        styler = styler.applymap(combined_tint, subset=["Combined OI"])
+        styler = apply_element_style(styler, combined_tint, subset=["Combined OI"])
     for col in ["CE ΔOI", "CE ΔPrem", "PE ΔOI", "PE ΔPrem"]:
         if col in df.columns:
-            styler = styler.applymap(delta_tint, subset=[col])
+            styler = apply_element_style(styler, delta_tint, subset=[col])
     numeric_cols = [c for c in df.columns if c not in ["CE Read", "PE Read"]]
     fmt0 = {c: "{:,.0f}" for c in numeric_cols if c not in ["CE LTP", "PE LTP", "CE ΔPrem", "PE ΔPrem"]}
     fmt2 = {c: "{:,.2f}" for c in ["CE LTP", "PE LTP", "CE ΔPrem", "PE ΔPrem"] if c in df.columns}
