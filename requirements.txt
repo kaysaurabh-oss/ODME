@@ -6,3 +6,6 @@ smartapi-python>=1.5.5
 pyotp>=2.9
 gspread>=6.0
 google-auth>=2.29
+logzero>=1.7.0
+websocket-client>=1.7.0
+pycryptodome>=3.20.0
