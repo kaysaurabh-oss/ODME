@@ -718,15 +718,37 @@ def build_commentary(
     elif tilt == "BEARISH POSITIONING":
         risk_line = "Bias favours CE selling or holding bearish theta, but only while CE premium remains soft/decays and CE wall does not shift higher."
 
-    return (
-        f"ODME Verdict: {tilt}. Scores — Bullish {scores.get('Bullish', 0)}, Bearish {scores.get('Bearish', 0)}, Range {scores.get('Range', 0)}, Expansion {scores.get('Expansion', 0)}.\n\n"
-        f"What changed: {change_line}\n\n"
-        f"Positioning: spot/future proxy is {_fmt_level(spot)}. Option POC {_fmt_level(poc)}; value area {_fmt_level(val)}–{_fmt_level(vah)}. {poc_line}\n\n"
-        f"Walls: active CE wall {_fmt_level(ce_wall)} ({ce_move}); active PE wall {_fmt_level(pe_wall)} ({pe_move}); range is {range_move}.\n\n"
-        f"CE Action: {ce_line}\n\n"
-        f"PE Action: {pe_line}\n\n"
-        f"{correction_line}\n\n" if correction_line else ""
-    ) + (
-        f"Final Action: {final_action}\n\n"
-        f"Risk Note: {risk_line}"
-    )
+    # Important: keep the commentary detailed even when correction_line is blank.
+    # In the earlier build, the inline conditional accidentally suppressed all
+    # sections before Final Action when correction_line was empty.
+    quiet_market = (not first) and abs(spot_delta) <= max(spot * 0.0003, 1.0) and poc_move == "stable" and ce_move == "stable" and pe_move == "stable"
+    if quiet_market:
+        session_line = (
+            "Market/ODME change is negligible versus the last saved snapshot. Treat this as a holding/monitoring read, "
+            "not as a fresh high-conviction signal. The next live moving snapshot will become more useful once spot, OI or premiums change."
+        )
+    elif first:
+        session_line = (
+            "This is the baseline snapshot. Use it to map the live option structure; confirmation improves from the next fetch onward."
+        )
+    else:
+        session_line = (
+            "This is an active comparison against the last saved ODME snapshot; action quality depends on whether premium behaviour confirms writer control or failure."
+        )
+
+    detail_lines = [
+        f"ODME Verdict: {tilt}. Scores — Bullish {scores.get('Bullish', 0)}, Bearish {scores.get('Bearish', 0)}, Range {scores.get('Range', 0)}, Expansion {scores.get('Expansion', 0)}.",
+        f"Session Read: {session_line}",
+        f"What changed: {change_line}",
+        f"Positioning: spot/future proxy is {_fmt_level(spot)}. Option POC {_fmt_level(poc)}; value area {_fmt_level(val)}–{_fmt_level(vah)}. {poc_line}",
+        f"Walls: active CE wall {_fmt_level(ce_wall)} ({ce_move}); active PE wall {_fmt_level(pe_wall)} ({pe_move}); range is {range_move}.",
+        f"CE Action: {ce_line}",
+        f"PE Action: {pe_line}",
+    ]
+    if correction_line:
+        detail_lines.append(f"Heads-up: {correction_line}")
+    detail_lines.extend([
+        f"Final Action: {final_action}",
+        f"Risk Note: {risk_line}",
+    ])
+    return "\n\n".join(detail_lines)
