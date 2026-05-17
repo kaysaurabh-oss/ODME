@@ -7,8 +7,8 @@ import pandas as pd
 import streamlit as st
 
 from angel_connector import AngelConnector, load_angel_credentials
-from data_store import get_store, make_key, make_snapshot_id, utc_now_iso
-from odme_config import APP_NAME, MCX_SYMBOLS, REFRESH_INTERVAL_SECONDS, SUPPORTED_INSTRUMENTS
+from data_store import get_store, make_key, make_snapshot_id, parse_previous_summary, utc_now_iso
+from odme_config import APP_NAME, REFRESH_INTERVAL_SECONDS, SUPPORTED_INSTRUMENTS
 from odme_engine import analyze_odme
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
@@ -20,6 +20,7 @@ def init_session() -> None:
         "angel": None,
         "master": None,
         "last_refresh_by_key": {},
+        "last_result_by_key": {},
         "login_error": "",
     }
     for k, v in defaults.items():
@@ -50,36 +51,22 @@ def login_page() -> None:
             st.session_state.login_error = str(exc)
             st.error(str(exc))
 
-    with st.expander("Deployment check"):
-        st.markdown(
-            """
-            For URL deployment, keep real credentials only in **Streamlit Secrets**:
-
-            ```toml
-            ANGEL_API_KEY = "..."
-            ANGEL_CLIENT_ID = "..."
-            ANGEL_PIN = "..."
-            ```
-
-            For local testing, create `config/angel_credentials.json` from the template.
-            """
-        )
-
 
 def app_header(store) -> None:
     left, right = st.columns([3, 1])
     with left:
         st.title(APP_NAME)
+        st.caption("Light Google Sheets mode: live chain is fetched from Angel, only ODME summary/commentary is saved.")
     with right:
         if st.button("Logout"):
             for k in ["logged_in", "angel", "master"]:
                 st.session_state[k] = False if k == "logged_in" else None
             st.rerun()
     mode = "Google Sheets" if store.__class__.__name__ == "GoogleSheetStore" else "Local files"
-    st.caption(f"Memory mode: {mode}. Streamlit refreshes only while the app is open.")
+    st.caption(f"Memory mode: {mode}. Stored tab: odme_snapshots. Full option-chain rows are not saved.")
 
 
-def initialize_or_refresh(store, angel: AngelConnector, master: pd.DataFrame, instrument: str, expiry: str, force: bool = False) -> Optional[Dict[str, Any]]:
+def fetch_analyze_save(store, angel: AngelConnector, master: pd.DataFrame, instrument: str, expiry: str, manual_spot: Optional[float], force: bool = True) -> Optional[Dict[str, Any]]:
     key = make_key(instrument, expiry)
     now = datetime.now(timezone.utc)
     last_map = st.session_state.get("last_refresh_by_key", {})
@@ -89,45 +76,44 @@ def initialize_or_refresh(store, angel: AngelConnector, master: pd.DataFrame, in
         if age < REFRESH_INTERVAL_SECONDS:
             return None
 
+    previous_raw = store.load_latest_odme_snapshot(key)
+    previous = parse_previous_summary(previous_raw)
+
     chain, info = angel.fetch_option_chain_snapshot(master, instrument, expiry)
+    usable = int((pd.to_numeric(chain.get("oi", pd.Series(dtype=float)), errors="coerce").fillna(0) > 0).sum())
+    result = analyze_odme(chain, instrument, manual_spot if manual_spot and manual_spot > 0 else None, previous_summary=previous)
+
     snapshot_id = make_snapshot_id(key)
     ts = utc_now_iso()
-    usable = int((pd.to_numeric(chain.get("oi", pd.Series(dtype=float)), errors="coerce").fillna(0) > 0).sum())
-    snapshot = {
+    status_note = "OK" if usable > 0 else "Selected expiry has no usable OI. Choose another active expiry."
+    meta = {
         "snapshot_id": snapshot_id,
         "key": key,
         "ts": ts,
         "instrument": instrument,
         "exchange": info.get("exchange", ""),
         "expiry": expiry,
-        "spot": "",
-        "future": "",
-        "source": "Angel SmartAPI FULL",
-        "chain_rows": len(chain),
+        "source": "Angel SmartAPI FULL → ODME compact summary",
         "usable_oi_count": usable,
-        "notes": f"unfetched={info.get('unfetched_count', 0)}",
+        "notes": f"{status_note}; contracts={len(chain)}; unfetched={info.get('unfetched_count', 0)}",
     }
-    store.append_snapshot(snapshot, chain)
-    status = "ACTIVE" if usable > 0 else "NO_USABLE_OI"
-    notes = "OK" if usable > 0 else "Selected expiry has no usable OI. Choose another active expiry."
-    store.upsert_initialized({
-        "key": key,
-        "instrument": instrument,
-        "exchange": info.get("exchange", ""),
-        "expiry": expiry,
-        "initialized_at": ts if not store.is_initialized(key) else "",
-        "last_fetch_at": ts,
-        "option_count": len(chain),
-        "usable_oi_count": usable,
-        "status": status,
-        "notes": notes,
-    })
+    store.append_odme_snapshot(result, meta)
     last_map[key] = now
     st.session_state.last_refresh_by_key = last_map
-    return {"snapshot": snapshot, "info": info, "usable": usable}
+    st.session_state.last_result_by_key[key] = result
+    return {"result": result, "meta": meta, "usable": usable, "contracts": len(chain)}
 
 
-def render_dashboard(result: Dict[str, Any]) -> None:
+def _to_float(value: Any) -> float:
+    try:
+        if value is None or value == "":
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def render_live_dashboard(result: Dict[str, Any]) -> None:
     if result.get("error"):
         st.warning(result["error"])
         return
@@ -154,22 +140,53 @@ def render_dashboard(result: Dict[str, Any]) -> None:
     st.markdown("### Plain-English ODME commentary")
     st.write(result["commentary"])
 
-    tab1, tab2, tab3 = st.tabs(["Key Matrix", "Strike Table", "HVN / LVN"])
+    tab1, tab2, tab3 = st.tabs(["Compact Matrix", "Current Strike Table", "HVN / LVN"])
     with tab1:
         matrix = result.get("matrix", pd.DataFrame())
         if matrix.empty:
-            st.info("Matrix will build after at least one saved snapshot. More useful after multiple snapshots.")
+            st.info("Matrix will become meaningful from the second saved snapshot.")
         else:
             st.dataframe(matrix, use_container_width=True, hide_index=True)
     with tab2:
-        cols = ["strike", "combined_oi", "ce_oi", "pe_oi", "ce_buildup", "pe_buildup", "combined_volume", "ce_wall_score", "pe_wall_score"]
         table = result.get("strike_table", pd.DataFrame())
-        st.dataframe(table[[c for c in cols if c in table.columns]].sort_values("strike"), use_container_width=True, hide_index=True)
+        cols = ["strike", "combined_oi", "ce_oi", "pe_oi", "combined_volume", "ce_wall_score", "pe_wall_score", "ce_ltp", "pe_ltp"]
+        if table.empty:
+            st.info("No strike table available.")
+        else:
+            st.dataframe(table[[c for c in cols if c in table.columns]].sort_values("strike"), use_container_width=True, hide_index=True)
     with tab3:
         st.write("HVN/friction zones")
         st.dataframe(pd.DataFrame(result.get("hvn", [])), use_container_width=True, hide_index=True)
         st.write("LVN/vacuum zones")
         st.dataframe(pd.DataFrame(result.get("lvn", [])), use_container_width=True, hide_index=True)
+
+
+def render_saved_summary(row: Dict[str, Any]) -> None:
+    if not row:
+        st.info("No saved ODME summary yet. Fetch live snapshot first.")
+        return
+    st.subheader(row.get("odme_tilt", "Saved ODME Summary"))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Saved Spot/Future Proxy", f"{_to_float(row.get('spot')):,.2f}")
+    c2.metric("Saved Option POC", f"{_to_float(row.get('option_poc')):,.0f}", row.get("poc_shift", ""))
+    c3.metric("Saved Value Area", f"{_to_float(row.get('value_area_low')):,.0f}–{_to_float(row.get('value_area_high')):,.0f}")
+    c4.metric("Saved Range", row.get("range_shift", ""))
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Bullish Score", row.get("bullish_score", 0))
+    s2.metric("Bearish Score", row.get("bearish_score", 0))
+    s3.metric("Range Score", row.get("range_score", 0))
+    s4.metric("Expansion Score", row.get("expansion_score", 0))
+
+    g1, g2, g3, g4 = st.columns(4)
+    g1.metric("Safer Sell CE", f"{_to_float(row.get('safer_sell_ce')):,.0f}")
+    g2.metric("Active CE Wall", f"{_to_float(row.get('active_ce_wall')):,.0f}", row.get("ce_wall_shift", ""))
+    g3.metric("Safer Sell PE", f"{_to_float(row.get('safer_sell_pe')):,.0f}")
+    g4.metric("Active PE Wall", f"{_to_float(row.get('active_pe_wall')):,.0f}", row.get("pe_wall_shift", ""))
+
+    st.markdown("### Last saved commentary")
+    st.write(row.get("commentary", ""))
+    st.caption(f"Last saved at: {row.get('ts', '')}")
 
 
 def main_page() -> None:
@@ -190,50 +207,53 @@ def main_page() -> None:
         key = make_key(instrument, expiry)
         manual_spot = st.number_input("Optional manual spot/future override", min_value=0.0, value=0.0, step=1.0)
         st.caption(f"Contracts found: {len(option_rows[option_rows['expiry'].astype(str).eq(str(expiry))])}")
-        init = st.button("Initialize Expiry / Fetch Snapshot", type="primary")
-        refresh = st.button("Manual Refresh Snapshot")
+        fetch = st.button("Fetch Live + Save ODME Summary", type="primary")
+        auto_on = st.checkbox("Auto-refresh hourly while app is open", value=False)
         st.divider()
-        st.write("Initialized expiries")
+        st.write("Saved ODME summaries")
         init_df = store.list_initialized()
         if init_df.empty:
             st.caption("None yet.")
         else:
             st.dataframe(init_df.tail(10), use_container_width=True, hide_index=True)
 
-    if init or refresh:
-        with st.spinner("Fetching Angel option-chain FULL data and saving snapshot..."):
+    if fetch:
+        with st.spinner("Fetching live Angel chain, creating ODME commentary, saving compact summary..."):
             try:
-                res = initialize_or_refresh(store, angel, master, instrument, expiry, force=True)
+                res = fetch_analyze_save(store, angel, master, instrument, expiry, manual_spot, force=True)
                 if res and res["usable"] > 0:
-                    st.success(f"Snapshot saved. Usable OI contracts: {res['usable']}.")
+                    st.success(f"ODME summary saved. Usable OI contracts: {res['usable']}. Full chain rows were not saved.")
                 elif res:
-                    st.warning("Snapshot saved, but this expiry has no usable OI. Select another active expiry.")
+                    st.warning("Summary saved, but this expiry has no usable OI. Select another active expiry.")
             except Exception as exc:
                 st.error(str(exc))
 
-    # Auto hourly refresh for initialized selected key while app is active.
-    if store.is_initialized(key):
+    if auto_on and store.is_initialized(key):
         try:
-            auto_res = initialize_or_refresh(store, angel, master, instrument, expiry, force=False)
+            auto_res = fetch_analyze_save(store, angel, master, instrument, expiry, manual_spot, force=False)
             if auto_res:
-                st.toast("Hourly ODME snapshot refreshed.")
+                st.toast("Hourly ODME summary refreshed.")
         except Exception as exc:
             st.warning(f"Auto refresh failed: {exc}")
 
     st.markdown("---")
     st.subheader(f"Selected: {instrument} / {expiry}")
-    if not store.is_initialized(key):
-        st.info("This instrument+expiry is not initialized yet. Click Initialize Expiry / Fetch Snapshot.")
-        return
+    live_result = st.session_state.get("last_result_by_key", {}).get(key)
+    if live_result:
+        render_live_dashboard(live_result)
+    else:
+        saved = store.load_latest_odme_snapshot(key)
+        if saved:
+            render_saved_summary(saved)
+            st.info("This is the last saved summary. Click Fetch Live + Save ODME Summary for a fresh Angel read and new comparison.")
+        else:
+            st.info("No saved ODME summary for this instrument+expiry yet. Click Fetch Live + Save ODME Summary.")
 
-    chain_memory = store.load_chain_memory(key)
-    snapshots = store.load_snapshots(key)
-    if chain_memory.empty:
-        st.warning("No chain memory rows found yet. Fetch a snapshot again.")
-        return
-    st.caption(f"Memory rows: {len(chain_memory):,} | Snapshots: {len(snapshots):,}")
-    result = analyze_odme(chain_memory, instrument, manual_spot if manual_spot > 0 else None)
-    render_dashboard(result)
+    history = store.load_odme_history(key, limit=20)
+    if not history.empty:
+        with st.expander("Saved history for selected expiry"):
+            cols = ["ts", "odme_tilt", "spot", "option_poc", "ce_wall", "pe_wall", "poc_shift", "ce_wall_shift", "pe_wall_shift", "bullish_score", "bearish_score", "range_score", "expansion_score"]
+            st.dataframe(history[[c for c in cols if c in history.columns]].sort_values("ts", ascending=False), use_container_width=True, hide_index=True)
 
 
 def main() -> None:
