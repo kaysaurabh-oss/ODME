@@ -755,6 +755,127 @@ def _compact_hero(final_action: str, ce_card: Dict[str, Any], pe_card: Dict[str,
         hero += f"\n{itm_caution}"
     return hero
 
+
+
+def _summary_value(summary: Dict[str, Any], *names: str, default: Any = 0.0) -> Any:
+    for name in names:
+        if isinstance(summary, dict) and summary.get(name) not in [None, ""]:
+            return summary.get(name)
+    return default
+
+
+def reconstruct_saved_result(current_summary: Dict[str, Any], previous_summary: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Rebuild the saved-screen cards from compact Google Sheet snapshot rows.
+
+    Full option-chain rows are intentionally not stored. This function uses the
+    compact saved key_strikes_json plus the comparison snapshot to recreate the
+    same card colours, arrows, premium alert and path assist that were visible
+    after the live fetch. It is for display only; it does not fetch live data.
+    """
+    previous_summary = previous_summary or {}
+    cur = current_summary or {}
+
+    spot = _safe_float(_summary_value(cur, "spot"))
+    prev_spot = _safe_float(_summary_value(previous_summary, "spot"))
+    poc = _safe_float(_summary_value(cur, "poc", "option_poc"))
+    val = _safe_float(_summary_value(cur, "value_area_low"))
+    vah = _safe_float(_summary_value(cur, "value_area_high"))
+    ce_wall = _safe_float(_summary_value(cur, "ce_wall", "active_ce_wall"))
+    pe_wall = _safe_float(_summary_value(cur, "pe_wall", "active_pe_wall"))
+    safer_ce = _safe_float(_summary_value(cur, "safer_sell_ce"))
+    safer_pe = _safe_float(_summary_value(cur, "safer_sell_pe"))
+
+    prev_poc = _safe_float(_summary_value(previous_summary, "poc", "option_poc"))
+    prev_ce_wall = _safe_float(_summary_value(previous_summary, "ce_wall", "active_ce_wall"))
+    prev_pe_wall = _safe_float(_summary_value(previous_summary, "pe_wall", "active_pe_wall"))
+    prev_safer_ce = _safe_float(_summary_value(previous_summary, "safer_sell_ce"))
+    prev_safer_pe = _safe_float(_summary_value(previous_summary, "safer_sell_pe"))
+
+    poc_move = str(_summary_value(cur, "poc_move", "poc_shift", default="")) or _movement(poc, prev_poc)
+    ce_move = str(_summary_value(cur, "ce_wall_move", "ce_wall_shift", default="")) or _movement(ce_wall, prev_ce_wall)
+    pe_move = str(_summary_value(cur, "pe_wall_move", "pe_wall_shift", default="")) or _movement(pe_wall, prev_pe_wall)
+
+    key_strikes = _extract_prev_key_metrics(cur)
+    prev_keys = _extract_prev_key_metrics(previous_summary)
+    matrix = _build_matrix(key_strikes, prev_keys, spot, prev_spot)
+    action_matrix = _actionable_matrix(matrix, spot)
+
+    ce_defence = _count_tags(action_matrix, ["ce_defended", "ce_defended_mild", "ce_control", "ce_control_mild"], "CE")
+    ce_stress = _count_tags(action_matrix, ["ce_stress", "ce_failure", "ce_abnormal"], "CE")
+    ce_failure = _count_tags(action_matrix, ["ce_failure"], "CE")
+    pe_support = _count_tags(action_matrix, ["pe_support", "pe_support_mild", "pe_defended", "pe_defended_mild"], "PE")
+    pe_stress = _count_tags(action_matrix, ["pe_trap", "pe_failure", "pe_stress"], "PE")
+    pe_failure = _count_tags(action_matrix, ["pe_failure"], "PE")
+
+    poc_card = _poc_card(spot, poc, pe_wall, ce_wall, poc_move, ce_defence, ce_stress, ce_failure, pe_support, pe_stress, pe_failure)
+    ce_wall_card = _wall_card("CE", ce_wall, prev_ce_wall, ce_move, matrix)
+    pe_wall_card = _wall_card("PE", pe_wall, prev_pe_wall, pe_move, matrix)
+    safer_ce_card = _safer_card("CE", safer_ce, prev_safer_ce, ce_move, matrix)
+    safer_pe_card = _safer_card("PE", safer_pe, prev_safer_pe, pe_move, matrix)
+
+    spot_delta = spot - prev_spot if prev_spot else 0.0
+    premium_alert = _premium_alert(action_matrix, spot_delta)
+    itm_caution = _significant_itm_caution(matrix, spot)
+
+    # Rebuild a compact strike table from saved key-strikes for path assist.
+    strike_rows = []
+    for v in (key_strikes or {}).values():
+        if not isinstance(v, dict):
+            continue
+        strike = _safe_float(v.get("strike"))
+        if not strike:
+            continue
+        ce_oi = _safe_float(v.get("ce_oi")); pe_oi = _safe_float(v.get("pe_oi"))
+        row = dict(v)
+        row["strike"] = strike
+        row["ce_oi"] = ce_oi; row["pe_oi"] = pe_oi
+        row["ce_volume"] = _safe_float(v.get("ce_volume")); row["pe_volume"] = _safe_float(v.get("pe_volume"))
+        row["combined_oi"] = ce_oi + pe_oi
+        strike_rows.append(row)
+    strikes = pd.DataFrame(strike_rows)
+    if not strikes.empty:
+        strikes = strikes.sort_values("strike")
+    path_risk = _build_path_risk(strikes, spot, ce_wall, pe_wall) if not strikes.empty else {}
+
+    first = not bool(previous_summary) or not prev_spot
+    hero_action = _compact_hero("", ce_wall_card, pe_wall_card, safer_ce_card, safer_pe_card, poc_card, first, itm_caution)
+
+    scores = {
+        "Bullish": int(_safe_float(_summary_value(cur, "bullish_score", default=0))),
+        "Bearish": int(_safe_float(_summary_value(cur, "bearish_score", default=0))),
+        "Range": int(_safe_float(_summary_value(cur, "range_score", default=0))),
+        "Expansion": int(_safe_float(_summary_value(cur, "expansion_score", default=0))),
+    }
+
+    return {
+        "tilt": str(_summary_value(cur, "tilt", "odme_tilt", default="")),
+        "spot": spot,
+        "poc": poc,
+        "value_area_low": val,
+        "value_area_high": vah,
+        "ce_wall": ce_wall,
+        "pe_wall": pe_wall,
+        "safer_sell_ce": safer_ce,
+        "safer_sell_pe": safer_pe,
+        "scores": scores,
+        "poc_move": poc_move,
+        "ce_wall_move": ce_move,
+        "pe_wall_move": pe_move,
+        "commentary": str(_summary_value(cur, "commentary", default="")),
+        "hero_action": hero_action,
+        "final_action": hero_action,
+        "premium_alert": premium_alert,
+        "path_risk": path_risk,
+        "cards": {
+            "poc": poc_card,
+            "ce_wall": ce_wall_card,
+            "pe_wall": pe_wall_card,
+            "safer_ce": safer_ce_card,
+            "safer_pe": safer_pe_card,
+        },
+    }
+
+
 def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | None = None, previous_summary: Dict[str, Any] | None = None) -> Dict[str, Any]:
     previous_summary = previous_summary or {}
     strikes, meta = build_strike_table(chain_df, instrument, manual_spot)

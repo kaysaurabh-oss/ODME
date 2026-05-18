@@ -9,7 +9,7 @@ import streamlit as st
 from angel_connector import AngelConnector, AngelDataError, AngelSessionError, load_angel_credentials
 from data_store import get_store, make_key, make_snapshot_id, parse_previous_summary, utc_now_iso
 from odme_config import APP_NAME, REFRESH_INTERVAL_SECONDS, SUPPORTED_INSTRUMENTS
-from odme_engine import analyze_odme
+from odme_engine import analyze_odme, reconstruct_saved_result
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
@@ -382,49 +382,56 @@ def result_to_display(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def saved_row_to_display(row: Dict[str, Any]) -> Dict[str, Any]:
+def saved_row_to_display(row: Dict[str, Any], previous_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Display the last saved snapshot with the same card logic as the last fetch.
+
+    This prevents the app from reopening into grey "Fetch live" cards. The saved
+    Google Sheet summary contains compact key-strike data, so we can rebuild the
+    last anchored card colours, arrows, premium alert, hero text and path assist
+    without a fresh Angel fetch.
+    """
+    current_summary = parse_previous_summary(row or {})
+    previous_summary = parse_previous_summary(previous_row or {}) if previous_row else {}
+    rebuilt = reconstruct_saved_result(current_summary, previous_summary)
     sections = split_commentary(row.get("commentary", ""))
-    scores = {
-        "Bullish": row.get("bullish_score", 0),
-        "Bearish": row.get("bearish_score", 0),
-        "Range": row.get("range_score", 0),
-        "Expansion": row.get("expansion_score", 0),
-    }
+    prev_spot = _safe_float(previous_summary.get("spot"))
+    spot_now = _safe_float(rebuilt.get("spot"))
+    day_change = spot_now - prev_spot if prev_spot else 0.0
+    day_change_pct = (day_change / prev_spot * 100.0) if prev_spot else 0.0
     return {
         "kind": "saved",
         "ts": row.get("ts", ""),
-        "tilt": row.get("odme_tilt", "MIXED / NO CLEAN EDGE"),
-        "spot": row.get("spot"),
-        "previous_spot": 0.0,
-        "day_change": 0.0,
-        "day_change_pct": 0.0,
-        "poc": row.get("option_poc"),
-        "value_area_low": row.get("value_area_low"),
-        "value_area_high": row.get("value_area_high"),
-        "ce_wall": row.get("active_ce_wall") or row.get("ce_wall"),
-        "pe_wall": row.get("active_pe_wall") or row.get("pe_wall"),
-        "ce_wall_move": row.get("ce_wall_shift", ""),
-        "pe_wall_move": row.get("pe_wall_shift", ""),
-        "poc_move": row.get("poc_shift", ""),
+        "tilt": rebuilt.get("tilt") or row.get("odme_tilt", "MIXED / NO CLEAN EDGE"),
+        "spot": rebuilt.get("spot"),
+        "previous_spot": prev_spot,
+        "day_change": day_change,
+        "day_change_pct": day_change_pct,
+        "poc": rebuilt.get("poc"),
+        "value_area_low": rebuilt.get("value_area_low"),
+        "value_area_high": rebuilt.get("value_area_high"),
+        "ce_wall": rebuilt.get("ce_wall"),
+        "pe_wall": rebuilt.get("pe_wall"),
+        "ce_wall_move": rebuilt.get("ce_wall_move", ""),
+        "pe_wall_move": rebuilt.get("pe_wall_move", ""),
+        "poc_move": rebuilt.get("poc_move", ""),
         "range_move": row.get("range_shift", ""),
-        "scores": scores,
-        "safer_sell_ce": row.get("safer_sell_ce"),
-        "safer_sell_pe": row.get("safer_sell_pe"),
+        "scores": rebuilt.get("scores", {}),
+        "safer_sell_ce": rebuilt.get("safer_sell_ce"),
+        "safer_sell_pe": rebuilt.get("safer_sell_pe"),
         "commentary": row.get("commentary", ""),
         "sections": sections,
-        "final_action": get_section(sections, "Final Action", default="Fetch live summary for current action."),
-        "ce_action": get_section(sections, "CE Action", default="Fetch live summary for CE action."),
-        "pe_action": get_section(sections, "PE Action", default="Fetch live summary for PE action."),
-        "risk_note": get_section(sections, "Risk Note", default="No risk note in saved summary."),
+        "final_action": rebuilt.get("final_action") or get_section(sections, "Final Action", default="Last saved ODME action unavailable."),
+        "ce_action": get_section(sections, "CE Action", default=""),
+        "pe_action": get_section(sections, "PE Action", default=""),
+        "risk_note": get_section(sections, "Risk Note", default=""),
         "verdict_text": get_section(sections, "ODME Verdict", default=row.get("odme_tilt", "")),
         "session_read": get_section(sections, "Session Read", default=""),
-        "cards": {},
-        "premium_alert": "",
-        "hero_action": get_section(sections, "Final Action", default="Fetch live data for current action."),
-        "anchor_snapshot_ts": "",
-        "path_risk": {},
+        "cards": rebuilt.get("cards", {}),
+        "premium_alert": rebuilt.get("premium_alert", ""),
+        "hero_action": rebuilt.get("hero_action") or rebuilt.get("final_action") or get_section(sections, "Final Action", default="Last saved ODME action unavailable."),
+        "anchor_snapshot_ts": previous_row.get("ts", "") if previous_row else "",
+        "path_risk": rebuilt.get("path_risk", {}),
     }
-
 
 def build_comparison_table(result: Dict[str, Any]) -> pd.DataFrame:
     prev = result.get("_previous_summary") or {}
@@ -883,6 +890,40 @@ def render_odme_dashboard(display: Dict[str, Any], comparison: pd.DataFrame, liv
     render_path_risk(display)
     render_anchor_comparison(display, comparison)
 
+
+
+def _previous_row_for_saved_view(history: pd.DataFrame, latest_row: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the row used to rebuild the last saved comparison.
+
+    Prefer the latest snapshot strictly before the latest saved snapshot's local
+    date, because the live engine uses prior-session anchor logic. If that is not
+    available, fall back to the immediate previous saved row.
+    """
+    if history is None or history.empty or not latest_row:
+        return {}
+    df = history.copy()
+    df["_ts"] = pd.to_datetime(df.get("ts"), errors="coerce", utc=True)
+    df = df.dropna(subset=["_ts"]).sort_values("_ts")
+    if df.empty:
+        return {}
+    latest_ts = pd.to_datetime(latest_row.get("ts"), errors="coerce", utc=True)
+    if pd.isna(latest_ts):
+        return df.iloc[-2].drop(labels=["_ts"], errors="ignore").to_dict() if len(df) >= 2 else {}
+    # Use Asia/Kolkata session date to match the store's anchor convention.
+    try:
+        latest_date = latest_ts.tz_convert("Asia/Kolkata").date()
+        df["_local_date"] = df["_ts"].dt.tz_convert("Asia/Kolkata").dt.date
+        prior_session = df[df["_local_date"] < latest_date]
+        if not prior_session.empty:
+            return prior_session.iloc[-1].drop(labels=["_ts", "_local_date"], errors="ignore").to_dict()
+    except Exception:
+        pass
+    before_latest = df[df["_ts"] < latest_ts]
+    if before_latest.empty:
+        return {}
+    return before_latest.iloc[-1].drop(labels=["_ts", "_local_date"], errors="ignore").to_dict()
+
+
 def render_history(history: pd.DataFrame) -> None:
     if history is None or history.empty:
         return
@@ -970,9 +1011,10 @@ def main_page() -> None:
     else:
         saved = store.load_latest_odme_snapshot(key)
         if saved:
-            st.info("Showing last saved ODME summary. Live comparisons use the latest saved snapshot before today as the fixed anchor; click Fetch Live + Save ODME Summary for current ODME path assist and fresh anchored comparison.")
-            display = saved_row_to_display(saved)
-            comparison = build_saved_comparison_table(history)
+            previous_saved = _previous_row_for_saved_view(history, saved)
+            st.info("Showing last saved ODME summary. Cards and comparison are rebuilt from the last saved anchor; click Fetch Live + Save ODME Summary only when you want a fresh live update.")
+            display = saved_row_to_display(saved, previous_saved)
+            comparison = build_comparison_table({**reconstruct_saved_result(parse_previous_summary(saved), parse_previous_summary(previous_saved) if previous_saved else {}), "_previous_summary": parse_previous_summary(previous_saved) if previous_saved else {}, "anchor_snapshot_ts": previous_saved.get("ts", "") if previous_saved else ""}) if previous_saved else build_saved_comparison_table(history)
             render_odme_dashboard(display, comparison, live_result=None)
         else:
             st.info("No saved ODME summary for this instrument+expiry yet. Click Fetch Live + Save ODME Summary.")
