@@ -207,6 +207,20 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _movement_label_for_display(previous: Any, current: Any) -> str:
+    """Return a compact movement marker for comparison rows."""
+    try:
+        if previous is None or previous == "" or current is None or current == "":
+            return ""
+        prev = float(previous)
+        cur = float(current)
+        if abs(cur - prev) < 1e-9:
+            return ""
+        return "↑" if cur > prev else "↓"
+    except Exception:
+        return ""
+
+
 def _tint_for_tilt(tilt: str) -> str:
     tilt = str(tilt).upper()
     if "BULLISH" in tilt:
