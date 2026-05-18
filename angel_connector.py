@@ -220,13 +220,35 @@ class AngelConnector:
 
     @classmethod
     def get_future_rows(cls, master: pd.DataFrame, instrument: str) -> pd.DataFrame:
+        """Return only true futures rows for the instrument.
+
+        Important Angel/MCX quirk:
+        Commodity options can have instrumenttype values such as OPTFUT. A loose
+        contains("FUT") check therefore pulls option rows like
+        SILVERM19JUN26300000CE into the futures list. That creates false
+        futures LTPs from option premiums.
+
+        Futures selection must therefore satisfy all of these:
+        - same exchange/root
+        - instrument type contains FUT
+        - instrument type does NOT contain OPT
+        - symbol does NOT end with CE/PE
+        """
         if master.empty:
             return master
         exch = cls.option_exchange_for_instrument(instrument)
         df = master.copy()
         exch_match = df.get("exch_seg", pd.Series("", index=df.index)).astype(str).str.upper().eq(exch)
-        fut_type_match = df.get("instrumenttype", pd.Series("", index=df.index)).astype(str).str.upper().str.contains("FUT", na=False)
-        df = df[exch_match & fut_type_match & cls._root_mask(df, instrument)].copy()
+
+        itype = df.get("instrumenttype", pd.Series("", index=df.index)).astype(str).str.upper().str.strip()
+        symbol = df.get("symbol", pd.Series("", index=df.index)).astype(str).str.upper().str.strip()
+
+        # True futures include FUTIDX/FUTSTK/FUTCOM etc.
+        # Exclude OPTIDX/OPTSTK/OPTFUT/OPTCOM and any CE/PE symbols.
+        fut_type_match = itype.str.contains("FUT", na=False) & ~itype.str.contains("OPT", na=False)
+        not_option_symbol = ~symbol.str.endswith(("CE", "PE"), na=False)
+
+        df = df[exch_match & fut_type_match & not_option_symbol & cls._root_mask(df, instrument)].copy()
         if df.empty:
             return df
         return df.sort_values(["expiry_dt", "expiry", "symbol"], na_position="last")
