@@ -688,6 +688,17 @@ def render_final_hero(display: Dict[str, Any]) -> None:
     text = display.get("hero_action") or display.get("final_action") or "No ODME action generated."
     render_hero("ODME Action", str(text).replace("\n", "<br>"), _tint_for_action(text, ""))
 
+
+def render_anchor_comparison(display: Dict[str, Any], comparison: pd.DataFrame) -> None:
+    st.markdown("### Anchor comparison")
+    anchor_ts = str(display.get("anchor_snapshot_ts") or "").strip()
+    if anchor_ts:
+        st.caption(f"Anchor used: latest saved snapshot before today — {anchor_ts}")
+    if comparison is None or comparison.empty:
+        st.info("No prior anchor available for this instrument+expiry yet. Current values will become the next trading-session anchor after saving.")
+        return
+    st.dataframe(comparison, use_container_width=True, hide_index=True, height=210)
+
 def render_top_cards(display: Dict[str, Any]) -> None:
     tilt = display.get("tilt", "MIXED / NO CLEAN EDGE")
     top = st.columns(5)
@@ -732,16 +743,16 @@ def render_previous_and_scores(comparison: pd.DataFrame, display: Dict[str, Any]
 
 
 def render_chain_heatmap(live_result: Optional[Dict[str, Any]]) -> None:
-    st.markdown("### Option chain heatmap — ATM ± 5 strikes")
+    st.markdown("### Option chain heatmap — ATM ± 15 strikes")
     if not live_result:
         st.info("Heatmap is available after a fresh live fetch. Saved Google Sheet summaries intentionally do not store full option-chain rows.")
         return
-    chain_view = build_chain_view(live_result, radius=5)
+    chain_view = build_chain_view(live_result, radius=15)
     if chain_view.empty:
         st.info("No strike table available from current live result.")
     else:
         st.caption("Visual backup only. Use ODME Action and cards for the decision.")
-        st.dataframe(style_chain_table(chain_view, live_result), use_container_width=True, hide_index=True, height=430)
+        st.dataframe(style_chain_table(chain_view, live_result), use_container_width=True, hide_index=True, height=620)
 
 
 def render_expandable_commentary(display: Dict[str, Any]) -> None:
@@ -787,6 +798,7 @@ def render_odme_dashboard(display: Dict[str, Any], comparison: pd.DataFrame, liv
     render_data_line(display, live_result)
     render_level_cards(display)
     render_final_hero(display)
+    render_anchor_comparison(display, comparison)
     render_chain_heatmap(live_result)
 
 def render_history(history: pd.DataFrame) -> None:

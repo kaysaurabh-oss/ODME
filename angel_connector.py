@@ -192,8 +192,8 @@ class AngelConnector:
         contracts such as NATURALGAS, NATGASMINI, COPPER and ZINC.
 
         This function therefore uses an instrument-specific MCX scale first.
-        It keeps SILVER/SILVERM/SILVERMIC unscaled because those contracts are
-        quoted at large absolute strike levels.
+        SILVER-family option strikes are also passed through the config scale
+        because Angel may store them as 100x while futures LTP is in displayed units.
         """
         strike = _safe_float(row.get("strike", 0))
         if strike <= 0:

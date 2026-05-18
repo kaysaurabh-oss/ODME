@@ -206,7 +206,8 @@ def _make_key_strikes(strikes: pd.DataFrame, spot: float, poc: float, val: float
     levels = set([poc, val, vah])
     levels.update(ce_candidates["strike"].astype(float).tolist())
     levels.update(pe_candidates["strike"].astype(float).tolist())
-    near = strikes.assign(dist=(strikes["strike"] - spot).abs()).sort_values("dist").head(5)["strike"].astype(float).tolist()
+    # Keep a compact but wider ATM band so significant near-ITM changes can be assessed without storing the full chain.
+    near = strikes.assign(dist=(strikes["strike"] - spot).abs()).sort_values("dist").head(15)["strike"].astype(float).tolist()
     levels.update(near)
     out: Dict[str, Dict[str, float]] = {}
     for level in sorted(x for x in levels if x and not pd.isna(x)):
@@ -367,6 +368,83 @@ def _rows_for_side(matrix: pd.DataFrame, side: str, tags: List[str]) -> pd.DataF
     if matrix.empty or "action_tag" not in matrix.columns:
         return pd.DataFrame()
     return matrix[(matrix["side"].eq(side.upper())) & (matrix["action_tag"].isin(tags))].copy()
+
+def _actionable_matrix(matrix: pd.DataFrame, spot: float) -> pd.DataFrame:
+    """Return ATM/OTM rows only for action decisions.
+
+    CE actionable rows are strikes at/above spot; PE actionable rows are strikes at/below spot.
+    ITM rows are deliberately excluded from wall/safe-strike and primary hero logic.
+    """
+    if matrix is None or matrix.empty or not spot:
+        return matrix.copy() if isinstance(matrix, pd.DataFrame) else pd.DataFrame()
+    m = matrix.copy()
+    st = pd.to_numeric(m.get("strike"), errors="coerce")
+    return m[((m["side"].eq("CE")) & (st >= spot)) | ((m["side"].eq("PE")) & (st <= spot))].copy()
+
+
+def _itm_matrix(matrix: pd.DataFrame, spot: float) -> pd.DataFrame:
+    """Return ITM rows only. Used only for a single caution overlay, never for wall/safe-strike selection."""
+    if matrix is None or matrix.empty or not spot:
+        return pd.DataFrame()
+    m = matrix.copy()
+    st = pd.to_numeric(m.get("strike"), errors="coerce")
+    return m[((m["side"].eq("CE")) & (st < spot)) | ((m["side"].eq("PE")) & (st > spot))].copy()
+
+
+def _significant_itm_caution(matrix: pd.DataFrame, spot: float) -> str:
+    """Single ITM overlay based only on significant OI change, not absolute OI.
+
+    This intentionally does not affect wall/safe-strike selection. It only adds a compact
+    caution line to the hero when near-ITM activity has materially changed vs anchor.
+    """
+    itm = _itm_matrix(matrix, spot)
+    if itm.empty or "delta_oi_vs_previous" not in itm.columns:
+        return ""
+
+    all_abs = pd.to_numeric(matrix.get("delta_oi_vs_previous"), errors="coerce").abs().replace([np.inf, -np.inf], np.nan).dropna()
+    all_abs = all_abs[all_abs > 0]
+    if all_abs.empty:
+        return ""
+    threshold = float(all_abs.quantile(0.75))
+    if threshold <= 0:
+        return ""
+
+    itm = itm.copy()
+    itm["abs_oi_change"] = pd.to_numeric(itm["delta_oi_vs_previous"], errors="coerce").abs().fillna(0)
+    itm = itm[itm["abs_oi_change"] >= threshold]
+    if itm.empty:
+        return ""
+
+    # Pick the single strongest ITM change. Do not rank by absolute OI.
+    row = itm.sort_values("abs_oi_change", ascending=False).iloc[0]
+    side = str(row.get("side", "")).upper()
+    strike = _fmt_level(row.get("strike"))
+    oi_delta = _safe_float(row.get("delta_oi_vs_previous"))
+    prem_delta = _safe_float(row.get("delta_premium_vs_previous"))
+    oi_dir = _direction(oi_delta, 0.0)
+    prem_dir = _direction(prem_delta, 0.0)
+
+    if side == "CE":
+        if oi_dir == "up" and prem_dir == "up":
+            return f"ITM caution: bullish upside risk from {strike} CE — do not treat CE selling as clean."
+        if oi_dir == "down" and prem_dir == "up":
+            return f"ITM caution: bullish upside risk from {strike} CE covering / premium firmness."
+        if oi_dir == "up" and prem_dir in ["down", "flat"]:
+            return f"ITM caution: bearish/weak-bullish read from {strike} CE adjustment; upside follow-through is not clean."
+        if oi_dir == "down" and prem_dir in ["down", "flat"]:
+            return f"ITM caution: bearish/weak-bullish read from {strike} CE unwinding."
+
+    if side == "PE":
+        if oi_dir == "up" and prem_dir == "up":
+            return f"ITM caution: bearish downside risk from {strike} PE — PE selling needs caution."
+        if oi_dir == "down" and prem_dir == "up":
+            return f"ITM caution: bearish downside risk from {strike} PE covering / premium firmness."
+        if oi_dir == "up" and prem_dir in ["down", "flat"]:
+            return f"ITM caution: bullish/weak-bearish read from {strike} PE adjustment; downside follow-through is not clean."
+        if oi_dir == "down" and prem_dir in ["down", "flat"]:
+            return f"ITM caution: bullish/weak-bearish read from {strike} PE unwinding."
+
+    return ""
 
 
 def _decide_tilt(scores: Dict[str, int]) -> str:
@@ -555,7 +633,7 @@ def _premium_alert(matrix: pd.DataFrame, spot_delta: float) -> str:
     return ""
 
 
-def _compact_hero(final_action: str, ce_card: Dict[str, Any], pe_card: Dict[str, Any], safer_ce_card: Dict[str, Any], safer_pe_card: Dict[str, Any], poc_card: Dict[str, Any], first: bool) -> str:
+def _compact_hero(final_action: str, ce_card: Dict[str, Any], pe_card: Dict[str, Any], safer_ce_card: Dict[str, Any], safer_pe_card: Dict[str, Any], poc_card: Dict[str, Any], first: bool, itm_caution: str = "") -> str:
     if first:
         return "Observation mode only — prior anchor not available. Levels are visible, but ODME should not be used for strong action yet."
     # Prefer action card with clearer tradability.
@@ -570,7 +648,10 @@ def _compact_hero(final_action: str, ce_card: Dict[str, Any], pe_card: Dict[str,
     else:
         action = "No clean fresh short option. Wait or use wider strikes only if EDGE strongly supports it."
     reason = f"Reason: CE wall is {str(ce_card.get('state','')).lower()}, PE wall is {str(pe_card.get('state','')).lower()}, and POC shows {str(poc_card.get('state','')).lower()}."
-    return f"{action}\n{reason}"
+    hero = f"{action}\n{reason}"
+    if itm_caution:
+        hero += f"\n{itm_caution}"
+    return hero
 
 def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | None = None, previous_summary: Dict[str, Any] | None = None) -> Dict[str, Any]:
     previous_summary = previous_summary or {}
@@ -608,23 +689,25 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
         _add_level_to_keys(key_strikes, strikes, _lvl)
     prev_keys = _extract_prev_key_metrics(previous_summary)
     matrix = _build_matrix(key_strikes, prev_keys, spot, prev_spot)
+    action_matrix = _actionable_matrix(matrix, spot)
+    itm_caution = _significant_itm_caution(matrix, spot)
 
-    # Spot-adjusted event counts.
-    ce_defence = _count_tags(matrix, ["ce_defended", "ce_defended_mild", "ce_control", "ce_control_mild"], "CE")
-    ce_stress = _count_tags(matrix, ["ce_stress", "ce_failure", "ce_abnormal"], "CE")
-    ce_failure = _count_tags(matrix, ["ce_failure"], "CE")
-    pe_support = _count_tags(matrix, ["pe_support", "pe_support_mild", "pe_defended", "pe_defended_mild"], "PE")
+    # Spot-adjusted event counts. ITM rows are excluded from primary action logic.
+    ce_defence = _count_tags(action_matrix, ["ce_defended", "ce_defended_mild", "ce_control", "ce_control_mild"], "CE")
+    ce_stress = _count_tags(action_matrix, ["ce_stress", "ce_failure", "ce_abnormal"], "CE")
+    ce_failure = _count_tags(action_matrix, ["ce_failure"], "CE")
+    pe_support = _count_tags(action_matrix, ["pe_support", "pe_support_mild", "pe_defended", "pe_defended_mild"], "PE")
     pe_stress = _count_tags(matrix, ["pe_trap", "pe_failure", "pe_stress"], "PE")
-    pe_failure = _count_tags(matrix, ["pe_failure"], "PE")
+    pe_failure = _count_tags(action_matrix, ["pe_failure"], "PE")
 
     above_poc = spot > poc if poc else False
     below_poc = spot < poc if poc else False
     stretched = abs(spot - poc) / spot > 0.025 if spot and poc else False
 
-    bullish = _sum_col(matrix, "bullish_pts")
-    bearish = _sum_col(matrix, "bearish_pts")
-    range_score = _sum_col(matrix, "range_pts")
-    expansion = _sum_col(matrix, "expansion_pts")
+    bullish = _sum_col(action_matrix, "bullish_pts")
+    bearish = _sum_col(action_matrix, "bearish_pts")
+    range_score = _sum_col(action_matrix, "range_pts")
+    expansion = _sum_col(action_matrix, "expansion_pts")
 
     # Structure/migration overlay. These are intentionally secondary to premium/OI behaviour.
     bullish += 12 if pe_move == "higher" else 0
@@ -668,8 +751,8 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
     pe_wall_card = _wall_card("PE", pe_wall, prev_pe_wall, pe_move, matrix)
     safer_ce_card = _safer_card("CE", safer_ce, prev_safer_ce, ce_move, matrix)
     safer_pe_card = _safer_card("PE", safer_pe, prev_safer_pe, pe_move, matrix)
-    premium_alert = _premium_alert(matrix, spot_delta)
-    hero_action = _compact_hero(final_action, ce_wall_card, pe_wall_card, safer_ce_card, safer_pe_card, poc_card, poc_move == "first snapshot" or not prev_spot)
+    premium_alert = _premium_alert(action_matrix, spot_delta)
+    hero_action = _compact_hero(final_action, ce_wall_card, pe_wall_card, safer_ce_card, safer_pe_card, poc_card, poc_move == "first snapshot" or not prev_spot, itm_caution)
 
     commentary = build_commentary(
         tilt=tilt,
@@ -694,7 +777,7 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
         pe_stress=pe_stress,
         stretched=stretched,
         previous_summary=previous_summary,
-        matrix=matrix,
+        matrix=action_matrix,
         ce_action=ce_action,
         pe_action=pe_action,
         final_action=final_action,
@@ -725,6 +808,7 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
         "final_action": final_action,
         "hero_action": hero_action,
         "premium_alert": premium_alert,
+        "itm_caution": itm_caution,
         "cards": {
             "poc": poc_card,
             "ce_wall": ce_wall_card,

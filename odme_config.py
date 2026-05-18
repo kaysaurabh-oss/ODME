@@ -39,7 +39,7 @@ DEFAULT_RELEVANT_RANGE_PCT = 0.10
 # Some lower-priced MCX commodities are stored as 100x in the master even when
 # the raw strike is below the old generic 100000 threshold.
 # Example: NATURALGAS 30000 in master means 300.00 strike.
-# Keep SILVER/SILVERM unscaled because those contracts are quoted at large absolute levels.
+# SILVER-family options may be stored as 100x in Angel master while futures LTP is already displayed.
 MCX_STRIKE_SCALE_DIVISOR = {
     "NATURALGAS": 100.0,
     "NATGASMINI": 100.0,
@@ -49,9 +49,13 @@ MCX_STRIKE_SCALE_DIVISOR = {
     "CRUDEOILM": 100.0,
     "GOLD": 100.0,
     "GOLDM": 100.0,
-    "SILVER": 1.0,
-    "SILVERM": 1.0,
-    "SILVERMIC": 1.0,
+    # Angel MCX master currently stores SILVER-family option strikes as 100x.
+    # Example: 27600000 in master = 276000 displayed strike.
+    # Futures LTP is already returned in displayed price units, so option strikes
+    # must be divided before futures-range validation and ODME analysis.
+    "SILVER": 100.0,
+    "SILVERM": 100.0,
+    "SILVERMIC": 100.0,
 }
 
 
