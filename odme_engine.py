@@ -636,18 +636,50 @@ def _premium_alert(matrix: pd.DataFrame, spot_delta: float) -> str:
 def _compact_hero(final_action: str, ce_card: Dict[str, Any], pe_card: Dict[str, Any], safer_ce_card: Dict[str, Any], safer_pe_card: Dict[str, Any], poc_card: Dict[str, Any], first: bool, itm_caution: str = "") -> str:
     if first:
         return "Observation mode only — prior anchor not available. Levels are visible, but ODME should not be used for strong action yet."
-    # Prefer action card with clearer tradability.
+
     ce_ok = safer_ce_card.get("state") == "Tradable"
     pe_ok = safer_pe_card.get("state") == "Tradable"
-    if ce_ok and not pe_ok:
-        action = f"Prefer short CE at {safer_ce_card.get('level', '')}. Avoid fresh PE selling for now."
-    elif pe_ok and not ce_ok:
-        action = f"Prefer short PE at {safer_pe_card.get('level', '')}. Avoid fresh CE selling for now."
-    elif ce_ok and pe_ok:
-        action = "Both safer sides are tradable only as theta structures; use EDGE to choose side."
+    poc_state = str(poc_card.get("state", "")).lower()
+    ce_wall_state = str(ce_card.get("state", "")).lower()
+    pe_wall_state = str(pe_card.get("state", "")).lower()
+
+    # POC pressure is an ODME range-pressure read, not an EDGE trade direction.
+    # Do not allow the hero to suggest a clean short side when the opposite wall is also stressed.
+    upward_pressure = "upside expansion" in poc_state or "magnet pull upward" in poc_state
+    downward_pressure = "downside expansion" in poc_state or "magnet pull downward" in poc_state
+    ce_wall_stressed = any(x in ce_wall_state for x in ["pressure", "failure", "covering", "shifted"])
+    pe_wall_stressed = any(x in pe_wall_state for x in ["pressure", "failure", "covering", "shifted"])
+
+    conflict = (downward_pressure and ce_wall_stressed) or (upward_pressure and pe_wall_stressed)
+    if conflict:
+        action = "Conflicting premium pressure — no clean fresh short option. Wait for EDGE confirmation; avoid aggressive CE/PE selling."
+        if downward_pressure:
+            reason = f"Reason: POC shows {str(poc_card.get('state','')).lower()}, but CE wall is {str(ce_card.get('state','')).lower()}; this is two-way premium risk, not a clean short-CE setup."
+        else:
+            reason = f"Reason: POC shows {str(poc_card.get('state','')).lower()}, but PE wall is {str(pe_card.get('state','')).lower()}; this is two-way premium risk, not a clean short-PE setup."
+    elif upward_pressure:
+        if pe_ok:
+            action = f"Prefer short PE at {safer_pe_card.get('level', '')}. Avoid fresh CE selling while POC pressure is upward."
+        else:
+            action = "Avoid fresh CE selling. PE side is not clean enough yet, so wait or use wider PE only with EDGE support."
+        reason = f"Reason: POC shows {str(poc_card.get('state','')).lower()}, CE wall is {str(ce_card.get('state','')).lower()}, and safer PE is {str(safer_pe_card.get('state','')).lower()}."
+    elif downward_pressure:
+        if ce_ok:
+            action = f"Prefer short CE at {safer_ce_card.get('level', '')}. Avoid fresh PE selling while POC pressure is downward."
+        else:
+            action = "Avoid fresh PE selling. CE side is not clean enough yet, so wait or use wider CE only with EDGE support."
+        reason = f"Reason: POC shows {str(poc_card.get('state','')).lower()}, PE wall is {str(pe_card.get('state','')).lower()}, and safer CE is {str(safer_ce_card.get('state','')).lower()}."
     else:
-        action = "No clean fresh short option. Wait or use wider strikes only if EDGE strongly supports it."
-    reason = f"Reason: CE wall is {str(ce_card.get('state','')).lower()}, PE wall is {str(pe_card.get('state','')).lower()}, and POC shows {str(poc_card.get('state','')).lower()}."
+        if ce_ok and not pe_ok:
+            action = f"Prefer short CE at {safer_ce_card.get('level', '')}. Avoid fresh PE selling for now."
+        elif pe_ok and not ce_ok:
+            action = f"Prefer short PE at {safer_pe_card.get('level', '')}. Avoid fresh CE selling for now."
+        elif ce_ok and pe_ok:
+            action = "Both safer sides are tradable only as theta structures; use EDGE to choose side."
+        else:
+            action = "No clean fresh short option. Wait or use wider strikes only if EDGE strongly supports it."
+        reason = f"Reason: POC shows {str(poc_card.get('state','')).lower()}, CE wall is {str(ce_card.get('state','')).lower()}, and PE wall is {str(pe_card.get('state','')).lower()}."
+
     hero = f"{action}\n{reason}"
     if itm_caution:
         hero += f"\n{itm_caution}"
@@ -697,7 +729,7 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
     ce_stress = _count_tags(action_matrix, ["ce_stress", "ce_failure", "ce_abnormal"], "CE")
     ce_failure = _count_tags(action_matrix, ["ce_failure"], "CE")
     pe_support = _count_tags(action_matrix, ["pe_support", "pe_support_mild", "pe_defended", "pe_defended_mild"], "PE")
-    pe_stress = _count_tags(matrix, ["pe_trap", "pe_failure", "pe_stress"], "PE")
+    pe_stress = _count_tags(action_matrix, ["pe_trap", "pe_failure", "pe_stress"], "PE")
     pe_failure = _count_tags(action_matrix, ["pe_failure"], "PE")
 
     above_poc = spot > poc if poc else False

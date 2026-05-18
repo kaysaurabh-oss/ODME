@@ -395,11 +395,12 @@ def build_comparison_table(result: Dict[str, Any]) -> pd.DataFrame:
     if not prev:
         return pd.DataFrame()
     rows = [
-        {"Metric": "Spot", "Previous": _fmt_num(prev.get("spot"), 2), "Current": _fmt_num(result.get("spot"), 2), "Change": _fmt_num(_safe_float(result.get("spot")) - _safe_float(prev.get("spot")), 2)},
-        {"Metric": "Option POC", "Previous": _fmt_num(prev.get("poc") or prev.get("option_poc")), "Current": _fmt_num(result.get("poc")), "Change": result.get("poc_move", "")},
+        {"Metric": "Future/Spot", "Previous": _fmt_num(prev.get("spot"), 2), "Current": _fmt_num(result.get("spot"), 2), "Change": _fmt_num(_safe_float(result.get("spot")) - _safe_float(prev.get("spot")), 2)},
+        {"Metric": "POC", "Previous": _fmt_num(prev.get("poc") or prev.get("option_poc")), "Current": _fmt_num(result.get("poc")), "Change": result.get("poc_move", "")},
         {"Metric": "CE Wall", "Previous": _fmt_num(prev.get("ce_wall")), "Current": _fmt_num(result.get("ce_wall")), "Change": result.get("ce_wall_move", "")},
         {"Metric": "PE Wall", "Previous": _fmt_num(prev.get("pe_wall")), "Current": _fmt_num(result.get("pe_wall")), "Change": result.get("pe_wall_move", "")},
-        {"Metric": "Tilt", "Previous": prev.get("tilt") or prev.get("odme_tilt") or "NA", "Current": result.get("tilt", "NA"), "Change": ""},
+        {"Metric": "Safer CE Sell", "Previous": _fmt_num(prev.get("safer_sell_ce")), "Current": _fmt_num(result.get("safer_sell_ce")), "Change": _movement_label_for_display(prev.get("safer_sell_ce"), result.get("safer_sell_ce"))},
+        {"Metric": "Safer PE Sell", "Previous": _fmt_num(prev.get("safer_sell_pe")), "Current": _fmt_num(result.get("safer_sell_pe")), "Change": _movement_label_for_display(prev.get("safer_sell_pe"), result.get("safer_sell_pe"))},
     ]
     return pd.DataFrame(rows)
 
@@ -411,21 +412,30 @@ def build_saved_comparison_table(history: pd.DataFrame) -> pd.DataFrame:
     prev = h.iloc[0].to_dict()
     cur = h.iloc[1].to_dict()
     rows = [
-        {"Metric": "Spot", "Previous": _fmt_num(prev.get("spot"), 2), "Current": _fmt_num(cur.get("spot"), 2), "Change": _fmt_num(_safe_float(cur.get("spot")) - _safe_float(prev.get("spot")), 2)},
-        {"Metric": "Option POC", "Previous": _fmt_num(prev.get("option_poc")), "Current": _fmt_num(cur.get("option_poc")), "Change": cur.get("poc_shift", "")},
+        {"Metric": "Future/Spot", "Previous": _fmt_num(prev.get("spot"), 2), "Current": _fmt_num(cur.get("spot"), 2), "Change": _fmt_num(_safe_float(cur.get("spot")) - _safe_float(prev.get("spot")), 2)},
+        {"Metric": "POC", "Previous": _fmt_num(prev.get("option_poc")), "Current": _fmt_num(cur.get("option_poc")), "Change": cur.get("poc_shift", "")},
         {"Metric": "CE Wall", "Previous": _fmt_num(prev.get("ce_wall")), "Current": _fmt_num(cur.get("ce_wall")), "Change": cur.get("ce_wall_shift", "")},
         {"Metric": "PE Wall", "Previous": _fmt_num(prev.get("pe_wall")), "Current": _fmt_num(cur.get("pe_wall")), "Change": cur.get("pe_wall_shift", "")},
-        {"Metric": "Tilt", "Previous": prev.get("odme_tilt", "NA"), "Current": cur.get("odme_tilt", "NA"), "Change": ""},
+        {"Metric": "Safer CE Sell", "Previous": _fmt_num(prev.get("safer_sell_ce")), "Current": _fmt_num(cur.get("safer_sell_ce")), "Change": _movement_label_for_display(prev.get("safer_sell_ce"), cur.get("safer_sell_ce"))},
+        {"Metric": "Safer PE Sell", "Previous": _fmt_num(prev.get("safer_sell_pe")), "Current": _fmt_num(cur.get("safer_sell_pe")), "Change": _movement_label_for_display(prev.get("safer_sell_pe"), cur.get("safer_sell_pe"))},
     ]
     return pd.DataFrame(rows)
 
 
-def build_chain_view(result: Dict[str, Any], radius: int = 8) -> pd.DataFrame:
+def build_chain_view(result: Dict[str, Any], radius: int = 10) -> pd.DataFrame:
+    """Plain ATM ± radius option-chain view.
+
+    Reads are intentionally shown only on the OTM side:
+    - strikes above spot: CE read only
+    - strikes below spot: PE read only
+    - nearest ATM row: reference row, no directional read
+    """
     table = result.get("strike_table", pd.DataFrame())
     if table is None or table.empty:
         return pd.DataFrame()
     df = table.copy()
     spot = _safe_float(result.get("spot"))
+    atm = None
     if spot and "strike" in df.columns:
         df["_dist"] = (pd.to_numeric(df["strike"], errors="coerce") - spot).abs()
         atm = _safe_float(df.sort_values("_dist").iloc[0]["strike"])
@@ -440,27 +450,25 @@ def build_chain_view(result: Dict[str, Any], radius: int = 8) -> pd.DataFrame:
     if matrix is not None and not matrix.empty:
         m = matrix.copy()
         m["strike"] = pd.to_numeric(m["strike"], errors="coerce")
-        ce_delta = m[m["side"].eq("CE")][["strike", "delta_oi_vs_previous", "delta_premium_vs_previous", "spot_adjusted_read", "action_tag"]].rename(columns={
-            "delta_oi_vs_previous": "CE ΔOI",
-            "delta_premium_vs_previous": "CE ΔPrem",
-            "spot_adjusted_read": "CE Read",
-            "action_tag": "CE State",
-        })
-        pe_delta = m[m["side"].eq("PE")][["strike", "delta_oi_vs_previous", "delta_premium_vs_previous", "spot_adjusted_read", "action_tag"]].rename(columns={
-            "delta_oi_vs_previous": "PE ΔOI",
-            "delta_premium_vs_previous": "PE ΔPrem",
-            "spot_adjusted_read": "PE Read",
-            "action_tag": "PE State",
-        })
+        ce_delta = m[m["side"].eq("CE")][["strike", "spot_adjusted_read"]].rename(columns={"spot_adjusted_read": "CE Read"})
+        pe_delta = m[m["side"].eq("PE")][["strike", "spot_adjusted_read"]].rename(columns={"spot_adjusted_read": "PE Read"})
     out = df.merge(ce_delta, on="strike", how="left").merge(pe_delta, on="strike", how="left")
-    rename = {"strike": "Strike", "ce_ltp": "CE LTP", "ce_oi": "CE OI", "pe_ltp": "PE LTP", "pe_oi": "PE OI", "combined_oi": "Combined OI"}
-    keep = ["strike", "ce_ltp", "ce_oi", "CE ΔOI", "CE ΔPrem", "pe_ltp", "pe_oi", "PE ΔOI", "PE ΔPrem", "combined_oi", "CE Read", "PE Read"]
+    out["Strike"] = pd.to_numeric(out["strike"], errors="coerce")
+    out["Zone"] = ""
+    if spot:
+        out.loc[out["Strike"] > spot, "Zone"] = "Upside / OTM CE"
+        out.loc[out["Strike"] < spot, "Zone"] = "Downside / OTM PE"
+    if atm:
+        out.loc[out["Strike"].round(6).eq(round(float(atm), 6)), "Zone"] = "ATM reference"
+    # Show reads only where they are actionable OTM reads. Blank the ITM side to avoid confusion.
+    out.loc[out["Strike"] <= (spot or 0), "CE Read"] = ""
+    out.loc[out["Strike"] >= (spot or 0), "PE Read"] = ""
+    if atm:
+        out.loc[out["Strike"].round(6).eq(round(float(atm), 6)), ["CE Read", "PE Read"]] = ""
+    rename = {"ce_ltp": "CE LTP", "ce_oi": "CE OI", "pe_ltp": "PE LTP", "pe_oi": "PE OI"}
+    keep = ["Strike", "Zone", "ce_ltp", "ce_oi", "CE Read", "PE Read", "pe_oi", "pe_ltp"]
     out = out[[c for c in keep if c in out.columns]].rename(columns=rename).sort_values("Strike")
-    for col in ["CE ΔOI", "CE ΔPrem", "PE ΔOI", "PE ΔPrem"]:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
     return out
-
 
 def style_chain_table(df: pd.DataFrame, result: Dict[str, Any]):
     if df.empty:
@@ -743,16 +751,16 @@ def render_previous_and_scores(comparison: pd.DataFrame, display: Dict[str, Any]
 
 
 def render_chain_heatmap(live_result: Optional[Dict[str, Any]]) -> None:
-    st.markdown("### Option chain heatmap — ATM ± 15 strikes")
+    st.markdown("### Option chain — ATM ± 10 strikes")
     if not live_result:
-        st.info("Heatmap is available after a fresh live fetch. Saved Google Sheet summaries intentionally do not store full option-chain rows.")
+        st.info("Option-chain view is available after a fresh live fetch. Saved Google Sheet summaries intentionally do not store full option-chain rows.")
         return
-    chain_view = build_chain_view(live_result, radius=15)
+    chain_view = build_chain_view(live_result, radius=10)
     if chain_view.empty:
         st.info("No strike table available from current live result.")
     else:
-        st.caption("Visual backup only. Use ODME Action and cards for the decision.")
-        st.dataframe(style_chain_table(chain_view, live_result), use_container_width=True, hide_index=True, height=620)
+        st.caption("Clean OTM read only: upside rows show CE read; downside rows show PE read.")
+        st.dataframe(chain_view, use_container_width=True, hide_index=True, height=520)
 
 
 def render_expandable_commentary(display: Dict[str, Any]) -> None:
