@@ -503,13 +503,18 @@ def build_chain_view(result: Dict[str, Any], radius: int = 10) -> pd.DataFrame:
         out.loc[out["Strike"] < spot, "Zone"] = "Downside / OTM PE"
     if atm:
         out.loc[out["Strike"].round(6).eq(round(float(atm), 6)), "Zone"] = "ATM reference"
-    # Show reads only where they are actionable OTM reads. Blank the ITM side to avoid confusion.
-    out.loc[out["Strike"] <= (spot or 0), "CE Read"] = ""
-    out.loc[out["Strike"] >= (spot or 0), "PE Read"] = ""
+    # Show one clean OTM buildup column only:
+    # - strikes above spot use CE read
+    # - strikes below spot use PE read
+    # - nearest ATM row is kept as reference with blank buildup
+    out["Buildup"] = ""
+    if spot:
+        out.loc[out["Strike"] > spot, "Buildup"] = out.loc[out["Strike"] > spot, "CE Read"].fillna("")
+        out.loc[out["Strike"] < spot, "Buildup"] = out.loc[out["Strike"] < spot, "PE Read"].fillna("")
     if atm:
-        out.loc[out["Strike"].round(6).eq(round(float(atm), 6)), ["CE Read", "PE Read"]] = ""
-    rename = {"ce_ltp": "CE LTP", "ce_oi": "CE OI", "pe_ltp": "PE LTP", "pe_oi": "PE OI"}
-    keep = ["Strike", "Zone", "ce_ltp", "ce_oi", "CE Read", "PE Read", "pe_oi", "pe_ltp"]
+        out.loc[out["Strike"].round(6).eq(round(float(atm), 6)), "Buildup"] = ""
+    rename = {"ce_ltp": "CE LTP", "pe_ltp": "PE LTP"}
+    keep = ["Strike", "Buildup", "ce_ltp", "pe_ltp"]
     out = out[[c for c in keep if c in out.columns]].rename(columns=rename).sort_values("Strike")
     return out
 
@@ -831,16 +836,28 @@ def render_previous_and_scores(comparison: pd.DataFrame, display: Dict[str, Any]
 
 
 def render_chain_heatmap(live_result: Optional[Dict[str, Any]]) -> None:
-    st.markdown("### Option chain — ATM ± 10 strikes")
+    # Full option-chain rows are intentionally not saved. Show this only for the
+    # current live fetch result, as a compact read-only confirmation table.
     if not live_result:
-        st.info("Option-chain view is available after a fresh live fetch. Saved Google Sheet summaries intentionally do not store full option-chain rows.")
         return
+    st.markdown("### Live option-chain read — ATM ± 10 strikes")
     chain_view = build_chain_view(live_result, radius=10)
     if chain_view.empty:
         st.info("No strike table available from current live result.")
     else:
-        st.caption("Clean OTM read only: upside rows show CE read; downside rows show PE read.")
-        st.dataframe(chain_view, use_container_width=True, hide_index=True, height=520)
+        st.caption("Clean OTM buildup only: upside strikes show CE read; downside strikes show PE read.")
+        st.dataframe(
+            chain_view,
+            use_container_width=True,
+            hide_index=True,
+            height=460,
+            column_config={
+                "Strike": st.column_config.NumberColumn("Strike", format="%.0f", width="small"),
+                "Buildup": st.column_config.TextColumn("Buildup", width="large"),
+                "CE LTP": st.column_config.NumberColumn("CE LTP", format="%.2f", width="small"),
+                "PE LTP": st.column_config.NumberColumn("PE LTP", format="%.2f", width="small"),
+            },
+        )
 
 
 def render_expandable_commentary(display: Dict[str, Any]) -> None:
@@ -888,6 +905,7 @@ def render_odme_dashboard(display: Dict[str, Any], comparison: pd.DataFrame, liv
     render_level_cards(display)
     render_final_hero(display)
     render_path_risk(display)
+    render_chain_heatmap(live_result)
     render_anchor_comparison(display, comparison)
 
 
