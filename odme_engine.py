@@ -10,10 +10,10 @@ from odme_config import DEFAULT_RELEVANT_RANGE_PCT, RELEVANT_RANGE_PCT
 
 
 # =============================================================================
-# ODME Engine v3
-# Focus: compact live ODME summary, previous-vs-current comparison,
-# writer-control / writer-defence-under-pressure / writer-failure logic,
-# and actionable commentary without full-chain history.
+# ODME Engine v5
+# Focus: compact live ODME summary, previous-vs-current comparison, actionable
+# commentary. Includes full ITM CE/PE positioning overlay matrix without
+# polluting actionable CE/PE wall guidance.
 # =============================================================================
 
 
@@ -224,99 +224,84 @@ def _make_key_strikes(strikes: pd.DataFrame, spot: float, poc: float, val: float
     return out
 
 
-def _premium_state(delta_premium: float, premium_pct: float) -> str:
-    """Classify premium move with a practical tolerance to avoid tick-noise."""
-    if abs(premium_pct) <= 3.0 or abs(delta_premium) <= 1.0:
-        return "flat"
-    return "up" if delta_premium > 0 else "down"
-
-
-def _oi_state(delta_oi: float, oi_pct: float) -> str:
-    if delta_oi <= 0:
-        return "down"
-    # Sharp OI addition means writers are still adding/defending. If premium is
-    # rising at the same time, that is defence under pressure, not automatic failure.
-    if oi_pct >= 12.0 or delta_oi >= 5000:
-        return "up_sharp"
-    return "up"
-
-
-def _spot_adjusted_read(side: str, spot_delta: float, oi_delta: float, oi_pct: float, premium_delta: float, premium_pct: float) -> Tuple[str, str, int, int, int, int]:
+def _spot_adjusted_read(side: str, spot_delta: float, oi_delta: float, premium_delta: float, premium_pct: float) -> Tuple[str, str, int, int, int, int]:
     """Return: read, action_tag, bullish_pts, bearish_pts, range_pts, expansion_pts.
 
-    v3 logic:
-    - Writer control = OI rising + premium flat/falling.
-    - Writer defence under pressure = OI rising sharply + premium rising.
-      This is not failure yet; use safer strike first, then shift toward active
-      wall only if next fetch confirms premium cooling while OI holds.
-    - Writer failure = premium rising while OI falls/not holding.
+    The important correction:
+    - Spot rising + PE premium not falling is NOT clean put-writing support.
+    - Clean support requires PE OI addition plus PE premium decay/softness.
+    - If PE premium stays firm/rises while spot rises, downside demand/IV stress is present.
+    Mirrored logic is used for CE on falling spot.
     """
     side = side.upper()
     spot_dir = _direction(spot_delta, 0.0)
-    prem = _premium_state(premium_delta, premium_pct)
-    oi = _oi_state(oi_delta, oi_pct)
-    oi_up = oi in ["up", "up_sharp"]
-    oi_sharp = oi == "up_sharp"
-    oi_down = oi == "down"
+    prem_dir = _direction(premium_delta, 0.0)
+    oi_dir = _direction(oi_delta, 0.0)
+    strong_premium = abs(premium_pct) >= 8.0 or abs(premium_delta) >= 5.0
 
     if spot_dir == "flat":
-        if oi_up and prem in ["down", "flat"]:
-            return "writers controlling while spot is flat", "writer_control", 0, 0, 12, 0
-        if oi_sharp and prem == "up":
-            return "writers defending under pressure despite flat spot", "defence_pressure", 0, 0, 4, 10
-        if oi_down and prem == "up":
-            return "writer exit risk despite flat spot", "writer_failure", 0, 0, 0, 14
+        if oi_dir == "up" and prem_dir == "down":
+            return "writer control while spot is flat", "control", 0, 0, 12, 0
+        if oi_dir == "up" and prem_dir == "up":
+            return "premium stress despite flat spot", "stress", 0, 0, 0, 12
+        if oi_dir == "down" and prem_dir == "up":
+            return "writer exit risk despite flat spot", "failure", 0, 0, 0, 10
         return "quiet / low conviction", "neutral", 0, 0, 4, 0
 
+    # CE side
     if side == "CE":
         if spot_dir == "up":
-            if oi_up and prem in ["down", "flat"]:
-                return "CE writers are absorbing the rise", "ce_control", 0, 10, 14, 0
-            if oi_sharp and prem == "up":
-                return "CE writers still defending, but premium is rising: defence under pressure", "ce_defence_pressure", 5, 0, 3, 12
-            if oi_up and prem == "up":
-                return "CE wall under pressure; writers present but not in clean control", "ce_pressure", 8, 0, 0, 10
-            if oi_down and prem == "up":
-                return "CE writers covering / wall failing", "ce_failure", 20, 0, 0, 18
-            if oi_down and prem in ["down", "flat"]:
-                return "CE interest fading during rise", "ce_fading", 5, 0, 3, 0
-        else:
-            if oi_up and prem in ["down", "flat"]:
-                return "fresh CE writing confirms overhead control", "ce_control", 0, 18, 10, 0
-            if oi_sharp and prem == "up":
-                return "CE writers adding, but premium firmness shows defence under pressure", "ce_defence_pressure", 0, 4, 3, 12
-            if oi_up and prem == "up":
-                return "abnormal CE premium firmness with fresh OI", "ce_pressure", 0, 0, 0, 12
-            if oi_down and prem == "up":
-                return "CE writer exit / upside hedge demand", "ce_failure", 10, 0, 0, 14
-            if oi_down and prem in ["down", "flat"]:
-                return "CE longs unwinding with falling spot", "ce_weak", 0, 8, 5, 0
+            if oi_dir == "up" and prem_dir == "down":
+                return "call writers absorbing the rise", "ce_defended", 0, 8, 14, 0
+            if oi_dir == "up" and prem_dir == "flat":
+                return "call writers still absorbing; no clean upside stress", "ce_defended_mild", 0, 4, 10, 0
+            if oi_dir == "up" and prem_dir == "up":
+                pts = 16 if strong_premium else 9
+                return "call-side stress with fresh CE OI", "ce_stress", pts, 0, 0, pts
+            if oi_dir == "down" and prem_dir == "up":
+                return "call writers covering / CE wall risk", "ce_failure", 18, 0, 0, 16
+            if oi_dir == "down" and prem_dir in ["down", "flat"]:
+                return "call interest fading during rise", "neutral", 4, 0, 3, 0
+        else:  # spot falling
+            if oi_dir == "up" and prem_dir == "down":
+                return "fresh call writing confirms overhead pressure", "ce_control", 0, 16, 8, 0
+            if oi_dir == "up" and prem_dir == "flat":
+                return "call writing pressure, but premium not decaying enough", "ce_control_mild", 0, 10, 4, 2
+            if oi_dir == "up" and prem_dir == "up":
+                return "abnormal CE premium firmness on falling spot", "ce_abnormal", 0, 0, 0, 12
+            if oi_dir == "down" and prem_dir == "up":
+                return "call writer exit / upside hedge demand", "ce_failure", 8, 0, 0, 12
+            if oi_dir == "down" and prem_dir in ["down", "flat"]:
+                return "CE longs unwinding with falling spot", "ce_weak", 0, 7, 5, 0
 
+    # PE side
     if side == "PE":
         if spot_dir == "up":
-            if oi_up and prem in ["down", "flat"]:
-                return "clean PE writing support", "pe_control", 20, 0, 10, 0
-            if oi_sharp and prem == "up":
-                return "PE writers adding, but premium is firm: support under pressure", "pe_defence_pressure", 4, 0, 3, 14
-            if oi_up and prem == "up":
-                return "PE premium firm despite rise; support is not clean", "pe_pressure", 0, 0, 0, 14
-            if oi_down and prem == "up":
-                return "PE writers exiting while protection demand stays firm", "pe_failure", 0, 18, 0, 18
-            if oi_down and prem in ["down", "flat"]:
-                return "PE unwinding during rise; rally accepted but support is weaker", "pe_unwind", 6, 0, 3, 0
-        else:
-            if oi_up and prem in ["down", "flat"]:
-                return "PE writers absorbing the fall", "pe_control", 12, 0, 14, 0
-            if oi_sharp and prem == "up":
-                return "PE writers still defending, but premium is rising: defence under pressure", "pe_defence_pressure", 0, 5, 3, 14
-            if oi_up and prem == "up":
-                return "PE wall under pressure; writers present but not in clean control", "pe_pressure", 0, 10, 0, 12
-            if oi_down and prem == "up":
-                return "PE writers covering / wall failing", "pe_failure", 0, 20, 0, 18
-            if oi_down and prem in ["down", "flat"]:
-                return "PE interest fading during fall", "pe_fading", 0, 5, 3, 0
+            if oi_dir == "up" and prem_dir == "down":
+                return "clean put writing support", "pe_support", 18, 0, 10, 0
+            if oi_dir == "up" and prem_dir == "flat":
+                return "put writers attempting support, but premium is not decaying cleanly", "pe_support_mild", 8, 0, 4, 5
+            if oi_dir == "up" and prem_dir == "up":
+                return "put premium firm despite rise: downside demand / trap risk", "pe_trap", 0, 0, 0, 18
+            if oi_dir == "down" and prem_dir == "up":
+                return "put writers exiting while protection demand stays firm", "pe_failure", 0, 16, 0, 16
+            if oi_dir == "down" and prem_dir in ["down", "flat"]:
+                return "put unwinding during rise; rally accepted but support is weaker", "pe_unwind", 6, 0, 3, 0
+        else:  # spot falling
+            if oi_dir == "up" and prem_dir == "down":
+                return "put writers absorbing the fall", "pe_defended", 10, 0, 14, 0
+            if oi_dir == "up" and prem_dir == "flat":
+                return "put writers attempting defence; premium not expanding", "pe_defended_mild", 5, 0, 8, 2
+            if oi_dir == "up" and prem_dir == "up":
+                pts = 18 if strong_premium else 11
+                return "fresh put buying / downside stress", "pe_stress", 0, pts, 0, pts
+            if oi_dir == "down" and prem_dir == "up":
+                return "put writers covering / PE wall risk", "pe_failure", 0, 18, 0, 16
+            if oi_dir == "down" and prem_dir in ["down", "flat"]:
+                return "put interest fading during fall", "neutral", 0, 4, 3, 0
 
     return "neutral / inconclusive", "neutral", 0, 0, 0, 0
+
 
 def _build_matrix(current_keys: Dict[str, Dict[str, float]], previous_keys: Dict[str, Dict[str, float]], current_spot: float, previous_spot: float) -> pd.DataFrame:
     rows = []
@@ -335,10 +320,9 @@ def _build_matrix(current_keys: Dict[str, Dict[str, float]], previous_keys: Dict
             doi = cur_oi - prev_oi if previous_keys else 0.0
             dltp = cur_ltp - prev_ltp if previous_keys else 0.0
             dpct = _pct_change(cur_ltp, prev_ltp) if previous_keys else 0.0
-            oi_pct = _pct_change(cur_oi, prev_oi) if previous_keys else 0.0
             generic = classify_matrix(doi, dltp) if previous_keys else "first snapshot baseline"
             if previous_keys:
-                adj_read, action_tag, b, br, r, e = _spot_adjusted_read(side.upper(), spot_delta, doi, oi_pct, dltp, dpct)
+                adj_read, action_tag, b, br, r, e = _spot_adjusted_read(side.upper(), spot_delta, doi, dltp, dpct)
             else:
                 adj_read, action_tag, b, br, r, e = "first snapshot baseline", "baseline", 0, 0, 0, 0
             rows.append({
@@ -349,7 +333,6 @@ def _build_matrix(current_keys: Dict[str, Dict[str, float]], previous_keys: Dict
                 "delta_oi_vs_previous": doi,
                 "delta_premium_vs_previous": dltp,
                 "premium_change_pct": dpct,
-                "oi_change_pct": oi_pct if previous_keys else 0.0,
                 "spot_change_points": spot_delta,
                 "spot_change_pct": spot_pct,
                 "matrix_read": generic,
@@ -387,6 +370,210 @@ def _rows_for_side(matrix: pd.DataFrame, side: str, tags: List[str]) -> pd.DataF
     return matrix[(matrix["side"].eq(side.upper())) & (matrix["action_tag"].isin(tags))].copy()
 
 
+def _actionable_matrix(matrix: pd.DataFrame, spot: float) -> pd.DataFrame:
+    """Only ATM/OTM side rows are allowed to drive actionable CE/PE wall guidance.
+
+    CE action: strikes at/above spot.
+    PE action: strikes at/below spot.
+    ITM rows remain useful as background positioning, but they must not be
+    described as overhead resistance/support walls.
+    """
+    if matrix.empty or not spot:
+        return matrix.copy()
+    x = matrix.copy()
+    return x[((x["side"].eq("CE")) & (x["strike"] >= spot)) | ((x["side"].eq("PE")) & (x["strike"] <= spot))].copy()
+
+
+def _itm_matrix(matrix: pd.DataFrame, spot: float) -> pd.DataFrame:
+    if matrix.empty or not spot:
+        return pd.DataFrame()
+    x = matrix.copy()
+    return x[((x["side"].eq("CE")) & (x["strike"] < spot)) | ((x["side"].eq("PE")) & (x["strike"] > spot))].copy()
+
+
+def _material_rows(x: pd.DataFrame) -> pd.DataFrame:
+    if x.empty:
+        return x
+    y = x.copy()
+    y["abs_oi"] = pd.to_numeric(y["delta_oi_vs_previous"], errors="coerce").abs().fillna(0)
+    y["abs_prem"] = pd.to_numeric(y["delta_premium_vs_previous"], errors="coerce").abs().fillna(0)
+    # Keep any real movement; first snapshots will naturally have no useful previous comparison.
+    return y[(y["abs_oi"] > 0) | (y["abs_prem"] > 0)].copy()
+
+
+def _itm_positioning_overlay(matrix: pd.DataFrame, spot: float) -> Tuple[str, Dict[str, int]]:
+    """Convert all material ITM CE/PE OI + premium combinations into a net overlay.
+
+    Important design rule:
+    - ITM CE below spot and ITM PE above spot are NOT actionable short-option walls.
+    - They are positioning/adjustment evidence that supports or challenges the main read.
+    - Actionable CE/PE guidance remains restricted to ATM/OTM side strikes.
+
+    Full matrix handled:
+    ITM CE below spot:
+      OI up + premium down   = bearish-neutral call writing/adjustment, weak bullish follow-through
+      OI up + premium up     = bullish pressure / aggressive ITM call demand, but confirm with POC migration
+      OI down + premium up   = bullish covering / short-call pressure, upside risk
+      OI down + premium down = long-call unwinding / bullish interest fading, bearish-neutral
+
+    ITM PE above spot:
+      OI up + premium down   = bearish exposure losing value / PE writing adjustment, range repair
+      OI up + premium up     = bearish stress / hedge buildup, downside risk
+      OI down + premium up   = put-writer covering or old bearish exposure reducing while premium stays firm, bearish-risk
+      OI down + premium down = bearish exposure unwinding and premium cooling, range repair / bullish-neutral
+    """
+    itm = _material_rows(_itm_matrix(matrix, spot))
+    if itm.empty:
+        return "", {"Bullish": 0, "Bearish": 0, "Range": 0, "Expansion": 0}
+
+    ce = itm[itm["side"].eq("CE")].copy()
+    pe = itm[itm["side"].eq("PE")].copy()
+
+    def case_mask(df: pd.DataFrame, oi: str, prem: str) -> pd.Series:
+        if df.empty:
+            return pd.Series(False, index=df.index)
+        doi = pd.to_numeric(df["delta_oi_vs_previous"], errors="coerce").fillna(0)
+        dpr = pd.to_numeric(df["delta_premium_vs_previous"], errors="coerce").fillna(0)
+        oi_ok = doi > 0 if oi == "up" else doi < 0 if oi == "down" else doi == 0
+        pr_ok = dpr > 0 if prem == "up" else dpr < 0 if prem == "down" else dpr == 0
+        return oi_ok & pr_ok
+
+    def case_strength(df: pd.DataFrame, oi: str, prem: str) -> float:
+        if df.empty:
+            return 0.0
+        m = case_mask(df, oi, prem)
+        if not bool(m.any()):
+            return 0.0
+        x = df.loc[m].copy()
+        # Scale by both OI and premium movement so one tiny row does not dominate.
+        oi_strength = pd.to_numeric(x["delta_oi_vs_previous"], errors="coerce").abs().fillna(0).sum()
+        prem_strength = pd.to_numeric(x["delta_premium_vs_previous"], errors="coerce").abs().fillna(0).sum()
+        pct_strength = pd.to_numeric(x["premium_change_pct"], errors="coerce").abs().fillna(0).sum()
+        return float(oi_strength * 0.01 + prem_strength + pct_strength * 0.15 + len(x) * 2.0)
+
+    def top_levels(df: pd.DataFrame, oi: str, prem: str, side: str, limit: int = 2) -> str:
+        if df.empty:
+            return ""
+        m = case_mask(df, oi, prem)
+        if not bool(m.any()):
+            return ""
+        x = df.loc[m].copy()
+        x["strength"] = (
+            pd.to_numeric(x["delta_oi_vs_previous"], errors="coerce").abs().fillna(0) * 0.01
+            + pd.to_numeric(x["delta_premium_vs_previous"], errors="coerce").abs().fillna(0)
+            + pd.to_numeric(x["premium_change_pct"], errors="coerce").abs().fillna(0) * 0.15
+        )
+        x = x.sort_values("strength", ascending=False).head(limit)
+        return ", ".join([f"{_fmt_level(r['strike'])} {side}" for _, r in x.iterrows()])
+
+    cases = {
+        # CE ITM below spot
+        "ce_oi_up_prem_down": case_strength(ce, "up", "down"),
+        "ce_oi_up_prem_up": case_strength(ce, "up", "up"),
+        "ce_oi_down_prem_up": case_strength(ce, "down", "up"),
+        "ce_oi_down_prem_down": case_strength(ce, "down", "down"),
+        # PE ITM above spot
+        "pe_oi_up_prem_down": case_strength(pe, "up", "down"),
+        "pe_oi_up_prem_up": case_strength(pe, "up", "up"),
+        "pe_oi_down_prem_up": case_strength(pe, "down", "up"),
+        "pe_oi_down_prem_down": case_strength(pe, "down", "down"),
+    }
+
+    scores = {"Bullish": 0, "Bearish": 0, "Range": 0, "Expansion": 0}
+    detail_clauses: List[Tuple[float, str]] = []
+
+    def add(key: str, bull: int, bear: int, rng: int, exp: int, clause: str) -> None:
+        strength = cases.get(key, 0.0)
+        if strength <= 0:
+            return
+        # Cap contribution per case; strength adds dominance but prevents runaway scoring.
+        mult = 1.0 + min(strength, 30.0) / 60.0
+        scores["Bullish"] += int(round(bull * mult))
+        scores["Bearish"] += int(round(bear * mult))
+        scores["Range"] += int(round(rng * mult))
+        scores["Expansion"] += int(round(exp * mult))
+        detail_clauses.append((strength, clause))
+
+    ce_ud_levels = top_levels(ce, "up", "down", "CE")
+    ce_uu_levels = top_levels(ce, "up", "up", "CE")
+    ce_du_levels = top_levels(ce, "down", "up", "CE")
+    ce_dd_levels = top_levels(ce, "down", "down", "CE")
+    pe_ud_levels = top_levels(pe, "up", "down", "PE")
+    pe_uu_levels = top_levels(pe, "up", "up", "PE")
+    pe_du_levels = top_levels(pe, "down", "up", "PE")
+    pe_dd_levels = top_levels(pe, "down", "down", "PE")
+
+    add(
+        "ce_oi_up_prem_down", 0, 8, 5, 0,
+        f"ITM CE buildup below spot with premium decay{f' at {ce_ud_levels}' if ce_ud_levels else ''} shows call-side writing/adjustment and weak bullish follow-through."
+    )
+    add(
+        "ce_oi_up_prem_up", 7, 0, 0, 5,
+        f"ITM CE OI buildup with premium expansion{f' at {ce_uu_levels}' if ce_uu_levels else ''} shows bullish pressure/ITM call demand, but it needs POC migration higher to become clean breakout validation."
+    )
+    add(
+        "ce_oi_down_prem_up", 8, 0, 0, 6,
+        f"ITM CE OI reduction with premium expansion{f' at {ce_du_levels}' if ce_du_levels else ''} suggests short-call covering/upside pressure; upside risk is active."
+    )
+    add(
+        "ce_oi_down_prem_down", 0, 5, 4, 0,
+        f"ITM CE OI reduction with premium decay{f' at {ce_dd_levels}' if ce_dd_levels else ''} shows long-call unwinding or bullish interest fading."
+    )
+
+    add(
+        "pe_oi_up_prem_down", 5, 0, 6, 0,
+        f"ITM PE OI buildup with premium decay{f' at {pe_ud_levels}' if pe_ud_levels else ''} shows bearish exposure losing value / PE writing adjustment; this supports range repair if spot reclaims POC."
+    )
+    add(
+        "pe_oi_up_prem_up", 0, 9, 0, 7,
+        f"ITM PE OI buildup with premium expansion{f' at {pe_uu_levels}' if pe_uu_levels else ''} shows active downside stress or hedging above spot."
+    )
+    add(
+        "pe_oi_down_prem_up", 0, 9, 0, 6,
+        f"ITM PE OI reduction with premium expansion{f' at {pe_du_levels}' if pe_du_levels else ''} means downside premium remains firm while existing put exposure is being reduced/covered; this is bearish-risk, not support."
+    )
+    add(
+        "pe_oi_down_prem_down", 5, 0, 6, 0,
+        f"ITM PE OI reduction with premium decay{f' at {pe_dd_levels}' if pe_dd_levels else ''} shows bearish exposure unwinding and premium cooling; this supports range repair / bullish-neutral tone."
+    )
+
+    # Combined dominance lines. These are the important high-confidence summaries.
+    bearish_combo = cases["ce_oi_up_prem_down"] + cases["ce_oi_down_prem_down"] + cases["pe_oi_up_prem_up"] + cases["pe_oi_down_prem_up"]
+    bullish_combo = cases["ce_oi_up_prem_up"] + cases["ce_oi_down_prem_up"] + cases["pe_oi_up_prem_down"] + cases["pe_oi_down_prem_down"]
+    two_sided_premium_stress = (cases["ce_oi_up_prem_up"] + cases["ce_oi_down_prem_up"] > 0) and (cases["pe_oi_up_prem_up"] + cases["pe_oi_down_prem_up"] > 0)
+    two_sided_premium_decay = (cases["ce_oi_up_prem_down"] + cases["ce_oi_down_prem_down"] > 0) and (cases["pe_oi_up_prem_down"] + cases["pe_oi_down_prem_down"] > 0)
+
+    if two_sided_premium_stress:
+        scores["Expansion"] += 10
+        detail_clauses.insert(0, (999.0, "Both ITM CE and ITM PE premium are firm/expanding in material pockets; this is two-sided premium stress, so avoid aggressive theta until one side cools."))
+    elif two_sided_premium_decay:
+        scores["Range"] += 10
+        detail_clauses.insert(0, (998.0, "Both ITM CE and ITM PE premium are cooling in material pockets; this supports range/theta unless POC starts migrating with price."))
+
+    if bearish_combo > bullish_combo * 1.25 and bearish_combo > 0:
+        scores["Bearish"] += 8
+        detail_clauses.insert(0, (1000.0, "Net ITM overlay leans bearish-to-range: upside participation is weak/absorbed while downside premium or hedge pressure remains more relevant."))
+    elif bullish_combo > bearish_combo * 1.25 and bullish_combo > 0:
+        scores["Bullish"] += 8
+        detail_clauses.insert(0, (1000.0, "Net ITM overlay leans bullish-repair: bullish pressure/covering is stronger while bearish premium is cooling or unwinding."))
+    elif bearish_combo > 0 and bullish_combo > 0:
+        scores["Expansion"] += 5
+        detail_clauses.insert(0, (1000.0, "Net ITM overlay is mixed: both bullish-repair and bearish-risk pockets exist, so use it as a caution filter rather than a standalone directional signal."))
+
+    if not detail_clauses:
+        return "", scores
+
+    # Keep commentary actionable and not too long: combined read + strongest 1-2 evidence clauses.
+    detail_clauses = sorted(detail_clauses, key=lambda x: x[0], reverse=True)
+    selected: List[str] = []
+    for _, clause in detail_clauses:
+        if clause not in selected:
+            selected.append(clause)
+        if len(selected) >= 3:
+            break
+
+    return "ITM positioning overlay: " + " ".join(selected), scores
+
 def _decide_tilt(scores: Dict[str, int]) -> str:
     ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     if not ordered or ordered[0][1] < 25:
@@ -401,8 +588,16 @@ def _decide_tilt(scores: Dict[str, int]) -> str:
     }.get(ordered[0][0], "MIXED / NO CLEAN EDGE")
 
 
-def _nearest_action_rows(matrix: pd.DataFrame, tags: List[str], side: str, limit: int = 3) -> List[str]:
+def _nearest_action_rows(matrix: pd.DataFrame, tags: List[str], side: str, limit: int = 3, spot: float | None = None) -> List[str]:
     x = _rows_for_side(matrix, side, tags)
+    if x.empty:
+        return []
+    side_u = side.upper()
+    if spot:
+        if side_u == "CE":
+            x = x[x["strike"] >= spot].copy()
+        elif side_u == "PE":
+            x = x[x["strike"] <= spot].copy()
     if x.empty:
         return []
     x["abs_premium_move"] = pd.to_numeric(x["delta_premium_vs_previous"], errors="coerce").abs().fillna(0)
@@ -411,41 +606,25 @@ def _nearest_action_rows(matrix: pd.DataFrame, tags: List[str], side: str, limit
     return [f"{_fmt_level(r['strike'])} {side.upper()} ({str(r['spot_adjusted_read'])})" for _, r in x.iterrows()]
 
 
-def _side_action(
-    side: str,
-    wall: float,
-    safer: float,
-    wall_move: str,
-    pressure_count: int,
-    control_count: int,
-    failure_count: int,
-    defence_pressure_count: int = 0,
-) -> str:
+def _side_action(side: str, wall: float, safer: float, wall_move: str, stress_count: int, control_count: int, failure_count: int, support_count: int = 0) -> str:
     side = side.upper()
     if side == "CE":
-        if failure_count > 0:
-            return f"CE writers are failing/covering at the active wall {_fmt_level(wall)}. Do not sell this wall; use only safer higher CE around {_fmt_level(safer)} or reduce CE risk."
-        if defence_pressure_count > 0:
-            return f"CE writers are still defending {_fmt_level(wall)}, but premium is rising. Sell only safer higher CE around {_fmt_level(safer)} now; shift down toward {_fmt_level(wall)} only after the next fetch shows premium cooling while OI holds."
+        if failure_count > 0 or stress_count > control_count:
+            return f"Avoid active CE wall at {_fmt_level(wall)} for fresh selling; use safer higher CE around {_fmt_level(safer)} only if chart supply is also present."
         if control_count > 0 and wall_move in ["stable", "lower", "first snapshot"]:
-            return f"CE wall {_fmt_level(wall)} is working. Active wall selling is acceptable; if already in safer higher CE, shifting closer can be considered only while premium decay continues."
+            return f"CE selling is acceptable near/above {_fmt_level(wall)}; do not chase lower unless premium decay continues."
         if wall_move == "higher":
-            return f"CE wall has shifted higher. Do not short the old resistance aggressively; prefer safer higher CE around {_fmt_level(safer)}."
-        if pressure_count > control_count:
-            return f"CE side has pressure but no clean failure. Keep CE selling conservative at {_fmt_level(safer)} and wait for decay before shifting closer."
-        return f"No high-confidence CE action at the active wall; keep CE selling conservative near {_fmt_level(safer)}."
+            return f"CE resistance has shifted higher; prefer {_fmt_level(safer)} rather than selling the old/near wall aggressively."
+        return f"No high-confidence CE sale at the active wall; keep CE selling conservative near {_fmt_level(safer)}."
     else:
-        if failure_count > 0:
-            return f"PE writers are failing/covering at the active wall {_fmt_level(wall)}. Do not sell this wall; use only safer lower PE around {_fmt_level(safer)} or reduce PE risk."
-        if defence_pressure_count > 0:
-            return f"PE writers are still defending {_fmt_level(wall)}, but premium is rising/not cooling. Sell only safer lower PE around {_fmt_level(safer)} now; shift up toward {_fmt_level(wall)} only after the next fetch shows premium cooling while OI holds."
-        if control_count > 0 and wall_move in ["stable", "higher", "first snapshot"]:
-            return f"PE wall {_fmt_level(wall)} is working. Active wall selling is acceptable; if already in safer lower PE, shifting closer can be considered only while premium decay continues."
+        if failure_count > 0 or stress_count > support_count + control_count:
+            return f"Avoid active PE wall at {_fmt_level(wall)} for fresh selling; use safer lower PE around {_fmt_level(safer)} only if chart demand is also present."
+        if support_count > 0 and wall_move in ["stable", "higher", "first snapshot"]:
+            return f"PE selling is acceptable near/below {_fmt_level(wall)}; support is valid only while PE premium stays soft."
         if wall_move == "lower":
-            return f"PE wall has shifted lower. Do not sell the old support aggressively; prefer safer lower PE around {_fmt_level(safer)}."
-        if pressure_count > control_count:
-            return f"PE side has pressure but no clean failure. Keep PE selling conservative at {_fmt_level(safer)} and wait for decay before shifting closer."
-        return f"No high-confidence PE action at the active wall; keep PE selling conservative near {_fmt_level(safer)}."
+            return f"PE support has shifted lower; prefer {_fmt_level(safer)} and avoid aggressive higher PE selling."
+        return f"No high-confidence PE sale at the active wall; keep PE selling conservative near {_fmt_level(safer)}."
+
 
 def _final_action(tilt: str, ce_action: str, pe_action: str, scores: Dict[str, int], spot: float, poc: float, poc_move: str) -> str:
     if tilt == "BULLISH POSITIONING":
@@ -492,48 +671,48 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
     key_strikes = _make_key_strikes(strikes, spot, poc, val, vah, ce_candidates, pe_candidates)
     prev_keys = _extract_prev_key_metrics(previous_summary)
     matrix = _build_matrix(key_strikes, prev_keys, spot, prev_spot)
+    action_matrix = _actionable_matrix(matrix, spot)
+    itm_overlay_line, itm_scores = _itm_positioning_overlay(matrix, spot)
 
-    # Spot-adjusted event counts. v3 separates clean control, defence under pressure, and failure.
-    ce_control = _count_tags(matrix, ["ce_control"], "CE")
-    ce_defence_pressure = _count_tags(matrix, ["ce_defence_pressure"], "CE")
-    ce_pressure = _count_tags(matrix, ["ce_pressure", "ce_defence_pressure"], "CE")
-    ce_failure = _count_tags(matrix, ["ce_failure"], "CE")
-
-    pe_control = _count_tags(matrix, ["pe_control"], "PE")
-    pe_defence_pressure = _count_tags(matrix, ["pe_defence_pressure"], "PE")
-    pe_pressure = _count_tags(matrix, ["pe_pressure", "pe_defence_pressure"], "PE")
-    pe_failure = _count_tags(matrix, ["pe_failure"], "PE")
+    # Spot-adjusted event counts for actionable walls only.
+    # ITM activity is handled separately as a positioning overlay.
+    ce_defence = _count_tags(action_matrix, ["ce_defended", "ce_defended_mild", "ce_control", "ce_control_mild"], "CE")
+    ce_stress = _count_tags(action_matrix, ["ce_stress", "ce_failure", "ce_abnormal"], "CE")
+    ce_failure = _count_tags(action_matrix, ["ce_failure"], "CE")
+    pe_support = _count_tags(action_matrix, ["pe_support", "pe_support_mild", "pe_defended", "pe_defended_mild"], "PE")
+    pe_stress = _count_tags(action_matrix, ["pe_trap", "pe_failure", "pe_stress"], "PE")
+    pe_failure = _count_tags(action_matrix, ["pe_failure"], "PE")
 
     above_poc = spot > poc if poc else False
     below_poc = spot < poc if poc else False
     stretched = abs(spot - poc) / spot > 0.025 if spot and poc else False
 
-    bullish = _sum_col(matrix, "bullish_pts")
-    bearish = _sum_col(matrix, "bearish_pts")
-    range_score = _sum_col(matrix, "range_pts")
-    expansion = _sum_col(matrix, "expansion_pts")
+    bullish = _sum_col(action_matrix, "bullish_pts") + int(itm_scores.get("Bullish", 0))
+    bearish = _sum_col(action_matrix, "bearish_pts") + int(itm_scores.get("Bearish", 0))
+    range_score = _sum_col(action_matrix, "range_pts") + int(itm_scores.get("Range", 0))
+    expansion = _sum_col(action_matrix, "expansion_pts") + int(itm_scores.get("Expansion", 0))
 
     # Structure/migration overlay. These are intentionally secondary to premium/OI behaviour.
     bullish += 12 if pe_move == "higher" else 0
     bullish += 8 if ce_move == "higher" else 0
     bullish += 8 if above_poc and poc_move in ["higher", "stable", "first snapshot"] else 0
-    bullish += 8 if pe_control > pe_pressure and pe_control > 0 else 0
+    bullish += 8 if pe_support > pe_stress and pe_support > 0 else 0
 
     bearish += 12 if ce_move == "lower" else 0
     bearish += 8 if pe_move == "lower" else 0
     bearish += 8 if below_poc and poc_move in ["lower", "stable", "first snapshot"] else 0
-    bearish += 8 if ce_control > ce_pressure and ce_control > 0 else 0
+    bearish += 8 if ce_defence > ce_stress and ce_defence > 0 else 0
 
     range_score += 15 if range_move in ["stable", "narrowing", "first snapshot"] else 0
-    range_score += 12 if ce_control > 0 and pe_control > 0 else 0
+    range_score += 12 if ce_defence > 0 and pe_support > 0 else 0
     range_score += 10 if not stretched and poc_move in ["stable", "first snapshot"] else 0
     range_score += 8 if pe_wall < spot < ce_wall else 0
 
     expansion += 18 if range_move == "widening" else 0
-    expansion += 18 if (ce_pressure > 0 or ce_failure > 0) and (pe_pressure > 0 or pe_failure > 0) else 0
+    expansion += 18 if ce_stress > 0 and pe_stress > 0 else 0
     expansion += 12 if stretched and poc_move not in ["stable", "first snapshot"] else 0
-    expansion += 15 if pe_pressure > pe_control and _direction(spot_delta) == "up" else 0  # key correction: PE premium firm during rise = trap risk
-    expansion += 15 if ce_pressure > ce_control and _direction(spot_delta) == "down" else 0
+    expansion += 15 if pe_stress > pe_support and _direction(spot_delta) == "up" else 0  # key correction: PE premium firm during rise = trap risk
+    expansion += 15 if ce_stress > ce_defence and _direction(spot_delta) == "down" else 0
 
     scores = {
         "Bullish": int(max(0, min(100, bullish))),
@@ -546,8 +725,8 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
     hvn = strikes.sort_values("combined_oi", ascending=False).head(5)[["strike", "combined_oi"]].to_dict("records")
     lvn = strikes[strikes["combined_oi"] > 0].sort_values("combined_oi", ascending=True).head(5)[["strike", "combined_oi"]].to_dict("records")
 
-    ce_action = _side_action("CE", ce_wall, safer_ce, ce_move, ce_pressure, ce_control, ce_failure, ce_defence_pressure)
-    pe_action = _side_action("PE", pe_wall, safer_pe, pe_move, pe_pressure, pe_control, pe_failure, pe_defence_pressure)
+    ce_action = _side_action("CE", ce_wall, safer_ce, ce_move, ce_stress, ce_defence, ce_failure)
+    pe_action = _side_action("PE", pe_wall, safer_pe, pe_move, pe_stress, 0, pe_failure, pe_support)
     final_action = _final_action(tilt, ce_action, pe_action, scores, spot, poc, poc_move)
 
     commentary = build_commentary(
@@ -567,14 +746,10 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
         ce_move=ce_move,
         pe_move=pe_move,
         range_move=range_move,
-        ce_control=ce_control,
-        ce_pressure=ce_pressure,
-        ce_defence_pressure=ce_defence_pressure,
-        ce_failure=ce_failure,
-        pe_control=pe_control,
-        pe_pressure=pe_pressure,
-        pe_defence_pressure=pe_defence_pressure,
-        pe_failure=pe_failure,
+        ce_defence=ce_defence,
+        ce_stress=ce_stress,
+        pe_support=pe_support,
+        pe_stress=pe_stress,
         stretched=stretched,
         previous_summary=previous_summary,
         matrix=matrix,
@@ -582,6 +757,7 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
         pe_action=pe_action,
         final_action=final_action,
         scores=scores,
+        itm_overlay_line=itm_overlay_line,
     )
 
     return {
@@ -630,14 +806,10 @@ def build_commentary(
     ce_move: str,
     pe_move: str,
     range_move: str,
-    ce_control: int,
-    ce_pressure: int,
-    ce_defence_pressure: int,
-    ce_failure: int,
-    pe_control: int,
-    pe_pressure: int,
-    pe_defence_pressure: int,
-    pe_failure: int,
+    ce_defence: int,
+    ce_stress: int,
+    pe_support: int,
+    pe_stress: int,
     stretched: bool,
     previous_summary: Dict[str, Any],
     matrix: pd.DataFrame,
@@ -645,6 +817,7 @@ def build_commentary(
     pe_action: str,
     final_action: str,
     scores: Dict[str, int],
+    itm_overlay_line: str = "",
 ) -> str:
     prev_tilt = previous_summary.get("tilt") or previous_summary.get("odme_tilt") or "No previous snapshot"
     first = poc_move == "first snapshot" or not prev_spot
@@ -664,47 +837,36 @@ def build_commentary(
     else:
         poc_line = f"POC has shifted {poc_move} to {_fmt_level(poc)}; do not fade against this migration aggressively."
 
-    ce_key = _nearest_action_rows(matrix, ["ce_pressure", "ce_defence_pressure", "ce_failure"], "CE", 2)
-    ce_ctrl = _nearest_action_rows(matrix, ["ce_control"], "CE", 2)
-    pe_key = _nearest_action_rows(matrix, ["pe_pressure", "pe_defence_pressure", "pe_failure"], "PE", 2)
-    pe_ctrl = _nearest_action_rows(matrix, ["pe_control"], "PE", 2)
+    ce_key = _nearest_action_rows(matrix, ["ce_stress", "ce_failure", "ce_abnormal"], "CE", 2, spot)
+    ce_ctrl = _nearest_action_rows(matrix, ["ce_defended", "ce_defended_mild", "ce_control", "ce_control_mild"], "CE", 2, spot)
+    pe_key = _nearest_action_rows(matrix, ["pe_trap", "pe_failure", "pe_stress"], "PE", 2, spot)
+    pe_ctrl = _nearest_action_rows(matrix, ["pe_support", "pe_support_mild", "pe_defended", "pe_defended_mild"], "PE", 2, spot)
 
-    if ce_failure > 0:
-        ce_line = f"CE writers are failing at {', '.join(ce_key) if ce_key else _fmt_level(ce_wall)}. {ce_action}"
-    elif ce_defence_pressure > 0:
-        ce_line = f"CE writers are still defending, but under pressure at {', '.join(ce_key) if ce_key else _fmt_level(ce_wall)}. {ce_action}"
-    elif ce_control > 0:
-        ce_line = f"CE writers are in control at {', '.join(ce_ctrl) if ce_ctrl else _fmt_level(ce_wall)}. {ce_action}"
-    elif ce_pressure > 0:
-        ce_line = f"CE side shows pressure but no confirmed failure. {ce_action}"
+    if ce_stress > ce_defence:
+        ce_line = f"CE side is not clean for aggressive selling. Stress/failure is visible at {', '.join(ce_key) if ce_key else _fmt_level(ce_wall)}. {ce_action}"
+    elif ce_defence > 0:
+        ce_line = f"CE side shows writer absorption at {', '.join(ce_ctrl) if ce_ctrl else _fmt_level(ce_wall)}. {ce_action}"
     else:
         ce_line = f"CE side has no strong confirmation. {ce_action}"
 
-    if pe_failure > 0:
-        pe_line = f"PE writers are failing at {', '.join(pe_key) if pe_key else _fmt_level(pe_wall)}. {pe_action}"
-    elif pe_defence_pressure > 0:
-        pe_line = f"PE writers are still defending, but under pressure at {', '.join(pe_key) if pe_key else _fmt_level(pe_wall)}. {pe_action}"
-    elif pe_control > 0:
-        pe_line = f"PE writers are in control at {', '.join(pe_ctrl) if pe_ctrl else _fmt_level(pe_wall)}. {pe_action}"
-    elif pe_pressure > 0:
-        pe_line = f"PE side shows pressure but no confirmed failure. {pe_action}"
+    if pe_stress > pe_support:
+        pe_line = f"PE side is not clean support. Premium/OI behaviour warns at {', '.join(pe_key) if pe_key else _fmt_level(pe_wall)}. {pe_action}"
+    elif pe_support > 0:
+        pe_line = f"PE side shows usable support at {', '.join(pe_ctrl) if pe_ctrl else _fmt_level(pe_wall)}. {pe_action}"
     else:
         pe_line = f"PE side has no strong confirmation. {pe_action}"
 
+    # Critical correction explicitly inside commentary, but actionable not theoretical.
     spot_dir = _direction(spot_delta, 0.0)
     correction_line = ""
-    if spot_dir == "up" and pe_defence_pressure > 0:
-        correction_line = "Heads-up: PE writers are still adding/defending, but PE premium has not cooled. Use safer lower PE first; shift up only after the next fetch confirms premium decay with OI holding."
-    elif spot_dir == "up" and pe_control > pe_pressure and pe_control > 0:
-        correction_line = "PE support is clean because premium is soft/decaying while OI is being added. This supports bullish theta exposure."
-    elif spot_dir == "up" and pe_failure > 0:
-        correction_line = "Warning: spot is higher but PE premium remains firm while OI is not holding. That is not support; it is hedge demand/writer exit risk."
-    elif spot_dir == "down" and ce_defence_pressure > 0:
-        correction_line = "Heads-up: CE writers are still adding/defending, but CE premium has not cooled. Use safer higher CE first; shift down only after the next fetch confirms premium decay with OI holding."
-    elif spot_dir == "down" and ce_control > ce_pressure and ce_control > 0:
-        correction_line = "CE pressure is clean because premium is soft/decaying while OI is being added. This supports bearish theta exposure."
-    elif spot_dir == "down" and ce_failure > 0:
-        correction_line = "Warning: spot is lower but CE premium remains firm while OI is not holding. That is upside hedge/writer exit risk, not clean bearish control."
+    if spot_dir == "up" and pe_stress > 0:
+        correction_line = "Important: spot is higher but PE premium is not decaying cleanly at key strikes, so this is not clean bullish support; treat it as trap/hedge demand until PE premium softens."
+    elif spot_dir == "up" and pe_support > pe_stress and pe_support > 0:
+        correction_line = "PE support is valid because premium is soft/decaying while OI is being added; this is the cleaner bullish condition."
+    elif spot_dir == "down" and ce_stress > 0:
+        correction_line = "Important: spot is lower but CE premium is not decaying cleanly at key strikes, so this is not clean bearish control; upside hedge/covering risk remains."
+    elif spot_dir == "down" and ce_defence > ce_stress and ce_defence > 0:
+        correction_line = "CE pressure is valid because premium is soft/decaying while OI is being added; this is the cleaner bearish condition."
 
     risk_line = ""
     if tilt == "EXPANSION / TRAP RISK":
@@ -714,41 +876,21 @@ def build_commentary(
     elif tilt == "RANGE-BOUND THETA":
         risk_line = "Theta condition is acceptable only if strikes are kept outside the active walls and POC does not migrate with price."
     elif tilt == "BULLISH POSITIONING":
-        risk_line = "Bias favours PE selling or holding bullish theta, but only while PE premium remains soft/decays and PE wall does not shift lower."
+        risk_line = "Bias favours PE selling or holding bullish theta, but only while PE premium remains soft and PE wall does not shift lower."
     elif tilt == "BEARISH POSITIONING":
-        risk_line = "Bias favours CE selling or holding bearish theta, but only while CE premium remains soft/decays and CE wall does not shift higher."
+        risk_line = "Bias favours CE selling or holding bearish theta, but only while CE premium remains soft and CE wall does not shift higher."
 
-    # Important: keep the commentary detailed even when correction_line is blank.
-    # In the earlier build, the inline conditional accidentally suppressed all
-    # sections before Final Action when correction_line was empty.
-    quiet_market = (not first) and abs(spot_delta) <= max(spot * 0.0003, 1.0) and poc_move == "stable" and ce_move == "stable" and pe_move == "stable"
-    if quiet_market:
-        session_line = (
-            "Market/ODME change is negligible versus the last saved snapshot. Treat this as a holding/monitoring read, "
-            "not as a fresh high-conviction signal. The next live moving snapshot will become more useful once spot, OI or premiums change."
-        )
-    elif first:
-        session_line = (
-            "This is the baseline snapshot. Use it to map the live option structure; confirmation improves from the next fetch onward."
-        )
-    else:
-        session_line = (
-            "This is an active comparison against the last saved ODME snapshot; action quality depends on whether premium behaviour confirms writer control or failure."
-        )
-
-    detail_lines = [
-        f"ODME Verdict: {tilt}. Scores — Bullish {scores.get('Bullish', 0)}, Bearish {scores.get('Bearish', 0)}, Range {scores.get('Range', 0)}, Expansion {scores.get('Expansion', 0)}.",
-        f"Session Read: {session_line}",
-        f"What changed: {change_line}",
-        f"Positioning: spot/future proxy is {_fmt_level(spot)}. Option POC {_fmt_level(poc)}; value area {_fmt_level(val)}–{_fmt_level(vah)}. {poc_line}",
-        f"Walls: active CE wall {_fmt_level(ce_wall)} ({ce_move}); active PE wall {_fmt_level(pe_wall)} ({pe_move}); range is {range_move}.",
-        f"CE Action: {ce_line}",
-        f"PE Action: {pe_line}",
-    ]
-    if correction_line:
-        detail_lines.append(f"Heads-up: {correction_line}")
-    detail_lines.extend([
-        f"Final Action: {final_action}",
-        f"Risk Note: {risk_line}",
-    ])
-    return "\n\n".join(detail_lines)
+    return (
+        f"ODME Verdict: {tilt}. Scores — Bullish {scores.get('Bullish', 0)}, Bearish {scores.get('Bearish', 0)}, Range {scores.get('Range', 0)}, Expansion {scores.get('Expansion', 0)}.\n\n"
+        f"What changed: {change_line}\n\n"
+        f"Positioning: spot/future proxy is {_fmt_level(spot)}. Option POC {_fmt_level(poc)}; value area {_fmt_level(val)}–{_fmt_level(vah)}. {poc_line}"
+        + (f" {itm_overlay_line}" if itm_overlay_line else "")
+        + "\n\n"
+        f"Walls: active CE wall {_fmt_level(ce_wall)} ({ce_move}); active PE wall {_fmt_level(pe_wall)} ({pe_move}); range is {range_move}.\n\n"
+        f"CE Action: {ce_line}\n\n"
+        f"PE Action: {pe_line}\n\n"
+        f"{correction_line}\n\n" if correction_line else ""
+    ) + (
+        f"Final Action: {final_action}\n\n"
+        f"Risk Note: {risk_line}"
+    )
