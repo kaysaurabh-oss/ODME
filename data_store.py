@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -71,6 +72,35 @@ def _json_loads(value: Any, default: Any = None) -> Any:
         return default
 
 
+def select_prior_day_anchor(history: pd.DataFrame, tz_name: str = "Asia/Kolkata") -> Dict[str, Any]:
+    """Pick the latest saved snapshot strictly before today's local date as anchor.
+
+    This is not limited to yesterday. If the previous trading session was Friday
+    and today is Monday, Friday's latest saved snapshot is the anchor. If there
+    are holidays or the app was not opened for several days, the most recent
+    saved snapshot before today is used. Same-day snapshots are intentionally
+    excluded so intraday commentary does not drift against the last refresh.
+    """
+    if history is None or history.empty or "ts" not in history.columns:
+        return {}
+    df = history.copy()
+    df["_ts_utc"] = pd.to_datetime(df["ts"], errors="coerce", utc=True)
+    df = df.dropna(subset=["_ts_utc"])
+    if df.empty:
+        return {}
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Asia/Kolkata")
+    now_local_date = datetime.now(tz).date()
+    df["_local_date"] = df["_ts_utc"].dt.tz_convert(tz).dt.date
+    prior = df[df["_local_date"] < now_local_date].copy()
+    if prior.empty:
+        return {}
+    prior = prior.sort_values("_ts_utc")
+    return prior.iloc[-1].drop(labels=[c for c in ["_ts_utc", "_local_date"] if c in prior.columns]).to_dict()
+
+
 class BaseStore:
     def ensure(self) -> None:
         raise NotImplementedError
@@ -80,6 +110,16 @@ class BaseStore:
 
     def load_latest_odme_snapshot(self, key: str) -> Dict[str, Any]:
         raise NotImplementedError
+
+    def load_anchor_odme_snapshot(self, key: str, tz_name: str = "Asia/Kolkata") -> Dict[str, Any]:
+        """Return the fixed prior-day closing anchor for intraday comparison.
+
+        ODME live refreshes compare against the latest saved snapshot before
+        today's local date, not against the previous same-day refresh. This keeps
+        the previous-session positioning as the fixed anchor throughout the day.
+        """
+        hist = self.load_odme_history(key, limit=500)
+        return select_prior_day_anchor(hist, tz_name=tz_name)
 
     def load_odme_history(self, key: Optional[str] = None, limit: int = 100) -> pd.DataFrame:
         raise NotImplementedError

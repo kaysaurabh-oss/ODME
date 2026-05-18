@@ -14,6 +14,16 @@ from odme_engine import analyze_odme
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
 
+@st.cache_resource(show_spinner=False)
+def _angel_session_cache() -> Dict[str, Any]:
+    """Process-level cache to survive Streamlit websocket/session resets while app process is alive.
+
+    This does not survive Streamlit Cloud sleep/restart, but it reduces repeated TOTP prompts
+    during normal reruns or temporary browser reconnects.
+    """
+    return {}
+
+
 # =============================================================================
 # Session / login
 # =============================================================================
@@ -31,6 +41,17 @@ def init_session() -> None:
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
+
+    # Restore cached Angel session after a Streamlit websocket reset, if the
+    # Python process is still alive. If Streamlit Cloud slept/restarted, cache
+    # will be empty and a fresh TOTP login is unavoidable.
+    if not st.session_state.get("logged_in"):
+        cache = _angel_session_cache()
+        if cache.get("angel") is not None and cache.get("master") is not None:
+            st.session_state.logged_in = True
+            st.session_state.angel = cache.get("angel")
+            st.session_state.master = cache.get("master")
+            st.session_state.angel_login_at = cache.get("angel_login_at", "")
 
 
 def login_page() -> None:
@@ -53,7 +74,11 @@ def login_page() -> None:
             st.session_state.angel = angel
             st.session_state.master = master
             st.session_state.angel_login_at = angel.login_time_utc or ""
-            st.success("Angel login successful. Instrument master loaded. This browser session will reuse the Angel login until Streamlit restarts or Angel session expires.")
+            cache = _angel_session_cache()
+            cache["angel"] = angel
+            cache["master"] = master
+            cache["angel_login_at"] = angel.login_time_utc or ""
+            st.success("Angel login successful. Instrument master loaded. Login will be reused while the Streamlit process remains active. Fresh TOTP is needed only after Angel session expiry or Streamlit Cloud restart/sleep.")
             st.rerun()
         except Exception as exc:
             st.session_state.login_error = str(exc)
@@ -508,6 +533,7 @@ def app_header(store) -> None:
         if st.button("Logout"):
             for k in ["logged_in", "angel", "master", "angel_login_at"]:
                 st.session_state[k] = False if k == "logged_in" else None
+            _angel_session_cache().clear()
             st.rerun()
     mode = "Google Sheets" if store.__class__.__name__ == "GoogleSheetStore" else "Local files"
     angel = st.session_state.get("angel")
@@ -531,8 +557,12 @@ def fetch_analyze_save(store, angel: AngelConnector, master: pd.DataFrame, instr
             return None
 
     angel.ensure_session_ready()
-    previous_raw = store.load_latest_odme_snapshot(key)
+    previous_raw = store.load_anchor_odme_snapshot(key)
     previous = parse_previous_summary(previous_raw)
+    if isinstance(previous_raw, dict) and previous_raw.get("ts"):
+        anchor_note = f"anchor=latest saved snapshot before today ({previous_raw.get('ts')})"
+    else:
+        anchor_note = "anchor=no saved snapshot before today; current snapshot saved, anchored comparison will begin from the next trading session"
 
     chain, info = angel.fetch_option_chain_snapshot(master, instrument, expiry)
     future_ltp = float(info.get("future_ltp") or 0)
@@ -542,11 +572,14 @@ def fetch_analyze_save(store, angel: AngelConnector, master: pd.DataFrame, instr
     usable = int((pd.to_numeric(chain.get("oi", pd.Series(dtype=float)), errors="coerce").fillna(0) > 0).sum())
     result = analyze_odme(chain, instrument, future_ltp, previous_summary=previous)
     result["_previous_summary"] = previous
+    result["anchor_snapshot_ts"] = previous_raw.get("ts", "") if isinstance(previous_raw, dict) else ""
     result["future_ltp"] = future_ltp
     result["future_symbol"] = info.get("future_symbol", "")
     result["future_token"] = info.get("future_token", "")
     result["future_expiry"] = info.get("future_expiry", "")
     result["future_feed_time"] = info.get("future_feed_time", "")
+    result["future_mapping_reason"] = info.get("future_mapping_reason", "")
+    result["option_expiry_used_for_mapping"] = info.get("option_expiry_used_for_mapping", "")
 
     snapshot_id = make_snapshot_id(key)
     ts = utc_now_iso()
@@ -565,7 +598,7 @@ def fetch_analyze_save(store, angel: AngelConnector, master: pd.DataFrame, instr
         "expiry": expiry,
         "source": "Angel SmartAPI FULL options + verified Angel futures LTP → ODME compact summary",
         "usable_oi_count": usable,
-        "notes": f"{status_note}; {future_note}; contracts={len(chain)}; unfetched={info.get('unfetched_count', 0)}",
+        "notes": f"{status_note}; {anchor_note}; {future_note}; contracts={len(chain)}; unfetched={info.get('unfetched_count', 0)}",
     }
     store.append_odme_snapshot(result, meta)
     last_map[key] = now
@@ -680,6 +713,9 @@ def render_odme_dashboard(display: Dict[str, Any], comparison: pd.DataFrame, liv
                 "future_expiry": live_result.get("future_expiry", ""),
                 "future_ltp": live_result.get("future_ltp", live_result.get("spot", "")),
                 "future_feed_time": live_result.get("future_feed_time", ""),
+                "future_mapping_reason": live_result.get("future_mapping_reason", ""),
+                "option_expiry_used_for_mapping": live_result.get("option_expiry_used_for_mapping", ""),
+                "anchor_snapshot_before_today_ts": live_result.get("anchor_snapshot_ts", ""),
             })
     render_action_sections(display)
     render_previous_and_scores(comparison, display)
@@ -723,7 +759,7 @@ def main_page() -> None:
             st.stop()
         expiry = st.selectbox("Select expiry", expiries, index=0)
         key = make_key(instrument, expiry)
-        st.caption("Spot/future is fetched from Angel futures only. If future LTP cannot be verified, ODME will stop instead of assuming data.")
+        st.caption("Spot/future is fetched from the related Angel futures contract only. If futures LTP or contract mapping cannot be verified, ODME stops instead of assuming data.")
         st.caption(f"Option contracts found: {len(option_rows[option_rows['expiry'].astype(str).eq(str(expiry))])}")
         fetch = st.button("Fetch Live + Save ODME Summary", type="primary")
         auto_on = st.checkbox("Auto-refresh hourly while app is open", value=False)
@@ -743,7 +779,7 @@ def main_page() -> None:
             try:
                 res = fetch_analyze_save(store, angel, master, instrument, expiry, force=True)
                 if res and res["usable"] > 0:
-                    st.success(f"ODME summary saved. Future LTP: {res.get('future_ltp', 0):,.2f}. Usable OI contracts: {res['usable']}. Full chain rows were not saved.")
+                    st.success(f"ODME summary saved. Future LTP: {res.get('future_ltp', 0):,.2f}. Usable OI contracts: {res['usable']}. Comparison uses the latest saved snapshot before today as the fixed anchor. Full chain rows were not saved.")
                 elif res:
                     st.warning("Summary saved, but this expiry has no usable OI. Select another active expiry.")
             except AngelSessionError as exc:
@@ -775,7 +811,7 @@ def main_page() -> None:
     else:
         saved = store.load_latest_odme_snapshot(key)
         if saved:
-            st.info("Showing last saved ODME summary. Click Fetch Live + Save ODME Summary for current chain heatmap and fresh comparison.")
+            st.info("Showing last saved ODME summary. Live comparisons use the latest saved snapshot before today as the fixed anchor; click Fetch Live + Save ODME Summary for current chain heatmap and fresh anchored comparison.")
             display = saved_row_to_display(saved)
             comparison = build_saved_comparison_table(history)
             render_odme_dashboard(display, comparison, live_result=None)

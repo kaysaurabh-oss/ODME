@@ -286,27 +286,68 @@ class AngelConnector:
                 fetched[col] = pd.to_numeric(fetched[col], errors="coerce").fillna(0)
         return fetched
 
-    def fetch_future_ltp(self, master: pd.DataFrame, instrument: str, option_rows: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    def fetch_future_ltp(
+        self,
+        master: pd.DataFrame,
+        instrument: str,
+        option_rows: Optional[pd.DataFrame] = None,
+        option_expiry: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Fetch verified related futures LTP for the selected option expiry.
+
+        For index weeklies and MCX commodity options, option expiry frequently does not
+        match the futures expiry. The correct futures proxy is the nearest active futures
+        contract whose expiry is on/after the selected option expiry. If that is not
+        available, we fall back to the nearest active futures contract and clearly expose
+        the mapping in the verification panel.
+        """
         futures = self.get_future_rows(master, instrument)
         if futures.empty:
             raise AngelDataError(
-                f"No futures contract found in Angel master for {instrument}. ODME blocked because future LTP is required."
+                f"No futures contract found in Angel master for {instrument}. ODME blocked because related futures LTP is required."
             )
+
         today = pd.Timestamp(datetime.now().date())
         futures = futures[(futures["expiry_dt"].isna()) | (futures["expiry_dt"] >= today)].copy()
         if futures.empty:
             raise AngelDataError(f"Only expired futures found for {instrument}. ODME blocked.")
 
+        option_expiry_dt = _parse_expiry_date(option_expiry) if option_expiry else pd.NaT
+        futures["_expiry_rank"] = 9_999_999
+        futures["_selection_reason"] = "nearest active futures"
+        if not pd.isna(option_expiry_dt):
+            # Prefer related futures: futures expiry on/after selected option expiry.
+            diff_days = (futures["expiry_dt"] - option_expiry_dt).dt.days
+            related_mask = diff_days.ge(0) | futures["expiry_dt"].isna()
+            if related_mask.any():
+                futures.loc[related_mask, "_expiry_rank"] = diff_days[related_mask].fillna(999999).astype(int)
+                futures.loc[related_mask, "_selection_reason"] = "nearest futures expiry on/after selected option expiry"
+                candidates = futures[related_mask].copy()
+            else:
+                # Fallback is explicit; do not silently assume same-expiry matching.
+                diff_today = (futures["expiry_dt"] - today).dt.days
+                futures["_expiry_rank"] = diff_today.fillna(999999).astype(int)
+                candidates = futures.copy()
+        else:
+            diff_today = (futures["expiry_dt"] - today).dt.days
+            futures["_expiry_rank"] = diff_today.fillna(999999).astype(int)
+            candidates = futures.copy()
+
         exchange = self.option_exchange_for_instrument(instrument)
-        futures = futures.sort_values(["expiry_dt", "expiry"], na_position="last").head(18)
-        tokens = futures["token"].astype(str).dropna().unique().tolist()
+        candidates = candidates.sort_values(["_expiry_rank", "expiry_dt", "expiry"], na_position="last").head(24)
+        tokens = candidates["token"].astype(str).dropna().unique().tolist()
+        if not tokens:
+            raise AngelDataError(f"No usable futures tokens found for {instrument}. ODME blocked.")
+
         md = self.get_market_data_full(exchange, tokens)
         fetched = self._normalize_market_df(md.get("fetched", []))
         if fetched.empty:
             raise AngelDataError(
-                f"Angel returned no futures quote for {instrument}. ODME blocked; cannot verify spot/future LTP."
+                f"Angel returned no futures quote for {instrument}. ODME blocked; cannot verify related futures LTP."
             )
-        meta = futures[[c for c in ["token", "symbol", "expiry", "expiry_dt", "exch_seg", "name"] if c in futures.columns]].copy()
+
+        meta_cols = [c for c in ["token", "symbol", "expiry", "expiry_dt", "exch_seg", "name", "_expiry_rank", "_selection_reason"] if c in candidates.columns]
+        meta = candidates[meta_cols].copy()
         meta["token"] = meta["token"].astype(str)
         fut = meta.merge(fetched, on="token", how="left", suffixes=("", "_md"))
         if "symbol_md" in fut.columns:
@@ -316,10 +357,10 @@ class AngelConnector:
         active = fut[fut["ltp"] > 0].copy()
         if active.empty:
             raise AngelDataError(
-                f"Futures quote for {instrument} has zero/missing LTP. ODME blocked; choose another instrument or try later."
+                f"Related futures quotes for {instrument} have zero/missing LTP. ODME blocked; try again after quotes update or select another instrument."
             )
 
-        active = active.sort_values(["expiry_dt", "expiry", "volume"], ascending=[True, True, False], na_position="last")
+        active = active.sort_values(["_expiry_rank", "expiry_dt", "volume"], ascending=[True, True, False], na_position="last")
         row = active.iloc[0].to_dict()
         ltp = _safe_float(row.get("ltp"))
 
@@ -332,8 +373,9 @@ class AngelConnector:
                 buffer = max((mx - mn) * 0.05, ltp * 0.01)
                 if not (mn - buffer <= ltp <= mx + buffer):
                     raise AngelDataError(
-                        f"Unsafe future LTP for {instrument}: {ltp:,.2f} from {row.get('symbol')} is outside selected option-chain strike range "
-                        f"{mn:,.0f}–{mx:,.0f}. ODME blocked instead of assuming wrong spot."
+                        f"Unsafe related futures LTP for {instrument}: {ltp:,.2f} from {row.get('symbol')} "
+                        f"is outside selected option-chain strike range {mn:,.0f}–{mx:,.0f}. "
+                        f"ODME blocked instead of assuming wrong spot. Futures mapping reason: {row.get('_selection_reason', '')}."
                     )
 
         return {
@@ -344,6 +386,8 @@ class AngelConnector:
             "future_exchange": exchange,
             "future_feed_time": str(row.get("feed_time", "")),
             "future_trade_time": str(row.get("trade_time", "")),
+            "future_mapping_reason": str(row.get("_selection_reason", "")),
+            "option_expiry_used_for_mapping": str(option_expiry or ""),
         }
 
     def fetch_option_chain_snapshot(self, master: pd.DataFrame, instrument: str, expiry: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -354,7 +398,7 @@ class AngelConnector:
             raise AngelDataError(f"No option contracts found for {instrument} expiry {expiry}.")
         exchange = self.option_exchange_for_instrument(instrument)
 
-        future_info = self.fetch_future_ltp(master, instrument, option_rows=option_rows)
+        future_info = self.fetch_future_ltp(master, instrument, option_rows=option_rows, option_expiry=expiry)
         tokens = option_rows["token"].astype(str).dropna().unique().tolist()
         md = self.get_market_data_full(exchange, tokens)
         fetched = self._normalize_market_df(md.get("fetched", []))
