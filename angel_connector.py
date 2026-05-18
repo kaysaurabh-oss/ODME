@@ -12,7 +12,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from odme_config import ANGEL_INSTRUMENT_MASTER_URL, LOCAL_CONFIG_PATH, MCX_SYMBOLS
+from odme_config import ANGEL_INSTRUMENT_MASTER_URL, LOCAL_CONFIG_PATH, MCX_SYMBOLS, MCX_STRIKE_SCALE_DIVISOR
 
 try:
     from SmartApi import SmartConnect
@@ -185,11 +185,35 @@ class AngelConnector:
 
     @staticmethod
     def normalize_strike(row: pd.Series) -> float:
+        """Normalize Angel master strike to the actual displayed strike.
+
+        Angel uses 100x strike storage for many contracts, but the old generic
+        rule (divide only when strike >= 100000) misses lower-priced MCX
+        contracts such as NATURALGAS, NATGASMINI, COPPER and ZINC.
+
+        This function therefore uses an instrument-specific MCX scale first.
+        It keeps SILVER/SILVERM/SILVERMIC unscaled because those contracts are
+        quoted at large absolute strike levels.
+        """
         strike = _safe_float(row.get("strike", 0))
-        exch = str(row.get("exch_seg", "")).upper()
+        if strike <= 0:
+            return 0.0
+
+        exch = str(row.get("exch_seg", "")).upper().strip()
+        name = str(row.get("name", "")).upper().strip()
+
+        if exch == "MCX" and name in MCX_STRIKE_SCALE_DIVISOR:
+            divisor = _safe_float(MCX_STRIKE_SCALE_DIVISOR.get(name, 1.0), 1.0)
+            if divisor and divisor != 1.0:
+                return strike / divisor
+            return strike
+
+        # NSE FO index/equity options are generally 100x in Angel master.
+        if exch == "NFO":
+            return strike / 100.0 if strike >= 100000 else strike
+
+        # Conservative fallback for very large raw strikes.
         if strike >= 100000:
-            return strike / 100.0
-        if exch == "NFO" and strike >= 10000 * 100:
             return strike / 100.0
         return strike
 

@@ -35,6 +35,26 @@ RELEVANT_RANGE_PCT = {
 
 DEFAULT_RELEVANT_RANGE_PCT = 0.10
 
+# Angel MCX strike scaling is not uniform in appearance.
+# Some lower-priced MCX commodities are stored as 100x in the master even when
+# the raw strike is below the old generic 100000 threshold.
+# Example: NATURALGAS 30000 in master means 300.00 strike.
+# Keep SILVER/SILVERM unscaled because those contracts are quoted at large absolute levels.
+MCX_STRIKE_SCALE_DIVISOR = {
+    "NATURALGAS": 100.0,
+    "NATGASMINI": 100.0,
+    "COPPER": 100.0,
+    "ZINC": 100.0,
+    "CRUDEOIL": 100.0,
+    "CRUDEOILM": 100.0,
+    "GOLD": 100.0,
+    "GOLDM": 100.0,
+    "SILVER": 1.0,
+    "SILVERM": 1.0,
+    "SILVERMIC": 1.0,
+}
+
+
 # Hourly refresh while active. Streamlit only runs while the app is open.
 REFRESH_INTERVAL_SECONDS = 3600
 
