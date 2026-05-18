@@ -313,40 +313,65 @@ class AngelConnector:
             raise AngelDataError(f"Only expired futures found for {instrument}. ODME blocked.")
 
         option_expiry_dt = _parse_expiry_date(option_expiry) if option_expiry else pd.NaT
+        exchange = self.option_exchange_for_instrument(instrument)
+        is_mcx = exchange == "MCX"
+
+        # Build a full same-root futures candidate set. Do NOT take only the first future,
+        # because MCX options often expire before the referenced futures contract.
+        # Example: SILVERM option may expire on 26-May/19-Jun while the liquid futures
+        # reference is 30-Jun. Same-expiry futures, if present, are often zero/irrelevant.
         futures["_expiry_rank"] = 9_999_999
         futures["_selection_reason"] = "nearest active futures"
+        futures["_is_related_to_option_expiry"] = False
+
         if not pd.isna(option_expiry_dt):
-            # Prefer related futures: futures expiry on/after selected option expiry.
             diff_days = (futures["expiry_dt"] - option_expiry_dt).dt.days
-            related_mask = diff_days.ge(0) | futures["expiry_dt"].isna()
+            if is_mcx:
+                # For MCX commodity options, prefer the nearest futures expiry STRICTLY AFTER
+                # the option expiry. This avoids trying to fetch a same-date option expiry as
+                # the futures reference when the actual tradable futures month is later.
+                related_mask = diff_days.gt(0)
+                related_label = "nearest same-root MCX futures expiry after selected option expiry"
+            else:
+                # For NSE index options, monthly futures can be on/after weekly option expiry.
+                related_mask = diff_days.ge(0)
+                related_label = "nearest futures expiry on/after selected option expiry"
+
             if related_mask.any():
                 futures.loc[related_mask, "_expiry_rank"] = diff_days[related_mask].fillna(999999).astype(int)
-                futures.loc[related_mask, "_selection_reason"] = "nearest futures expiry on/after selected option expiry"
-                candidates = futures[related_mask].copy()
+                futures.loc[related_mask, "_selection_reason"] = related_label
+                futures.loc[related_mask, "_is_related_to_option_expiry"] = True
+                candidates = futures.copy()
             else:
-                # Fallback is explicit; do not silently assume same-expiry matching.
+                # Explicit fallback. We still fetch all active same-root futures and later pick
+                # a non-zero quote, but the reason will clearly show no after-expiry future existed.
                 diff_today = (futures["expiry_dt"] - today).dt.days
                 futures["_expiry_rank"] = diff_today.fillna(999999).astype(int)
+                futures["_selection_reason"] = "fallback: no same-root futures expiry after selected option expiry; using nearest quoted active future"
                 candidates = futures.copy()
         else:
             diff_today = (futures["expiry_dt"] - today).dt.days
             futures["_expiry_rank"] = diff_today.fillna(999999).astype(int)
+            futures["_selection_reason"] = "nearest active futures; option expiry date could not be parsed"
             candidates = futures.copy()
 
-        exchange = self.option_exchange_for_instrument(instrument)
-        candidates = candidates.sort_values(["_expiry_rank", "expiry_dt", "expiry"], na_position="last").head(24)
+        candidates = candidates.sort_values(["_is_related_to_option_expiry", "_expiry_rank", "expiry_dt", "expiry"], ascending=[False, True, True, True], na_position="last")
         tokens = candidates["token"].astype(str).dropna().unique().tolist()
         if not tokens:
             raise AngelDataError(f"No usable futures tokens found for {instrument}. ODME blocked.")
 
+        # Fetch every same-root active future candidate. Candidate count is normally very small;
+        # this prevents zero-LTP same-expiry candidates from blocking the later liquid future.
         md = self.get_market_data_full(exchange, tokens)
         fetched = self._normalize_market_df(md.get("fetched", []))
         if fetched.empty:
+            preview = candidates[[c for c in ["symbol", "expiry", "token"] if c in candidates.columns]].head(10).to_dict("records")
             raise AngelDataError(
-                f"Angel returned no futures quote for {instrument}. ODME blocked; cannot verify related futures LTP."
+                f"Angel returned no futures quote for {instrument}. ODME blocked; cannot verify related futures LTP. "
+                f"Candidate futures checked: {preview}"
             )
 
-        meta_cols = [c for c in ["token", "symbol", "expiry", "expiry_dt", "exch_seg", "name", "_expiry_rank", "_selection_reason"] if c in candidates.columns]
+        meta_cols = [c for c in ["token", "symbol", "expiry", "expiry_dt", "exch_seg", "name", "_expiry_rank", "_selection_reason", "_is_related_to_option_expiry"] if c in candidates.columns]
         meta = candidates[meta_cols].copy()
         meta["token"] = meta["token"].astype(str)
         fut = meta.merge(fetched, on="token", how="left", suffixes=("", "_md"))
@@ -354,14 +379,27 @@ class AngelConnector:
             fut["symbol"] = fut["symbol"].fillna(fut["symbol_md"])
         fut["ltp"] = pd.to_numeric(fut.get("ltp", 0), errors="coerce").fillna(0)
         fut["volume"] = pd.to_numeric(fut.get("volume", 0), errors="coerce").fillna(0)
+
         active = fut[fut["ltp"] > 0].copy()
         if active.empty:
+            preview_cols = [c for c in ["symbol", "expiry", "token", "ltp", "volume", "_selection_reason"] if c in fut.columns]
+            preview = fut[preview_cols].head(12).to_dict("records")
             raise AngelDataError(
-                f"Related futures quotes for {instrument} have zero/missing LTP. ODME blocked; try again after quotes update or select another instrument."
+                f"Related same-root futures quotes for {instrument} have zero/missing LTP. ODME blocked; "
+                f"no assumption made. Candidate futures checked: {preview}"
             )
 
-        active = active.sort_values(["_expiry_rank", "expiry_dt", "volume"], ascending=[True, True, False], na_position="last")
-        row = active.iloc[0].to_dict()
+        # Primary selection: active related future after/on option expiry as per exchange rule.
+        related_active = active[active["_is_related_to_option_expiry"].fillna(False)].copy()
+        if not related_active.empty:
+            active_pick = related_active.sort_values(["_expiry_rank", "expiry_dt", "volume"], ascending=[True, True, False], na_position="last")
+        else:
+            # Fallback: highest-quality active same-root future. This is only used when no after-expiry
+            # related future has a quote; the reason is exposed to the UI verification panel.
+            active["_selection_reason"] = active["_selection_reason"].astype(str) + " | fallback picked quoted same-root future"
+            active_pick = active.sort_values(["_expiry_rank", "expiry_dt", "volume"], ascending=[True, True, False], na_position="last")
+
+        row = active_pick.iloc[0].to_dict()
         ltp = _safe_float(row.get("ltp"))
 
         # Dynamic validation against selected option-chain strikes. This prevents nonsense like NIFTY 70k.
