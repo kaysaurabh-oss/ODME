@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, List
 import pandas as pd
 import streamlit as st
 
-from angel_connector import AngelConnector, load_angel_credentials
+from angel_connector import AngelConnector, AngelDataError, AngelSessionError, load_angel_credentials
 from data_store import get_store, make_key, make_snapshot_id, parse_previous_summary, utc_now_iso
 from odme_config import APP_NAME, REFRESH_INTERVAL_SECONDS, SUPPORTED_INSTRUMENTS
 from odme_engine import analyze_odme
@@ -27,6 +27,7 @@ def init_session() -> None:
         "last_refresh_by_key": {},
         "last_result_by_key": {},
         "login_error": "",
+        "angel_login_at": "",
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
@@ -51,7 +52,8 @@ def login_page() -> None:
             st.session_state.logged_in = True
             st.session_state.angel = angel
             st.session_state.master = master
-            st.success("Angel login successful. Instrument master loaded.")
+            st.session_state.angel_login_at = angel.login_time_utc or ""
+            st.success("Angel login successful. Instrument master loaded. This browser session will reuse the Angel login until Streamlit restarts or Angel session expires.")
             st.rerun()
         except Exception as exc:
             st.session_state.login_error = str(exc)
@@ -504,14 +506,21 @@ def app_header(store) -> None:
         st.caption("Live Angel option-chain read → compact ODME summary saved to Google Sheets.")
     with right:
         if st.button("Logout"):
-            for k in ["logged_in", "angel", "master"]:
+            for k in ["logged_in", "angel", "master", "angel_login_at"]:
                 st.session_state[k] = False if k == "logged_in" else None
             st.rerun()
     mode = "Google Sheets" if store.__class__.__name__ == "GoogleSheetStore" else "Local files"
-    st.caption(f"Memory mode: {mode}. Stored tab: odme_snapshots. Full option-chain rows are not saved.")
+    angel = st.session_state.get("angel")
+    session_text = angel.session_label() if angel is not None and hasattr(angel, "session_label") else "Angel session active"
+    st.caption(f"Memory mode: {mode}. Stored tab: odme_snapshots. Full option-chain rows are not saved. | {session_text}")
 
 
-def fetch_analyze_save(store, angel: AngelConnector, master: pd.DataFrame, instrument: str, expiry: str, manual_spot: Optional[float], force: bool = True) -> Optional[Dict[str, Any]]:
+def fetch_analyze_save(store, angel: AngelConnector, master: pd.DataFrame, instrument: str, expiry: str, force: bool = True) -> Optional[Dict[str, Any]]:
+    """Fetch verified Angel futures LTP + option chain, analyze, and save compact ODME summary.
+
+    No manual spot fallback is allowed. If Angel futures LTP cannot be verified against the
+    selected option-chain strike range, analysis is blocked and the user sees the reason.
+    """
     key = make_key(instrument, expiry)
     now = datetime.now(timezone.utc)
     last_map = st.session_state.get("last_refresh_by_key", {})
@@ -521,18 +530,32 @@ def fetch_analyze_save(store, angel: AngelConnector, master: pd.DataFrame, instr
         if age < REFRESH_INTERVAL_SECONDS:
             return None
 
+    angel.ensure_session_ready()
     previous_raw = store.load_latest_odme_snapshot(key)
     previous = parse_previous_summary(previous_raw)
 
     chain, info = angel.fetch_option_chain_snapshot(master, instrument, expiry)
+    future_ltp = float(info.get("future_ltp") or 0)
+    if future_ltp <= 0:
+        raise AngelDataError("Angel future LTP was not available. ODME analysis blocked; no spot assumption used.")
+
     usable = int((pd.to_numeric(chain.get("oi", pd.Series(dtype=float)), errors="coerce").fillna(0) > 0).sum())
-    result = analyze_odme(chain, instrument, manual_spot if manual_spot and manual_spot > 0 else None, previous_summary=previous)
+    result = analyze_odme(chain, instrument, future_ltp, previous_summary=previous)
     result["_previous_summary"] = previous
+    result["future_ltp"] = future_ltp
+    result["future_symbol"] = info.get("future_symbol", "")
+    result["future_token"] = info.get("future_token", "")
+    result["future_expiry"] = info.get("future_expiry", "")
+    result["future_feed_time"] = info.get("future_feed_time", "")
 
     snapshot_id = make_snapshot_id(key)
     ts = utc_now_iso()
     result["ts"] = ts
     status_note = "OK" if usable > 0 else "Selected expiry has no usable OI. Choose another active expiry."
+    future_note = (
+        f"future={info.get('future_symbol', '')}; future_ltp={future_ltp:,.2f}; "
+        f"future_expiry={info.get('future_expiry', '')}; future_token={info.get('future_token', '')}"
+    )
     meta = {
         "snapshot_id": snapshot_id,
         "key": key,
@@ -540,15 +563,15 @@ def fetch_analyze_save(store, angel: AngelConnector, master: pd.DataFrame, instr
         "instrument": instrument,
         "exchange": info.get("exchange", ""),
         "expiry": expiry,
-        "source": "Angel SmartAPI FULL → ODME compact summary",
+        "source": "Angel SmartAPI FULL options + verified Angel futures LTP → ODME compact summary",
         "usable_oi_count": usable,
-        "notes": f"{status_note}; contracts={len(chain)}; unfetched={info.get('unfetched_count', 0)}",
+        "notes": f"{status_note}; {future_note}; contracts={len(chain)}; unfetched={info.get('unfetched_count', 0)}",
     }
     store.append_odme_snapshot(result, meta)
     last_map[key] = now
     st.session_state.last_refresh_by_key = last_map
     st.session_state.last_result_by_key[key] = result
-    return {"result": result, "meta": meta, "usable": usable, "contracts": len(chain)}
+    return {"result": result, "meta": meta, "usable": usable, "contracts": len(chain), "future_ltp": future_ltp}
 
 
 def render_top_cards(display: Dict[str, Any]) -> None:
@@ -557,7 +580,7 @@ def render_top_cards(display: Dict[str, Any]) -> None:
     with top[0]:
         render_card("ODME Tilt", tilt, display.get("ts", "current"), _tint_for_tilt(tilt))
     with top[1]:
-        render_card("Spot", _fmt_num(display.get("spot"), 2), "Angel proxy / manual", "tint-grey")
+        render_card("Future LTP", _fmt_num(display.get("spot"), 2), "Verified Angel futures", "tint-grey")
     with top[2]:
         render_card("Option POC", _fmt_num(display.get("poc")), display.get("poc_move", ""), "tint-blue")
     with top[3]:
@@ -649,6 +672,15 @@ def render_odme_dashboard(display: Dict[str, Any], comparison: pd.DataFrame, liv
         return
     st.markdown("### 1. Live ODME levels" if display.get("kind") == "live" else "### 1. Last saved ODME levels")
     render_top_cards(display)
+    if live_result:
+        with st.expander("Data verification details", expanded=False):
+            st.write({
+                "future_symbol": live_result.get("future_symbol", ""),
+                "future_token": live_result.get("future_token", ""),
+                "future_expiry": live_result.get("future_expiry", ""),
+                "future_ltp": live_result.get("future_ltp", live_result.get("spot", "")),
+                "future_feed_time": live_result.get("future_feed_time", ""),
+            })
     render_action_sections(display)
     render_previous_and_scores(comparison, display)
     render_chain_heatmap(live_result)
@@ -691,8 +723,8 @@ def main_page() -> None:
             st.stop()
         expiry = st.selectbox("Select expiry", expiries, index=0)
         key = make_key(instrument, expiry)
-        manual_spot = st.number_input("Optional manual spot/future override", min_value=0.0, value=0.0, step=1.0)
-        st.caption(f"Contracts found: {len(option_rows[option_rows['expiry'].astype(str).eq(str(expiry))])}")
+        st.caption("Spot/future is fetched from Angel futures only. If future LTP cannot be verified, ODME will stop instead of assuming data.")
+        st.caption(f"Option contracts found: {len(option_rows[option_rows['expiry'].astype(str).eq(str(expiry))])}")
         fetch = st.button("Fetch Live + Save ODME Summary", type="primary")
         auto_on = st.checkbox("Auto-refresh hourly while app is open", value=False)
         st.divider()
@@ -709,21 +741,27 @@ def main_page() -> None:
     if fetch:
         with st.spinner("Fetching live Angel chain, creating ODME commentary, saving compact summary..."):
             try:
-                res = fetch_analyze_save(store, angel, master, instrument, expiry, manual_spot, force=True)
+                res = fetch_analyze_save(store, angel, master, instrument, expiry, force=True)
                 if res and res["usable"] > 0:
-                    st.success(f"ODME summary saved. Usable OI contracts: {res['usable']}. Full chain rows were not saved.")
+                    st.success(f"ODME summary saved. Future LTP: {res.get('future_ltp', 0):,.2f}. Usable OI contracts: {res['usable']}. Full chain rows were not saved.")
                 elif res:
                     st.warning("Summary saved, but this expiry has no usable OI. Select another active expiry.")
-            except Exception as exc:
+            except AngelSessionError as exc:
                 st.error(str(exc))
+                st.info("This is an Angel session issue. Enter a fresh TOTP only if the app says the session is inactive/expired or Streamlit Cloud restarted.")
+            except AngelDataError as exc:
+                st.error(str(exc))
+                st.info("ODME did not save a snapshot because the live data was not verified. Try another expiry/instrument or fetch again after Angel quotes update.")
+            except Exception as exc:
+                st.error(f"Unexpected fetch error: {exc}")
 
     if auto_on and store.is_initialized(key):
         try:
-            auto_res = fetch_analyze_save(store, angel, master, instrument, expiry, manual_spot, force=False)
+            auto_res = fetch_analyze_save(store, angel, master, instrument, expiry, force=False)
             if auto_res:
                 st.toast("Hourly ODME summary refreshed.")
         except Exception as exc:
-            st.warning(f"Auto refresh failed: {exc}")
+            st.warning(f"Auto refresh failed. No snapshot saved: {exc}")
 
     st.markdown("---")
     st.subheader(f"Selected: {instrument} / {expiry}")

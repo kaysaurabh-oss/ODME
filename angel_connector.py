@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -10,7 +12,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from odme_config import ANGEL_INSTRUMENT_MASTER_URL, LOCAL_CONFIG_PATH, MCX_SYMBOLS, NSE_INDEX_SYMBOLS
+from odme_config import ANGEL_INSTRUMENT_MASTER_URL, LOCAL_CONFIG_PATH, MCX_SYMBOLS
 
 try:
     from SmartApi import SmartConnect
@@ -25,6 +27,14 @@ class AngelCredentials:
     pin: str
 
 
+class AngelDataError(RuntimeError):
+    """Raised when Angel data is missing, inconsistent, or unsafe to use."""
+
+
+class AngelSessionError(RuntimeError):
+    """Raised when Angel login/session is unavailable or expired."""
+
+
 def _read_streamlit_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     try:
         return st.secrets.get(name, default)
@@ -33,11 +43,6 @@ def _read_streamlit_secret(name: str, default: Optional[str] = None) -> Optional
 
 
 def load_angel_credentials() -> AngelCredentials:
-    """Load credentials from Streamlit secrets first, then local config file.
-
-    URL deployment: use Streamlit Cloud secrets.
-    Local deployment: create config/angel_credentials.json from template.
-    """
     api_key = _read_streamlit_secret("ANGEL_API_KEY")
     client_id = _read_streamlit_secret("ANGEL_CLIENT_ID")
     pin = _read_streamlit_secret("ANGEL_PIN")
@@ -60,12 +65,68 @@ def load_angel_credentials() -> AngelCredentials:
     )
 
 
+# Strict roots prevent accidental mixing: SILVERM != SILVERMIC, GOLD != GOLDM, CRUDEOIL != CRUDEOILM.
+INSTRUMENT_ALIASES = {
+    "SILVERM": ["SILVERM"],
+    "SILVERMIC": ["SILVERMIC"],
+    "SILVER": ["SILVER"],
+    "GOLDM": ["GOLDM"],
+    "GOLD": ["GOLD"],
+    "CRUDEOILM": ["CRUDEOILM"],
+    "CRUDEOIL": ["CRUDEOIL"],
+    "NATGASMINI": ["NATGASMINI"],
+    "NATURALGAS": ["NATURALGAS"],
+}
+
+
+def _aliases_for(instrument: str) -> List[str]:
+    root = str(instrument).upper().strip()
+    return INSTRUMENT_ALIASES.get(root, [root])
+
+
+def _strict_symbol_root_match(symbol_series: pd.Series, roots: List[str]) -> pd.Series:
+    symbols = symbol_series.astype(str).str.upper().str.strip()
+    mask = pd.Series(False, index=symbols.index)
+    for root in roots:
+        root = root.upper().strip()
+        starts = symbols.str.startswith(root, na=False)
+        next_char = symbols.str.slice(len(root), len(root) + 1)
+        boundary = next_char.eq("") | ~next_char.str.match(r"[A-Z]", na=False)
+        mask = mask | (starts & boundary)
+    return mask
+
+
+def _parse_expiry_date(value: Any) -> pd.Timestamp:
+    s = str(value or "").strip().upper()
+    if not s:
+        return pd.NaT
+    # Angel typically uses 29MAY2025, but keep fallbacks.
+    for fmt in ("%d%b%Y", "%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return pd.Timestamp(datetime.strptime(s, fmt))
+        except Exception:
+            pass
+    return pd.to_datetime(s, errors="coerce")
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
 class AngelConnector:
     def __init__(self, credentials: AngelCredentials):
         self.credentials = credentials
         self.obj: Optional[Any] = None
         self.jwt_token: Optional[str] = None
+        self.refresh_token: Optional[str] = None
         self.feed_token: Optional[str] = None
+        self.login_time_utc: Optional[str] = None
+        self.last_session_error: str = ""
 
     def login(self, totp: str) -> Dict[str, Any]:
         if SmartConnect is None:
@@ -76,14 +137,29 @@ class AngelConnector:
         self.obj = SmartConnect(api_key=self.credentials.api_key)
         data = self.obj.generateSession(self.credentials.client_id, self.credentials.pin, totp)
         if not data or not data.get("status"):
-            raise RuntimeError(f"Angel login failed: {data}")
-        payload = data.get("data", {})
+            raise AngelSessionError(f"Angel login failed: {data}")
+        payload = data.get("data", {}) or {}
         self.jwt_token = payload.get("jwtToken")
+        self.refresh_token = payload.get("refreshToken")
         try:
             self.feed_token = self.obj.getfeedToken()
         except Exception:
             self.feed_token = payload.get("feedToken")
+        self.login_time_utc = datetime.now(timezone.utc).isoformat()
+        self.last_session_error = ""
         return data
+
+    def ensure_session_ready(self) -> None:
+        if self.obj is None or not self.jwt_token:
+            raise AngelSessionError(
+                "Angel session is not active. Streamlit may have restarted or the browser session was cleared. "
+                "Please login once again with current TOTP."
+            )
+
+    def session_label(self) -> str:
+        if not self.login_time_utc:
+            return "Angel session active"
+        return f"Angel session active since {self.login_time_utc[:19].replace('T', ' ')} UTC"
 
     @staticmethod
     @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -100,6 +176,7 @@ class AngelConnector:
         for col in ["expiry", "exch_seg", "instrumenttype", "symbol", "name", "token"]:
             if col in df.columns:
                 df[col] = df[col].astype(str)
+        df["expiry_dt"] = df["expiry"].apply(_parse_expiry_date) if "expiry" in df.columns else pd.NaT
         return df
 
     @staticmethod
@@ -108,10 +185,8 @@ class AngelConnector:
 
     @staticmethod
     def normalize_strike(row: pd.Series) -> float:
-        strike = float(row.get("strike", 0) or 0)
-        exch = str(row.get("exch_seg", ""))
-        # Angel NFO index option strikes are generally 100x. MCX often can also be scaled.
-        # Keep practical normalization: divide by 100 when strike is clearly too large.
+        strike = _safe_float(row.get("strike", 0))
+        exch = str(row.get("exch_seg", "")).upper()
         if strike >= 100000:
             return strike / 100.0
         if exch == "NFO" and strike >= 10000 * 100:
@@ -119,30 +194,52 @@ class AngelConnector:
         return strike
 
     @classmethod
+    def _root_mask(cls, df: pd.DataFrame, instrument: str) -> pd.Series:
+        roots = _aliases_for(instrument)
+        name_col = df.get("name", pd.Series("", index=df.index)).astype(str).str.upper().str.strip()
+        symbol_col = df.get("symbol", pd.Series("", index=df.index)).astype(str).str.upper().str.strip()
+        name_match = name_col.isin([r.upper() for r in roots])
+        symbol_match = _strict_symbol_root_match(symbol_col, roots)
+        return name_match | symbol_match
+
+    @classmethod
     def get_option_rows(cls, master: pd.DataFrame, instrument: str) -> pd.DataFrame:
         if master.empty:
             return master
         exch = cls.option_exchange_for_instrument(instrument)
         df = master.copy()
-        # symbol/name matching differs between exchanges; use both.
-        name_match = df.get("name", pd.Series(dtype=str)).astype(str).str.upper().eq(instrument.upper())
-        symbol_match = df.get("symbol", pd.Series(dtype=str)).astype(str).str.upper().str.startswith(instrument.upper())
-        exch_match = df.get("exch_seg", pd.Series(dtype=str)).astype(str).str.upper().eq(exch)
-        opt_type_match = df.get("instrumenttype", pd.Series(dtype=str)).astype(str).str.upper().str.contains("OPT", na=False)
-        df = df[exch_match & opt_type_match & (name_match | symbol_match)].copy()
+        exch_match = df.get("exch_seg", pd.Series("", index=df.index)).astype(str).str.upper().eq(exch)
+        opt_type_match = df.get("instrumenttype", pd.Series("", index=df.index)).astype(str).str.upper().str.contains("OPT", na=False)
+        df = df[exch_match & opt_type_match & cls._root_mask(df, instrument)].copy()
         if df.empty:
             return df
         df["strike_norm"] = df.apply(cls.normalize_strike, axis=1)
-        df["option_type"] = df["symbol"].str.upper().str.extract(r"(CE|PE)$", expand=False)
+        df["option_type"] = df["symbol"].astype(str).str.upper().str.extract(r"(CE|PE)$", expand=False)
         df = df[df["option_type"].isin(["CE", "PE"])]
-        return df.sort_values(["expiry", "strike_norm", "option_type", "symbol"])
+        return df.sort_values(["expiry_dt", "expiry", "strike_norm", "option_type", "symbol"], na_position="last")
+
+    @classmethod
+    def get_future_rows(cls, master: pd.DataFrame, instrument: str) -> pd.DataFrame:
+        if master.empty:
+            return master
+        exch = cls.option_exchange_for_instrument(instrument)
+        df = master.copy()
+        exch_match = df.get("exch_seg", pd.Series("", index=df.index)).astype(str).str.upper().eq(exch)
+        fut_type_match = df.get("instrumenttype", pd.Series("", index=df.index)).astype(str).str.upper().str.contains("FUT", na=False)
+        df = df[exch_match & fut_type_match & cls._root_mask(df, instrument)].copy()
+        if df.empty:
+            return df
+        return df.sort_values(["expiry_dt", "expiry", "symbol"], na_position="last")
 
     @classmethod
     def get_expiries(cls, master: pd.DataFrame, instrument: str) -> List[str]:
         rows = cls.get_option_rows(master, instrument)
         if rows.empty or "expiry" not in rows.columns:
             return []
-        return sorted(rows["expiry"].dropna().astype(str).unique().tolist())
+        # Keep chronological order where possible.
+        temp = rows[["expiry", "expiry_dt"]].drop_duplicates().copy()
+        temp = temp.sort_values(["expiry_dt", "expiry"], na_position="last")
+        return temp["expiry"].dropna().astype(str).unique().tolist()
 
     @staticmethod
     def _chunks(items: List[str], size: int) -> Iterable[List[str]]:
@@ -150,35 +247,31 @@ class AngelConnector:
             yield items[i:i + size]
 
     def get_market_data_full(self, exchange: str, tokens: List[str]) -> Dict[str, Any]:
-        if self.obj is None:
-            raise RuntimeError("Not logged in to Angel.")
+        self.ensure_session_ready()
         all_fetched: List[Dict[str, Any]] = []
         all_unfetched: List[Dict[str, Any]] = []
-        # Angel market data accepts a token map. Keep chunks small for reliability.
-        for chunk in self._chunks([str(t) for t in tokens], 45):
+        for chunk in self._chunks([str(t) for t in tokens if str(t).strip()], 45):
             params = {exchange: chunk}
-            response = self.obj.getMarketData("FULL", params)
+            try:
+                response = self.obj.getMarketData("FULL", params)
+            except Exception as exc:
+                raise AngelSessionError(f"Angel market-data request failed. Session may be expired or network/API failed: {exc}") from exc
             if not response or not response.get("status"):
-                raise RuntimeError(f"Angel market data failed for {exchange}: {response}")
+                msg = str(response)
+                if re.search(r"token|session|jwt|invalid|expired|login", msg, re.I):
+                    raise AngelSessionError(f"Angel session/API rejected market-data request. Login again with fresh TOTP. Details: {msg}")
+                raise AngelDataError(f"Angel market data failed for {exchange}: {msg}")
             data = response.get("data", {}) or {}
             all_fetched.extend(data.get("fetched", []) or [])
             all_unfetched.extend(data.get("unfetched", []) or [])
             time.sleep(0.15)
         return {"fetched": all_fetched, "unfetched": all_unfetched}
 
-    def fetch_option_chain_snapshot(self, master: pd.DataFrame, instrument: str, expiry: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-        option_rows = self.get_option_rows(master, instrument)
-        option_rows = option_rows[option_rows["expiry"].astype(str).eq(str(expiry))].copy()
-        if option_rows.empty:
-            raise RuntimeError(f"No option contracts found for {instrument} expiry {expiry}.")
-        exchange = self.option_exchange_for_instrument(instrument)
-        tokens = option_rows["token"].astype(str).dropna().unique().tolist()
-        md = self.get_market_data_full(exchange, tokens)
-        fetched = pd.DataFrame(md.get("fetched", []))
+    @staticmethod
+    def _normalize_market_df(records: List[Dict[str, Any]]) -> pd.DataFrame:
+        fetched = pd.DataFrame(records)
         if fetched.empty:
-            raise RuntimeError("Angel returned no fetched contracts for this expiry.")
-
-        # SmartAPI field names can vary in case.
+            return fetched
         rename_map = {
             "symbolToken": "token", "exchange": "exchange", "tradingSymbol": "symbol",
             "ltp": "ltp", "open": "open", "high": "high", "low": "low", "close": "close",
@@ -186,11 +279,92 @@ class AngelConnector:
             "exchFeedTime": "feed_time", "exchTradeTime": "trade_time",
         }
         fetched = fetched.rename(columns={k: v for k, v in rename_map.items() if k in fetched.columns})
-        fetched["token"] = fetched["token"].astype(str)
+        if "token" in fetched.columns:
+            fetched["token"] = fetched["token"].astype(str)
+        for col in ["ltp", "oi", "volume", "open", "high", "low", "close"]:
+            if col in fetched.columns:
+                fetched[col] = pd.to_numeric(fetched[col], errors="coerce").fillna(0)
+        return fetched
+
+    def fetch_future_ltp(self, master: pd.DataFrame, instrument: str, option_rows: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+        futures = self.get_future_rows(master, instrument)
+        if futures.empty:
+            raise AngelDataError(
+                f"No futures contract found in Angel master for {instrument}. ODME blocked because future LTP is required."
+            )
+        today = pd.Timestamp(datetime.now().date())
+        futures = futures[(futures["expiry_dt"].isna()) | (futures["expiry_dt"] >= today)].copy()
+        if futures.empty:
+            raise AngelDataError(f"Only expired futures found for {instrument}. ODME blocked.")
+
+        exchange = self.option_exchange_for_instrument(instrument)
+        futures = futures.sort_values(["expiry_dt", "expiry"], na_position="last").head(18)
+        tokens = futures["token"].astype(str).dropna().unique().tolist()
+        md = self.get_market_data_full(exchange, tokens)
+        fetched = self._normalize_market_df(md.get("fetched", []))
+        if fetched.empty:
+            raise AngelDataError(
+                f"Angel returned no futures quote for {instrument}. ODME blocked; cannot verify spot/future LTP."
+            )
+        meta = futures[[c for c in ["token", "symbol", "expiry", "expiry_dt", "exch_seg", "name"] if c in futures.columns]].copy()
+        meta["token"] = meta["token"].astype(str)
+        fut = meta.merge(fetched, on="token", how="left", suffixes=("", "_md"))
+        if "symbol_md" in fut.columns:
+            fut["symbol"] = fut["symbol"].fillna(fut["symbol_md"])
+        fut["ltp"] = pd.to_numeric(fut.get("ltp", 0), errors="coerce").fillna(0)
+        fut["volume"] = pd.to_numeric(fut.get("volume", 0), errors="coerce").fillna(0)
+        active = fut[fut["ltp"] > 0].copy()
+        if active.empty:
+            raise AngelDataError(
+                f"Futures quote for {instrument} has zero/missing LTP. ODME blocked; choose another instrument or try later."
+            )
+
+        active = active.sort_values(["expiry_dt", "expiry", "volume"], ascending=[True, True, False], na_position="last")
+        row = active.iloc[0].to_dict()
+        ltp = _safe_float(row.get("ltp"))
+
+        # Dynamic validation against selected option-chain strikes. This prevents nonsense like NIFTY 70k.
+        if option_rows is not None and not option_rows.empty and "strike_norm" in option_rows.columns:
+            strikes = pd.to_numeric(option_rows["strike_norm"], errors="coerce").dropna()
+            strikes = strikes[strikes > 0]
+            if not strikes.empty:
+                mn, mx = float(strikes.min()), float(strikes.max())
+                buffer = max((mx - mn) * 0.05, ltp * 0.01)
+                if not (mn - buffer <= ltp <= mx + buffer):
+                    raise AngelDataError(
+                        f"Unsafe future LTP for {instrument}: {ltp:,.2f} from {row.get('symbol')} is outside selected option-chain strike range "
+                        f"{mn:,.0f}–{mx:,.0f}. ODME blocked instead of assuming wrong spot."
+                    )
+
+        return {
+            "future_ltp": ltp,
+            "future_symbol": str(row.get("symbol", "")),
+            "future_token": str(row.get("token", "")),
+            "future_expiry": str(row.get("expiry", "")),
+            "future_exchange": exchange,
+            "future_feed_time": str(row.get("feed_time", "")),
+            "future_trade_time": str(row.get("trade_time", "")),
+        }
+
+    def fetch_option_chain_snapshot(self, master: pd.DataFrame, instrument: str, expiry: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        self.ensure_session_ready()
+        option_rows = self.get_option_rows(master, instrument)
+        option_rows = option_rows[option_rows["expiry"].astype(str).eq(str(expiry))].copy()
+        if option_rows.empty:
+            raise AngelDataError(f"No option contracts found for {instrument} expiry {expiry}.")
+        exchange = self.option_exchange_for_instrument(instrument)
+
+        future_info = self.fetch_future_ltp(master, instrument, option_rows=option_rows)
+        tokens = option_rows["token"].astype(str).dropna().unique().tolist()
+        md = self.get_market_data_full(exchange, tokens)
+        fetched = self._normalize_market_df(md.get("fetched", []))
+        if fetched.empty:
+            raise AngelDataError("Angel returned no fetched option contracts for this expiry.")
 
         meta_cols = ["token", "symbol", "strike_norm", "option_type", "expiry", "exch_seg", "name"]
         meta = option_rows[[c for c in meta_cols if c in option_rows.columns]].copy()
         meta = meta.rename(columns={"strike_norm": "strike", "exch_seg": "exchange"})
+        meta["token"] = meta["token"].astype(str)
         out = meta.merge(fetched, on="token", how="left", suffixes=("", "_md"))
         if "symbol_md" in out.columns:
             out["symbol"] = out["symbol"].fillna(out["symbol_md"])
@@ -204,11 +378,15 @@ class AngelConnector:
         out["expiry"] = str(expiry)
         out["exchange"] = exchange
         usable = int((out["oi"] > 0).sum())
+        if usable <= 0:
+            # Do not block saving entirely, but clearly warn. Some MCX expiries may be inactive.
+            pass
         info = {
             "exchange": exchange,
             "contracts": len(out),
             "usable_oi_count": usable,
             "unfetched_count": len(md.get("unfetched", [])),
+            **future_info,
         }
         return out, info
 
