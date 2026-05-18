@@ -633,6 +633,76 @@ def _premium_alert(matrix: pd.DataFrame, spot_delta: float) -> str:
     return ""
 
 
+def _median_step(strikes: pd.DataFrame) -> float:
+    try:
+        vals = sorted(set(float(x) for x in strikes["strike"].dropna().tolist()))
+        diffs = [b - a for a, b in zip(vals, vals[1:]) if b > a]
+        return float(np.median(diffs)) if diffs else 0.0
+    except Exception:
+        return 0.0
+
+
+def _path_speed(strikes: pd.DataFrame, spot: float, wall: float, side: str) -> Dict[str, Any]:
+    """Classify the path from spot to active wall as Sharp or Grind.
+
+    This is intentionally neutral: it is an option-buying/navigation aid, not a sell/avoid
+    instruction. Sharp means there are fewer meaningful option-positioning clusters between
+    spot and the wall. Grind means there are visible clusters before the wall.
+    """
+    side = side.upper()
+    if strikes.empty or not spot or not wall:
+        return {"side": "Upside" if side == "CE" else "Downside", "path": "No clear read", "wall": wall, "read": "Insufficient path data."}
+
+    oi_col = "ce_oi" if side == "CE" else "pe_oi"
+    vol_col = "ce_volume" if side == "CE" else "pe_volume"
+    label = "Upside" if side == "CE" else "Downside"
+
+    if side == "CE":
+        path_rows = strikes[(strikes["strike"] > spot) & (strikes["strike"] <= wall)].copy()
+        between_rows = strikes[(strikes["strike"] > spot) & (strikes["strike"] < wall)].copy()
+    else:
+        path_rows = strikes[(strikes["strike"] < spot) & (strikes["strike"] >= wall)].copy()
+        between_rows = strikes[(strikes["strike"] < spot) & (strikes["strike"] > wall)].copy()
+
+    wall_row = strikes[strikes["strike"].eq(wall)]
+    wall_oi = _safe_float(wall_row.iloc[0].get(oi_col)) if not wall_row.empty else 0.0
+    wall_vol = _safe_float(wall_row.iloc[0].get(vol_col)) if not wall_row.empty else 0.0
+    max_oi = _safe_float(strikes[oi_col].max()) if oi_col in strikes.columns else 0.0
+    max_vol = _safe_float(strikes[vol_col].max()) if vol_col in strikes.columns else 0.0
+
+    step = _median_step(strikes)
+    distance = abs(wall - spot)
+    dist_txt = f"{distance:,.0f} pts" if distance else "0 pts"
+
+    if path_rows.empty or distance <= max(step * 0.75, spot * 0.001):
+        return {"side": label, "path": "Wall nearby", "wall": wall, "read": f"{label} wall {_fmt_level(wall)} is nearby ({dist_txt})."}
+
+    oi_threshold = max(wall_oi * 0.25, max_oi * 0.12, 1.0)
+    vol_threshold = max(wall_vol * 0.25, max_vol * 0.12, 1.0)
+    clusters = between_rows[(between_rows[oi_col] >= oi_threshold) | (between_rows[vol_col] >= vol_threshold)].copy() if not between_rows.empty else pd.DataFrame()
+    intermediate_oi = float(between_rows[oi_col].sum()) if not between_rows.empty and oi_col in between_rows.columns else 0.0
+    cluster_count = len(clusters)
+
+    # Grind = meaningful option-positioning clusters are present before the wall.
+    grind = cluster_count >= 2 or (cluster_count >= 1 and intermediate_oi >= max(wall_oi * 0.55, max_oi * 0.18, 1.0))
+
+    if grind:
+        nearest = float(clusters.sort_values("strike", ascending=(side == "CE")).iloc[0]["strike"]) if not clusters.empty else 0.0
+        read = f"{label} path to {_fmt_level(wall)} {side} wall: Grind; positioning clusters visible before wall"
+        if nearest:
+            read += f" near {_fmt_level(nearest)}"
+        read += "."
+        return {"side": label, "path": "Grind", "wall": wall, "read": read}
+
+    return {"side": label, "path": "Sharp", "wall": wall, "read": f"{label} path to {_fmt_level(wall)} {side} wall: Sharp; limited positioning clusters before wall."}
+
+
+def _build_path_risk(strikes: pd.DataFrame, spot: float, ce_wall: float, pe_wall: float) -> Dict[str, Any]:
+    up = _path_speed(strikes, spot, ce_wall, "CE")
+    down = _path_speed(strikes, spot, pe_wall, "PE")
+    return {"upside": up, "downside": down}
+
+
 def _compact_hero(final_action: str, ce_card: Dict[str, Any], pe_card: Dict[str, Any], safer_ce_card: Dict[str, Any], safer_pe_card: Dict[str, Any], poc_card: Dict[str, Any], first: bool, itm_caution: str = "") -> str:
     if first:
         return "Observation mode only — prior anchor not available. Levels are visible, but ODME should not be used for strong action yet."
@@ -784,6 +854,7 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
     safer_ce_card = _safer_card("CE", safer_ce, prev_safer_ce, ce_move, matrix)
     safer_pe_card = _safer_card("PE", safer_pe, prev_safer_pe, pe_move, matrix)
     premium_alert = _premium_alert(action_matrix, spot_delta)
+    path_risk = _build_path_risk(strikes, spot, ce_wall, pe_wall)
     hero_action = _compact_hero(final_action, ce_wall_card, pe_wall_card, safer_ce_card, safer_pe_card, poc_card, poc_move == "first snapshot" or not prev_spot, itm_caution)
 
     commentary = build_commentary(
@@ -841,6 +912,7 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
         "hero_action": hero_action,
         "premium_alert": premium_alert,
         "itm_caution": itm_caution,
+        "path_risk": path_risk,
         "cards": {
             "poc": poc_card,
             "ce_wall": ce_wall_card,

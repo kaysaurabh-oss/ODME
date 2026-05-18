@@ -245,6 +245,15 @@ def _tint_for_action(text: str, default: str = "tint-grey") -> str:
     return default
 
 
+def _tint_for_change_pct(value: Any) -> str:
+    pct = _safe_float(value)
+    if pct > 0.01:
+        return "tint-green"
+    if pct < -0.01:
+        return "tint-red"
+    return "tint-grey"
+
+
 def render_card(label: str, value: Any, sub: str = "", tint: str = "tint-grey") -> None:
     st.markdown(
         f"""
@@ -332,11 +341,19 @@ def render_score_bars_from_values(scores: Dict[str, Any]) -> None:
 
 def result_to_display(result: Dict[str, Any]) -> Dict[str, Any]:
     sections = split_commentary(result.get("commentary", ""))
+    prev = result.get("_previous_summary") or {}
+    prev_spot = _safe_float(prev.get("spot"))
+    spot_now = _safe_float(result.get("spot"))
+    day_change = spot_now - prev_spot if prev_spot else 0.0
+    day_change_pct = (day_change / prev_spot * 100.0) if prev_spot else 0.0
     return {
         "kind": "live",
         "ts": result.get("ts", ""),
         "tilt": result.get("tilt", "MIXED / NO CLEAN EDGE"),
         "spot": result.get("spot"),
+        "previous_spot": prev_spot,
+        "day_change": day_change,
+        "day_change_pct": day_change_pct,
         "poc": result.get("poc"),
         "value_area_low": result.get("value_area_low"),
         "value_area_high": result.get("value_area_high"),
@@ -361,6 +378,7 @@ def result_to_display(result: Dict[str, Any]) -> Dict[str, Any]:
         "premium_alert": result.get("premium_alert", ""),
         "hero_action": result.get("hero_action") or result.get("final_action") or get_section(sections, "Final Action", default="No final action generated."),
         "anchor_snapshot_ts": result.get("anchor_snapshot_ts", ""),
+        "path_risk": result.get("path_risk", {}),
     }
 
 
@@ -377,6 +395,9 @@ def saved_row_to_display(row: Dict[str, Any]) -> Dict[str, Any]:
         "ts": row.get("ts", ""),
         "tilt": row.get("odme_tilt", "MIXED / NO CLEAN EDGE"),
         "spot": row.get("spot"),
+        "previous_spot": 0.0,
+        "day_change": 0.0,
+        "day_change_pct": 0.0,
         "poc": row.get("option_poc"),
         "value_area_low": row.get("value_area_low"),
         "value_area_high": row.get("value_area_high"),
@@ -401,6 +422,7 @@ def saved_row_to_display(row: Dict[str, Any]) -> Dict[str, Any]:
         "premium_alert": "",
         "hero_action": get_section(sections, "Final Action", default="Fetch live data for current action."),
         "anchor_snapshot_ts": "",
+        "path_risk": {},
     }
 
 
@@ -663,6 +685,20 @@ def render_data_line(display: Dict[str, Any], live_result: Optional[Dict[str, An
         st.markdown('<div class="data-sub">No prior anchor — observation mode</div>', unsafe_allow_html=True)
 
 
+def render_spot_futures_card(display: Dict[str, Any]) -> None:
+    spot = _safe_float(display.get("spot"))
+    pct = _safe_float(display.get("day_change_pct"))
+    change = _safe_float(display.get("day_change"))
+    if not spot:
+        return
+    if display.get("previous_spot"):
+        sign = "+" if change > 0 else ""
+        sub = f"Day change: {sign}{_fmt_num(change, 2)} ({sign}{pct:.2f}%) vs anchor"
+    else:
+        sub = "Day change unavailable — no prior anchor"
+    render_card("Spot / Futures", _fmt_num(spot, 2), sub, _tint_for_change_pct(pct))
+
+
 def render_trade_card(card: Dict[str, Any]) -> None:
     title = card.get("title", "")
     level = str(card.get("level", ""))
@@ -712,14 +748,37 @@ def render_final_hero(display: Dict[str, Any]) -> None:
 
 
 def render_anchor_comparison(display: Dict[str, Any], comparison: pd.DataFrame) -> None:
-    st.markdown("### Anchor comparison")
-    anchor_ts = str(display.get("anchor_snapshot_ts") or "").strip()
-    if anchor_ts:
-        st.caption(f"Anchor used: latest saved snapshot before today — {anchor_ts}")
-    if comparison is None or comparison.empty:
-        st.info("No prior anchor available for this instrument+expiry yet. Current values will become the next trading-session anchor after saving.")
+    with st.expander("Verify anchor comparison", expanded=False):
+        anchor_ts = str(display.get("anchor_snapshot_ts") or "").strip()
+        if anchor_ts:
+            st.caption(f"Anchor used: latest saved snapshot before today — {anchor_ts}")
+        if comparison is None or comparison.empty:
+            st.info("No prior anchor available for this instrument+expiry yet. Current values will become the next trading-session anchor after saving.")
+            return
+        st.dataframe(comparison, use_container_width=True, hide_index=True, height=210)
+
+
+def render_path_risk(display: Dict[str, Any]) -> None:
+    path_risk = display.get("path_risk") or {}
+    if not path_risk:
         return
-    st.dataframe(comparison, use_container_width=True, hide_index=True, height=210)
+    rows = []
+    for key, label in [("upside", "Upside to CE wall"), ("downside", "Downside to PE wall")]:
+        item = path_risk.get(key) or {}
+        if not item:
+            continue
+        rows.append({
+            "Path": label,
+            "Speed": item.get("path", "No clear read"),
+            "Wall": _fmt_num(item.get("wall")),
+            "Read": item.get("read", ""),
+        })
+    if not rows:
+        return
+    st.markdown("### ODME path assist")
+    st.caption("Option-buying context: Sharp means fewer positioning clusters before the wall; Grind means price may have to work through clusters.")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=118)
+
 
 def render_top_cards(display: Dict[str, Any]) -> None:
     tilt = display.get("tilt", "MIXED / NO CLEAN EDGE")
@@ -818,10 +877,11 @@ def render_odme_dashboard(display: Dict[str, Any], comparison: pd.DataFrame, liv
         render_data_line(display, live_result)
         return
     render_data_line(display, live_result)
+    render_spot_futures_card(display)
     render_level_cards(display)
     render_final_hero(display)
+    render_path_risk(display)
     render_anchor_comparison(display, comparison)
-    render_chain_heatmap(live_result)
 
 def render_history(history: pd.DataFrame) -> None:
     if history is None or history.empty:
@@ -910,7 +970,7 @@ def main_page() -> None:
     else:
         saved = store.load_latest_odme_snapshot(key)
         if saved:
-            st.info("Showing last saved ODME summary. Live comparisons use the latest saved snapshot before today as the fixed anchor; click Fetch Live + Save ODME Summary for current chain heatmap and fresh anchored comparison.")
+            st.info("Showing last saved ODME summary. Live comparisons use the latest saved snapshot before today as the fixed anchor; click Fetch Live + Save ODME Summary for current ODME path assist and fresh anchored comparison.")
             display = saved_row_to_display(saved)
             comparison = build_saved_comparison_table(history)
             render_odme_dashboard(display, comparison, live_result=None)
