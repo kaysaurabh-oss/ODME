@@ -346,6 +346,8 @@ def parse_previous_summary(row: Dict[str, Any]) -> Dict[str, Any]:
     out["poc"] = _to_float(out.get("option_poc"))
     out["ce_wall"] = _to_float(out.get("ce_wall"))
     out["pe_wall"] = _to_float(out.get("pe_wall"))
+    out["safer_sell_ce"] = _to_float(out.get("safer_sell_ce"))
+    out["safer_sell_pe"] = _to_float(out.get("safer_sell_pe"))
     out["value_area_low"] = _to_float(out.get("value_area_low"))
     out["value_area_high"] = _to_float(out.get("value_area_high"))
     out["scores"] = {

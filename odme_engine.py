@@ -427,6 +427,151 @@ def _final_action(tilt: str, ce_action: str, pe_action: str, scores: Dict[str, i
     return "No clean edge. Hold existing risk light and wait for the next fetch to confirm writer control or failure."
 
 
+
+
+def _move_arrow(move: str) -> str:
+    move = str(move or "").lower()
+    if move == "higher":
+        return "↑"
+    if move == "lower":
+        return "↓"
+    return ""
+
+
+def _get_strike_row(matrix: pd.DataFrame, strike: float, side: str) -> Dict[str, Any]:
+    if matrix is None or matrix.empty:
+        return {}
+    x = matrix[(matrix["side"].eq(side.upper())) & (pd.to_numeric(matrix["strike"], errors="coerce").round(6).eq(round(float(strike or 0), 6)))]
+    if x.empty:
+        return {}
+    return x.iloc[0].to_dict()
+
+
+def _add_level_to_keys(key_strikes: Dict[str, Dict[str, float]], strikes: pd.DataFrame, level: float) -> None:
+    level = _safe_float(level)
+    if not level or strikes is None or strikes.empty:
+        return
+    row = strikes[pd.to_numeric(strikes["strike"], errors="coerce").round(6).eq(round(level, 6))]
+    if row.empty:
+        return
+    r = row.iloc[0]
+    key_strikes[str(int(round(level)))] = {
+        "strike": float(level),
+        "ce_oi": _safe_float(r.get("ce_oi")), "pe_oi": _safe_float(r.get("pe_oi")),
+        "ce_ltp": _safe_float(r.get("ce_ltp")), "pe_ltp": _safe_float(r.get("pe_ltp")),
+        "ce_volume": _safe_float(r.get("ce_volume")), "pe_volume": _safe_float(r.get("pe_volume")),
+    }
+
+
+def _wall_card(side: str, wall: float, previous_wall: float, wall_move: str, matrix: pd.DataFrame) -> Dict[str, Any]:
+    side = side.upper()
+    row = _get_strike_row(matrix, wall, side)
+    prev_row = _get_strike_row(matrix, previous_wall, side) if previous_wall else {}
+    tag = str(row.get("action_tag", ""))
+    prev_tag = str(prev_row.get("action_tag", ""))
+    arrow = _move_arrow(wall_move)
+
+    if wall_move == "first snapshot":
+        return {"title": f"{side} Wall", "level": f"{_fmt_level(wall)} {side}", "arrow": "", "color": "grey", "state": "Observation mode", "message": "No prior anchor for wall quality."}
+
+    failure_tags = {"ce_failure", "pe_failure"}
+    stress_tags = {"ce_stress", "ce_abnormal", "pe_stress", "pe_trap"}
+    control_tags = {"ce_defended", "ce_defended_mild", "ce_control", "ce_control_mild", "pe_support", "pe_support_mild", "pe_defended", "pe_defended_mild"}
+    weak_prev_tags = failure_tags | stress_tags | {"ce_weak", "pe_unwind", "neutral"}
+
+    if tag in failure_tags:
+        return {"title": f"{side} Wall", "level": f"{_fmt_level(wall)} {side}", "arrow": arrow, "color": "red", "state": "Wall failure / covering", "message": "Do not treat as clean writer control."}
+    if wall_move not in ["stable", "first snapshot"] and prev_tag in weak_prev_tags:
+        return {"title": f"{side} Wall", "level": f"{_fmt_level(wall)} {side}", "arrow": arrow, "color": "orange", "state": f"Wall shifted after {_fmt_level(previous_wall)} failure", "message": "New wall is defensive, not clean yet."}
+    if tag in stress_tags:
+        return {"title": f"{side} Wall", "level": f"{_fmt_level(wall)} {side}", "arrow": arrow, "color": "orange", "state": "Wall defence under pressure", "message": "Writers active, but premium pressure is not clean."}
+    if tag in control_tags:
+        return {"title": f"{side} Wall", "level": f"{_fmt_level(wall)} {side}", "arrow": arrow, "color": "green", "state": "Clean wall holding", "message": "Writer control is currently clean."}
+    if wall_move not in ["stable", "first snapshot"]:
+        return {"title": f"{side} Wall", "level": f"{_fmt_level(wall)} {side}", "arrow": arrow, "color": "orange", "state": "Wall shifted", "message": "Treat migration as caution until confirmed."}
+    return {"title": f"{side} Wall", "level": f"{_fmt_level(wall)} {side}", "arrow": arrow, "color": "orange", "state": "Not clean", "message": "Wall exists, but writer quality is unclear."}
+
+
+def _safer_card(side: str, safer: float, previous_safer: float, wall_move: str, matrix: pd.DataFrame) -> Dict[str, Any]:
+    side = side.upper()
+    row = _get_strike_row(matrix, safer, side)
+    tag = str(row.get("action_tag", ""))
+    move = _movement(safer, previous_safer)
+    arrow = _move_arrow(move)
+    if move == "first snapshot":
+        arrow = ""
+        return {"title": f"Safer {side} Sell", "level": f"{_fmt_level(safer)} {side}", "arrow": arrow, "color": "grey", "state": "Observation mode", "message": "No anchor to confirm safer strike quality."}
+
+    failure_tags = {"ce_failure", "pe_failure"}
+    stress_tags = {"ce_stress", "ce_abnormal", "pe_stress", "pe_trap"}
+    control_tags = {"ce_defended", "ce_defended_mild", "ce_control", "ce_control_mild", "pe_support", "pe_support_mild", "pe_defended", "pe_defended_mild"}
+
+    if tag in failure_tags:
+        return {"title": f"Safer {side} Sell", "level": f"{_fmt_level(safer)} {side}", "arrow": arrow, "color": "red", "state": "Avoid", "message": "Writers are covering even at safer strike."}
+    if tag in control_tags and wall_move in ["stable", "first snapshot"]:
+        return {"title": f"Safer {side} Sell", "level": f"{_fmt_level(safer)} {side}", "arrow": arrow, "color": "green", "state": "Tradable", "message": "Cleaner buffer away from active wall."}
+    if tag in control_tags:
+        return {"title": f"Safer {side} Sell", "level": f"{_fmt_level(safer)} {side}", "arrow": arrow, "color": "green", "state": "Tradable", "message": "Safer than wall; use EDGE alignment."}
+    if tag in stress_tags:
+        return {"title": f"Safer {side} Sell", "level": f"{_fmt_level(safer)} {side}", "arrow": arrow, "color": "orange", "state": "Caution", "message": "Premium pressure exists; reduce size or wait."}
+    return {"title": f"Safer {side} Sell", "level": f"{_fmt_level(safer)} {side}", "arrow": arrow, "color": "orange", "state": "Caution", "message": "Not clean enough for aggressive selling."}
+
+
+def _poc_card(spot: float, poc: float, pe_wall: float, ce_wall: float, poc_move: str, ce_defence: int, ce_stress: int, ce_failure: int, pe_support: int, pe_stress: int, pe_failure: int) -> Dict[str, Any]:
+    arrow = _move_arrow(poc_move)
+    if poc_move == "first snapshot" or not poc or not spot:
+        return {"title": "POC", "level": _fmt_level(poc), "arrow": "", "color": "grey", "state": "Observation mode", "message": "No prior anchor for POC behaviour."}
+    width = abs(ce_wall - pe_wall) if ce_wall and pe_wall else 0.0
+    near = abs(spot - poc) <= max(width * 0.12, spot * 0.002, 1.0)
+    if near:
+        return {"title": "POC", "level": _fmt_level(poc), "arrow": arrow, "color": "grey", "state": "Theta control zone", "message": "Price near positioning balance."}
+    if spot > poc:
+        if ce_failure > 0 or ce_stress > ce_defence or poc_move == "higher":
+            return {"title": "POC", "level": _fmt_level(poc), "arrow": arrow, "color": "green", "state": "Upside expansion risk", "message": "CE selling needs safer strike only."}
+        return {"title": "POC", "level": _fmt_level(poc), "arrow": arrow, "color": "red", "state": "Magnet pull downward", "message": "Price stretched above balance."}
+    if spot < poc:
+        if pe_failure > 0 or pe_stress > pe_support or poc_move == "lower":
+            return {"title": "POC", "level": _fmt_level(poc), "arrow": arrow, "color": "red", "state": "Downside expansion risk", "message": "PE selling needs safer strike only."}
+        return {"title": "POC", "level": _fmt_level(poc), "arrow": arrow, "color": "green", "state": "Magnet pull upward", "message": "Price stretched below balance."}
+    return {"title": "POC", "level": _fmt_level(poc), "arrow": arrow, "color": "grey", "state": "Theta control zone", "message": "Price near positioning balance."}
+
+
+def _premium_alert(matrix: pd.DataFrame, spot_delta: float) -> str:
+    if matrix is None or matrix.empty:
+        return ""
+    spot_dir = _direction(spot_delta, 0.0)
+    if spot_dir == "flat":
+        if _count_tags(matrix, ["ce_stress", "ce_abnormal", "ce_failure", "pe_stress", "pe_trap", "pe_failure"]) > 0:
+            return "Premium alert: Premium expanding while spot is flat — theta risk elevated."
+        return ""
+    if spot_dir == "up" and _count_tags(matrix, ["pe_trap", "pe_failure", "pe_stress"], "PE") > 0:
+        return "Premium alert: PE premium firm despite spot rising — downside hedge demand active."
+    if spot_dir == "down" and _count_tags(matrix, ["ce_abnormal", "ce_failure", "ce_stress"], "CE") > 0:
+        return "Premium alert: CE premium firm despite spot falling — upside premium still active."
+    if spot_dir == "up" and _count_tags(matrix, ["ce_defended", "ce_defended_mild"], "CE") > 0:
+        return "Premium alert: Spot moved up but CE premium did not expand — upside follow-through weak."
+    if spot_dir == "down" and _count_tags(matrix, ["pe_defended", "pe_defended_mild"], "PE") > 0:
+        return "Premium alert: Spot moved down but PE premium did not expand — downside follow-through weak."
+    return ""
+
+
+def _compact_hero(final_action: str, ce_card: Dict[str, Any], pe_card: Dict[str, Any], safer_ce_card: Dict[str, Any], safer_pe_card: Dict[str, Any], poc_card: Dict[str, Any], first: bool) -> str:
+    if first:
+        return "Observation mode only — prior anchor not available. Levels are visible, but ODME should not be used for strong action yet."
+    # Prefer action card with clearer tradability.
+    ce_ok = safer_ce_card.get("state") == "Tradable"
+    pe_ok = safer_pe_card.get("state") == "Tradable"
+    if ce_ok and not pe_ok:
+        action = f"Prefer short CE at {safer_ce_card.get('level', '')}. Avoid fresh PE selling for now."
+    elif pe_ok and not ce_ok:
+        action = f"Prefer short PE at {safer_pe_card.get('level', '')}. Avoid fresh CE selling for now."
+    elif ce_ok and pe_ok:
+        action = "Both safer sides are tradable only as theta structures; use EDGE to choose side."
+    else:
+        action = "No clean fresh short option. Wait or use wider strikes only if EDGE strongly supports it."
+    reason = f"Reason: CE wall is {str(ce_card.get('state','')).lower()}, PE wall is {str(pe_card.get('state','')).lower()}, and POC shows {str(poc_card.get('state','')).lower()}."
+    return f"{action}\n{reason}"
+
 def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | None = None, previous_summary: Dict[str, Any] | None = None) -> Dict[str, Any]:
     previous_summary = previous_summary or {}
     strikes, meta = build_strike_table(chain_df, instrument, manual_spot)
@@ -448,6 +593,8 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
     prev_poc = _safe_float(previous_summary.get("poc") or previous_summary.get("option_poc"))
     prev_ce_wall = _safe_float(previous_summary.get("ce_wall"))
     prev_pe_wall = _safe_float(previous_summary.get("pe_wall"))
+    prev_safer_ce = _safe_float(previous_summary.get("safer_sell_ce"))
+    prev_safer_pe = _safe_float(previous_summary.get("safer_sell_pe"))
     spot_delta = spot - prev_spot if prev_spot else 0.0
     spot_pct = _pct_change(spot, prev_spot) if prev_spot else 0.0
     poc_move = _movement(poc, prev_poc)
@@ -456,6 +603,9 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
     range_move = _range_shift(ce_wall - pe_wall if ce_wall and pe_wall else 0, prev_ce_wall - prev_pe_wall if prev_ce_wall and prev_pe_wall else 0)
 
     key_strikes = _make_key_strikes(strikes, spot, poc, val, vah, ce_candidates, pe_candidates)
+    # Include prior important levels so wall migrations/failures are visible in anchored matrix.
+    for _lvl in [prev_poc, prev_ce_wall, prev_pe_wall, _safe_float(previous_summary.get("safer_sell_ce")), _safe_float(previous_summary.get("safer_sell_pe"))]:
+        _add_level_to_keys(key_strikes, strikes, _lvl)
     prev_keys = _extract_prev_key_metrics(previous_summary)
     matrix = _build_matrix(key_strikes, prev_keys, spot, prev_spot)
 
@@ -513,6 +663,14 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
     pe_action = _side_action("PE", pe_wall, safer_pe, pe_move, pe_stress, 0, pe_failure, pe_support)
     final_action = _final_action(tilt, ce_action, pe_action, scores, spot, poc, poc_move)
 
+    poc_card = _poc_card(spot, poc, pe_wall, ce_wall, poc_move, ce_defence, ce_stress, ce_failure, pe_support, pe_stress, pe_failure)
+    ce_wall_card = _wall_card("CE", ce_wall, prev_ce_wall, ce_move, matrix)
+    pe_wall_card = _wall_card("PE", pe_wall, prev_pe_wall, pe_move, matrix)
+    safer_ce_card = _safer_card("CE", safer_ce, prev_safer_ce, ce_move, matrix)
+    safer_pe_card = _safer_card("PE", safer_pe, prev_safer_pe, pe_move, matrix)
+    premium_alert = _premium_alert(matrix, spot_delta)
+    hero_action = _compact_hero(final_action, ce_wall_card, pe_wall_card, safer_ce_card, safer_pe_card, poc_card, poc_move == "first snapshot" or not prev_spot)
+
     commentary = build_commentary(
         tilt=tilt,
         spot=spot,
@@ -565,6 +723,15 @@ def analyze_odme(chain_df: pd.DataFrame, instrument: str, manual_spot: float | N
         "key_strikes": key_strikes,
         "commentary": commentary,
         "final_action": final_action,
+        "hero_action": hero_action,
+        "premium_alert": premium_alert,
+        "cards": {
+            "poc": poc_card,
+            "ce_wall": ce_wall_card,
+            "pe_wall": pe_wall_card,
+            "safer_ce": safer_ce_card,
+            "safer_pe": safer_pe_card,
+        },
         "ce_action": ce_action,
         "pe_action": pe_action,
         "meta": meta,

@@ -99,6 +99,10 @@ def inject_css() -> None:
         h2 {font-size: 1.12rem !important;}
         h3 {font-size: 0.98rem !important; margin-top: 0.6rem !important;}
         .small-note {font-size: 0.76rem; color: rgba(90,90,90,0.95);}
+        .data-line {font-size: 0.86rem; font-weight: 850; margin: 0.25rem 0 0.55rem 0; color: rgba(25,25,25,0.95);}
+        .data-sub {font-size: 0.72rem; font-weight: 650; color: rgba(105,105,105,0.95); margin-top: -0.35rem; margin-bottom: 0.55rem;}
+        .fetch-failed {font-size: 0.86rem; font-weight: 900; color: #c73535; margin: 0.25rem 0 0.55rem 0;}
+        .premium-alert {font-size: 0.86rem; font-weight: 900; color: #c73535; margin: 0.55rem 0 0.75rem 0;}
         .odme-card {
             border: 1px solid rgba(100,100,100,0.20);
             border-radius: 13px;
@@ -232,7 +236,7 @@ def render_card(label: str, value: Any, sub: str = "", tint: str = "tint-grey") 
         f"""
         <div class="odme-card {tint}">
             <div class="label">{_html_escape(label)}</div>
-            <div class="value">{_html_escape(value)}</div>
+            <div class="value">{_html_escape(value).replace("&lt;br&gt;", "<br>")}</div>
             <div class="sub">{_html_escape(sub)}</div>
         </div>
         """,
@@ -246,7 +250,7 @@ def render_hero(label: str, value: str, tint: str = "") -> None:
         f"""
         <div class="{cls}">
             <div class="label">{_html_escape(label)}</div>
-            <div class="value">{_html_escape(value)}</div>
+            <div class="value">{_html_escape(value).replace("&lt;br&gt;", "<br>")}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -339,6 +343,10 @@ def result_to_display(result: Dict[str, Any]) -> Dict[str, Any]:
         "risk_note": get_section(sections, "Risk Note", default="No risk note generated."),
         "verdict_text": get_section(sections, "ODME Verdict", default=result.get("tilt", "")),
         "session_read": get_section(sections, "Session Read", default=""),
+        "cards": result.get("cards", {}),
+        "premium_alert": result.get("premium_alert", ""),
+        "hero_action": result.get("hero_action") or result.get("final_action") or get_section(sections, "Final Action", default="No final action generated."),
+        "anchor_snapshot_ts": result.get("anchor_snapshot_ts", ""),
     }
 
 
@@ -375,6 +383,10 @@ def saved_row_to_display(row: Dict[str, Any]) -> Dict[str, Any]:
         "risk_note": get_section(sections, "Risk Note", default="No risk note in saved summary."),
         "verdict_text": get_section(sections, "ODME Verdict", default=row.get("odme_tilt", "")),
         "session_read": get_section(sections, "Session Read", default=""),
+        "cards": {},
+        "premium_alert": "",
+        "hero_action": get_section(sections, "Final Action", default="Fetch live data for current action."),
+        "anchor_snapshot_ts": "",
     }
 
 
@@ -607,6 +619,75 @@ def fetch_analyze_save(store, angel: AngelConnector, master: pd.DataFrame, instr
     return {"result": result, "meta": meta, "usable": usable, "contracts": len(chain), "future_ltp": future_ltp}
 
 
+
+
+def _tint_from_card_color(color: str) -> str:
+    color = str(color or "").lower()
+    if color == "green":
+        return "tint-green"
+    if color == "red":
+        return "tint-red"
+    if color in ["orange", "amber"]:
+        return "tint-amber"
+    return "tint-grey"
+
+
+def render_data_line(display: Dict[str, Any], live_result: Optional[Dict[str, Any]]) -> None:
+    if live_result and live_result.get("error"):
+        st.markdown(f'<div class="fetch-failed">Fetch failed — Reason: {_html_escape(live_result.get("error"))}</div>', unsafe_allow_html=True)
+        return
+    st.markdown('<div class="data-line">Live data</div>' if display.get("kind") == "live" else '<div class="data-line">Last saved data</div>', unsafe_allow_html=True)
+    if display.get("kind") == "live" and live_result is not None and not live_result.get("anchor_snapshot_ts"):
+        st.markdown('<div class="data-sub">No prior anchor — observation mode</div>', unsafe_allow_html=True)
+
+
+def render_trade_card(card: Dict[str, Any]) -> None:
+    title = card.get("title", "")
+    level = str(card.get("level", ""))
+    arrow = str(card.get("arrow", ""))
+    state = card.get("state", "")
+    message = card.get("message", "")
+    tint = _tint_from_card_color(card.get("color", "grey"))
+    level_line = f"{level} {arrow}".strip()
+    body = f"{state}<br><span style='font-size:0.74rem;color:rgba(80,80,80,0.95);'>{_html_escape(message)}</span>"
+    st.markdown(
+        f"""
+        <div class="odme-card {tint}">
+            <div class="label">{_html_escape(title)}</div>
+            <div class="value">{_html_escape(level_line)}</div>
+            <div class="sub"><b>{_html_escape(state)}</b><br>{_html_escape(message)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _fallback_cards(display: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    return {
+        "poc": {"title": "POC", "level": _fmt_num(display.get("poc")), "arrow": "", "color": "grey", "state": "Saved view", "message": "Fetch live data for current POC read."},
+        "ce_wall": {"title": "CE Wall", "level": f"{_fmt_num(display.get('ce_wall'))} CE", "arrow": "", "color": "grey", "state": "Saved view", "message": "Fetch live data for wall quality."},
+        "pe_wall": {"title": "PE Wall", "level": f"{_fmt_num(display.get('pe_wall'))} PE", "arrow": "", "color": "grey", "state": "Saved view", "message": "Fetch live data for wall quality."},
+        "safer_ce": {"title": "Safer CE Sell", "level": f"{_fmt_num(display.get('safer_sell_ce'))} CE", "arrow": "", "color": "grey", "state": "Saved view", "message": "Fetch live data for safer strike quality."},
+        "safer_pe": {"title": "Safer PE Sell", "level": f"{_fmt_num(display.get('safer_sell_pe'))} PE", "arrow": "", "color": "grey", "state": "Saved view", "message": "Fetch live data for safer strike quality."},
+    }
+
+
+def render_level_cards(display: Dict[str, Any]) -> None:
+    cards = display.get("cards") or _fallback_cards(display)
+    cols = st.columns(5)
+    keys = ["poc", "ce_wall", "pe_wall", "safer_ce", "safer_pe"]
+    for col, key in zip(cols, keys):
+        with col:
+            render_trade_card(cards.get(key, {}))
+    alert = str(display.get("premium_alert") or "").strip()
+    if alert:
+        st.markdown(f'<div class="premium-alert">{_html_escape(alert)}</div>', unsafe_allow_html=True)
+
+
+def render_final_hero(display: Dict[str, Any]) -> None:
+    text = display.get("hero_action") or display.get("final_action") or "No ODME action generated."
+    render_hero("ODME Action", str(text).replace("\n", "<br>"), _tint_for_action(text, ""))
+
 def render_top_cards(display: Dict[str, Any]) -> None:
     tilt = display.get("tilt", "MIXED / NO CLEAN EDGE")
     top = st.columns(5)
@@ -651,16 +732,16 @@ def render_previous_and_scores(comparison: pd.DataFrame, display: Dict[str, Any]
 
 
 def render_chain_heatmap(live_result: Optional[Dict[str, Any]]) -> None:
-    st.markdown("### 6. Key option chain heatmap — ATM ± 8 strikes")
+    st.markdown("### Option chain heatmap — ATM ± 5 strikes")
     if not live_result:
         st.info("Heatmap is available after a fresh live fetch. Saved Google Sheet summaries intentionally do not store full option-chain rows.")
         return
-    chain_view = build_chain_view(live_result, radius=8)
+    chain_view = build_chain_view(live_result, radius=5)
     if chain_view.empty:
         st.info("No strike table available from current live result.")
     else:
-        st.caption("Red tint = CE OI concentration, green tint = PE OI concentration, blue = combined OI/POC, amber border = ATM row. Use action cards for final trade guidance.")
-        st.dataframe(style_chain_table(chain_view, live_result), use_container_width=True, hide_index=True, height=560)
+        st.caption("Visual backup only. Use ODME Action and cards for the decision.")
+        st.dataframe(style_chain_table(chain_view, live_result), use_container_width=True, hide_index=True, height=430)
 
 
 def render_expandable_commentary(display: Dict[str, Any]) -> None:
@@ -701,28 +782,12 @@ def render_matrix(live_result: Optional[Dict[str, Any]]) -> None:
 
 def render_odme_dashboard(display: Dict[str, Any], comparison: pd.DataFrame, live_result: Optional[Dict[str, Any]] = None) -> None:
     if live_result and live_result.get("error"):
-        st.warning(live_result["error"])
+        render_data_line(display, live_result)
         return
-    st.markdown("### 1. Live ODME levels" if display.get("kind") == "live" else "### 1. Last saved ODME levels")
-    render_top_cards(display)
-    if live_result:
-        with st.expander("Data verification details", expanded=False):
-            st.write({
-                "future_symbol": live_result.get("future_symbol", ""),
-                "future_token": live_result.get("future_token", ""),
-                "future_expiry": live_result.get("future_expiry", ""),
-                "future_ltp": live_result.get("future_ltp", live_result.get("spot", "")),
-                "future_feed_time": live_result.get("future_feed_time", ""),
-                "future_mapping_reason": live_result.get("future_mapping_reason", ""),
-                "option_expiry_used_for_mapping": live_result.get("option_expiry_used_for_mapping", ""),
-                "anchor_snapshot_before_today_ts": live_result.get("anchor_snapshot_ts", ""),
-            })
-    render_action_sections(display)
-    render_previous_and_scores(comparison, display)
+    render_data_line(display, live_result)
+    render_level_cards(display)
+    render_final_hero(display)
     render_chain_heatmap(live_result)
-    render_expandable_commentary(display)
-    render_matrix(live_result)
-
 
 def render_history(history: pd.DataFrame) -> None:
     if history is None or history.empty:
@@ -818,7 +883,7 @@ def main_page() -> None:
         else:
             st.info("No saved ODME summary for this instrument+expiry yet. Click Fetch Live + Save ODME Summary.")
 
-    render_history(history)
+    # Snapshot history intentionally hidden in final action-first UI.
 
 
 def main() -> None:
