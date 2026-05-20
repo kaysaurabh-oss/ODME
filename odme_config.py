@@ -58,6 +58,45 @@ MCX_STRIKE_SCALE_DIVISOR = {
     "SILVERMIC": 100.0,
 }
 
+# Strike interval filter used after Angel strike normalization.
+# Instruments not listed here are left unchanged. This intentionally keeps ZINC
+# and any other non-configured symbols on the exchange-provided strikes.
+STRIKE_STEP_BY_INSTRUMENT = {
+    "NIFTY": 50,
+    "BANKNIFTY": 100,
+    "FINNIFTY": 50,
+    "MIDCPNIFTY": 25,
+    "GOLD": 500,
+    "GOLDM": 500,
+    "COPPER": 10,
+    "NATURALGAS": 5,
+    "SILVER": 1000,
+    "SILVERM": 1000,
+    "CRUDEOIL": 50,
+    "CRUDEOILM": 50,
+}
+
+
+def strike_step_for_instrument(instrument: str) -> int | None:
+    """Return configured strike interval, or None to keep exchange strikes as-is."""
+    key = str(instrument or "").upper().replace(" ", "").replace("-", "").replace("_", "").strip()
+    return STRIKE_STEP_BY_INSTRUMENT.get(key)
+
+
+def is_valid_configured_strike(instrument: str, strike: float) -> bool:
+    """True when strike matches configured interval; unconfigured instruments are not filtered."""
+    step = strike_step_for_instrument(instrument)
+    if not step:
+        return True
+    try:
+        value = float(strike)
+    except Exception:
+        return False
+    if value <= 0:
+        return False
+    nearest = round(value / step) * step
+    return abs(value - nearest) < 1e-6
+
 
 # Hourly refresh while active. Streamlit only runs while the app is open.
 REFRESH_INTERVAL_SECONDS = 3600

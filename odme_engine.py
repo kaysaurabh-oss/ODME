@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
-from odme_config import DEFAULT_RELEVANT_RANGE_PCT, RELEVANT_RANGE_PCT
+from odme_config import DEFAULT_RELEVANT_RANGE_PCT, RELEVANT_RANGE_PCT, is_valid_configured_strike
 
 
 # =============================================================================
@@ -117,6 +117,13 @@ def relevant_range(df: pd.DataFrame, instrument: str, spot: float) -> Tuple[floa
 
 def build_strike_table(chain_df: pd.DataFrame, instrument: str, manual_spot: float | None = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     df = _clean_chain(chain_df)
+    if df.empty:
+        return pd.DataFrame(), {"spot": 0, "range_low": 0, "range_high": 0, "relevant_rows": 0, "latest_rows": 0}
+
+    # Defensive filter for loaded/cached chain rows. Live Angel rows are already
+    # filtered in angel_connector.get_option_rows, but this keeps old saved data
+    # from reintroducing skipped strikes. ZINC and unconfigured symbols remain unchanged.
+    df = df[df["strike"].apply(lambda x: is_valid_configured_strike(instrument, x))].copy()
     if df.empty:
         return pd.DataFrame(), {"spot": 0, "range_low": 0, "range_high": 0, "relevant_rows": 0, "latest_rows": 0}
 

@@ -12,7 +12,13 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from odme_config import ANGEL_INSTRUMENT_MASTER_URL, LOCAL_CONFIG_PATH, MCX_SYMBOLS, MCX_STRIKE_SCALE_DIVISOR
+from odme_config import (
+    ANGEL_INSTRUMENT_MASTER_URL,
+    LOCAL_CONFIG_PATH,
+    MCX_SYMBOLS,
+    MCX_STRIKE_SCALE_DIVISOR,
+    is_valid_configured_strike,
+)
 
 try:
     from SmartApi import SmartConnect
@@ -238,6 +244,9 @@ class AngelConnector:
         if df.empty:
             return df
         df["strike_norm"] = df.apply(cls.normalize_strike, axis=1)
+        # Keep only the configured exchange strike interval for selected instruments.
+        # Unconfigured instruments, including ZINC, are left unchanged.
+        df = df[df["strike_norm"].apply(lambda x: is_valid_configured_strike(instrument, x))].copy()
         df["option_type"] = df["symbol"].astype(str).str.upper().str.extract(r"(CE|PE)$", expand=False)
         df = df[df["option_type"].isin(["CE", "PE"])]
         return df.sort_values(["expiry_dt", "expiry", "strike_norm", "option_type", "symbol"], na_position="last")
