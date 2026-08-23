@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, List
 
 import pandas as pd
@@ -10,7 +11,6 @@ from angel_connector import AngelConnector, AngelDataError, AngelSessionError, l
 from data_store import get_store, make_key, make_snapshot_id, parse_previous_summary, utc_now_iso
 from odme_config import APP_NAME, REFRESH_INTERVAL_SECONDS, SUPPORTED_INSTRUMENTS
 from odme_engine import analyze_odme, reconstruct_saved_result
-from email_notifier import send_email
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
@@ -65,48 +65,6 @@ def login_page() -> None:
         totp = st.text_input("Current Angel TOTP", type="password", max_chars=8)
         submitted = st.form_submit_button("Login")
 
-
-    with st.expander("Email alert test", expanded=False):
-        st.caption("This only tests Gmail delivery. It does not run ODME or require Angel login.")
-        if st.button("Send test email to configured recipients", key="send_email_test"):
-            try:
-                sender = str(st.secrets["GMAIL_SENDER"]).strip()
-                app_password = str(st.secrets["GMAIL_APP_PASSWORD"]).strip()
-                recipients = st.secrets["ALERT_EMAILS"]
-                sent_count = send_email(
-                    sender=sender,
-                    app_password=app_password,
-                    recipients=recipients,
-                    subject="ODME Alerts - Email Test",
-                    body=(
-                        "ODME email alert setup is working.\n\n"
-                        "This is only a delivery test; no market scan was run."
-                    ),
-                )
-                st.success(f"Test email sent successfully to {sent_count} recipient(s).")
-            except KeyError as exc:
-                st.error(f"Missing Streamlit secret: {exc}. Check GMAIL_SENDER, GMAIL_APP_PASSWORD and ALERT_EMAILS.")
-            except Exception as exc:
-                st.error(f"Email test failed: {exc}")
-
-    with st.expander("Automatic Angel login test", expanded=False):
-        st.caption(
-            "This generates the current Angel TOTP from ANGEL_TOTP_SECRET and tests a real SmartAPI login. "
-            "The TOTP secret and generated code are never displayed."
-        )
-        if st.button("Test automatic Angel login", key="test_auto_angel_login"):
-            try:
-                creds = load_angel_credentials()
-                test_angel = AngelConnector(creds)
-                test_angel.login_automatic()
-                test_master = test_angel.load_instrument_master()
-                if test_master is None or test_master.empty:
-                    raise RuntimeError("Angel login succeeded but instrument master could not be loaded.")
-                st.success(
-                    f"Automatic Angel login successful. Instrument master loaded ({len(test_master):,} rows)."
-                )
-            except Exception as exc:
-                st.error(f"Automatic Angel login test failed: {exc}")
 
     if submitted:
         try:
@@ -1004,6 +962,40 @@ def render_history(history: pd.DataFrame) -> None:
                 st.line_chart(chart_df[chart_cols])
 
 
+
+def _active_expiries(option_rows: pd.DataFrame) -> List[str]:
+    """Return non-expired option expiries in chronological order (India date)."""
+    if option_rows is None or option_rows.empty or "expiry" not in option_rows.columns:
+        return []
+    temp = option_rows[["expiry", "expiry_dt"]].drop_duplicates().copy()
+    today = pd.Timestamp(datetime.now(ZoneInfo("Asia/Kolkata")).date())
+    if "expiry_dt" in temp.columns:
+        temp = temp[temp["expiry_dt"].isna() | (temp["expiry_dt"] >= today)]
+    temp = temp.sort_values(["expiry_dt", "expiry"], na_position="last")
+    return temp["expiry"].dropna().astype(str).unique().tolist()
+
+
+def _instrument_options(settings: pd.DataFrame) -> List[str]:
+    if settings is None or settings.empty or "instrument" not in settings.columns:
+        return []
+    active = [str(x).upper().strip() for x in settings["instrument"].tolist() if str(x).strip()]
+    active_set = set(active)
+    defaults = [x for x in SUPPORTED_INSTRUMENTS if x in active_set]
+    customs = sorted(x for x in active_set if x not in set(SUPPORTED_INSTRUMENTS))
+    return defaults + customs
+
+
+def _setting_for(settings: pd.DataFrame, instrument: str) -> Dict[str, Any]:
+    if settings is None or settings.empty:
+        return {}
+    rows = settings[settings["instrument"].astype(str).str.upper().eq(str(instrument).upper())]
+    return rows.iloc[-1].to_dict() if not rows.empty else {}
+
+
+def _as_bool(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def main_page() -> None:
     inject_css()
     store = get_store()
@@ -1011,16 +1003,112 @@ def main_page() -> None:
     angel: AngelConnector = st.session_state.angel
     master: pd.DataFrame = st.session_state.master
 
+    # Expired option history is not comparable. Clean it once per India date.
+    india_date = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+    if st.session_state.get("last_expiry_cleanup_date") != india_date:
+        try:
+            cleanup = store.cleanup_expired_data(tz_name="Asia/Kolkata")
+            st.session_state["last_expiry_cleanup_date"] = india_date
+            if cleanup.get("deleted_snapshots", 0) or cleanup.get("cleared_scan_settings", 0):
+                st.toast(
+                    f"Expired ODME cleanup: {cleanup.get('deleted_snapshots', 0)} snapshot(s) deleted; "
+                    f"{cleanup.get('cleared_scan_settings', 0)} scan setting(s) cleared."
+                )
+        except Exception as exc:
+            st.warning(f"Expired-history cleanup could not run: {exc}")
+
     with st.sidebar:
         st.header("Instrument")
-        instrument = st.selectbox("Select instrument", SUPPORTED_INSTRUMENTS, index=0)
-        option_rows = angel.get_option_rows(master, instrument)
-        expiries = angel.get_expiries(master, instrument)
-        if not expiries:
-            st.error("No expiries found in Angel master for this instrument.")
+
+        try:
+            settings_df = store.list_instrument_settings(active_only=True)
+        except Exception as exc:
+            st.error(f"Could not load persistent instrument list: {exc}")
             st.stop()
-        expiry = st.selectbox("Select expiry", expiries, index=0)
+
+        instrument_options = _instrument_options(settings_df)
+        if not instrument_options:
+            st.warning("No active instruments. Add one below.")
+
+        with st.expander("Manage instruments", expanded=not bool(instrument_options)):
+            new_instrument = st.text_input(
+                "Add stock / instrument",
+                placeholder="e.g. RELIANCE",
+                key="new_instrument_input",
+            ).upper().strip()
+            if st.button("Add to dropdown", key="add_instrument_btn", use_container_width=True):
+                if not new_instrument:
+                    st.warning("Enter an instrument symbol first.")
+                else:
+                    try:
+                        new_options = angel.get_option_rows(master, new_instrument)
+                        new_futures = angel.get_future_rows(master, new_instrument)
+                        new_expiries = _active_expiries(new_options)
+                        if new_options.empty:
+                            st.error(f"No Angel option contracts found for {new_instrument}.")
+                        elif new_futures.empty:
+                            st.error(f"No Angel futures contract found for {new_instrument}; ODME requires futures data.")
+                        elif not new_expiries:
+                            st.error(f"No active option expiry found for {new_instrument}.")
+                        else:
+                            store.upsert_instrument_setting(new_instrument, active=True)
+                            st.success(f"{new_instrument} added to the persistent dropdown.")
+                            st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not add {new_instrument}: {exc}")
+
+        if not instrument_options:
+            st.stop()
+
+        instrument = st.selectbox("Select instrument", instrument_options, index=0)
+        current_setting = _setting_for(settings_df, instrument)
+
+        option_rows = angel.get_option_rows(master, instrument)
+        expiries = _active_expiries(option_rows)
+        if not expiries:
+            st.error("No active expiries found in Angel master for this instrument.")
+            st.stop()
+
+        saved_expiry = str(current_setting.get("selected_expiry", "")).strip()
+        expiry_index = expiries.index(saved_expiry) if saved_expiry in expiries else 0
+        expiry = st.selectbox("Select expiry (manual)", expiries, index=expiry_index)
         key = make_key(instrument, expiry)
+
+        st.caption(
+            "This exact expiry is used for the dashboard. Scheduled scanning will also use the manually saved expiry below; it will never auto-roll to the nearest expiry."
+        )
+        st.caption(f"Saved scan expiry: {saved_expiry or 'Not set'}")
+
+        with st.expander("Scheduled scan settings", expanded=True):
+            scan_enabled = st.checkbox(
+                "Enable scheduled scan",
+                value=_as_bool(current_setting.get("scan_enabled", False)),
+                key=f"scan_enabled_{instrument}",
+            )
+            email_alert = st.checkbox(
+                "Send email alert",
+                value=_as_bool(current_setting.get("email_alert", False)),
+                key=f"email_alert_{instrument}",
+                disabled=not scan_enabled,
+            )
+            if st.button("Save scan settings", key=f"save_scan_{instrument}", use_container_width=True):
+                store.upsert_instrument_setting(
+                    instrument,
+                    active=True,
+                    selected_expiry=expiry,
+                    scan_enabled=scan_enabled,
+                    email_alert=(email_alert if scan_enabled else False),
+                )
+                st.success(f"Saved: {instrument} / {expiry}")
+                st.rerun()
+
+        with st.expander("Remove instrument", expanded=False):
+            st.caption("Removes it from the dropdown and disables scans. Existing unexpired ODME snapshots are not deleted here.")
+            if st.button(f"Remove {instrument} from dropdown", key=f"remove_{instrument}", use_container_width=True):
+                store.deactivate_instrument(instrument)
+                st.success(f"{instrument} removed from the dropdown.")
+                st.rerun()
+
         st.caption("Spot/future is fetched from the related Angel futures contract only. If futures LTP or contract mapping cannot be verified, ODME stops instead of assuming data.")
         st.caption(f"Option contracts found: {len(option_rows[option_rows['expiry'].astype(str).eq(str(expiry))])}")
         fetch = st.button("Fetch Live + Save ODME Summary", type="primary")

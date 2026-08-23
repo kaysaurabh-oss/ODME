@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
-from odme_config import GOOGLE_SHEET_DEFAULT_NAME, LOCAL_DATA_DIR
+from odme_config import GOOGLE_SHEET_DEFAULT_NAME, LOCAL_DATA_DIR, SUPPORTED_INSTRUMENTS
 
 try:
     import gspread
@@ -21,6 +21,11 @@ except Exception:  # pragma: no cover
 
 
 ODME_TAB = "odme_snapshots"
+INSTRUMENT_TAB = "instrument_settings"
+
+INSTRUMENT_COLUMNS = [
+    "instrument", "active", "selected_expiry", "scan_enabled", "email_alert", "added_at", "updated_at"
+]
 
 ODME_COLUMNS = [
     "snapshot_id", "key", "ts", "instrument", "exchange", "expiry",
@@ -101,6 +106,54 @@ def select_prior_day_anchor(history: pd.DataFrame, tz_name: str = "Asia/Kolkata"
     return prior.iloc[-1].drop(labels=[c for c in ["_ts_utc", "_local_date"] if c in prior.columns]).to_dict()
 
 
+def _as_bool(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _expiry_date(value: Any) -> Optional[datetime.date]:
+    s = str(value or "").strip().upper()
+    if not s:
+        return None
+    for fmt in ("%d%b%Y", "%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    parsed = pd.to_datetime(s, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    try:
+        return parsed.date()
+    except Exception:
+        return None
+
+
+def _seed_default_settings(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        df = pd.DataFrame(columns=INSTRUMENT_COLUMNS)
+    for col in INSTRUMENT_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    existing = set(df["instrument"].astype(str).str.upper().str.strip()) if not df.empty else set()
+    now = utc_now_iso()
+    rows = []
+    for instrument in SUPPORTED_INSTRUMENTS:
+        if instrument not in existing:
+            rows.append({
+                "instrument": instrument,
+                "active": "TRUE",
+                "selected_expiry": "",
+                "scan_enabled": "FALSE",
+                "email_alert": "FALSE",
+                "added_at": now,
+                "updated_at": now,
+            })
+    if rows:
+        df = pd.concat([df[INSTRUMENT_COLUMNS], pd.DataFrame(rows)], ignore_index=True)
+    return df[INSTRUMENT_COLUMNS].astype(str).fillna("")
+
+
+
 class BaseStore:
     def ensure(self) -> None:
         raise NotImplementedError
@@ -151,6 +204,25 @@ class BaseStore:
         latest = self.load_latest_odme_snapshot(key)
         return bool(latest)
 
+    def list_instrument_settings(self, active_only: bool = False) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def upsert_instrument_setting(
+        self,
+        instrument: str,
+        active: Optional[bool] = None,
+        selected_expiry: Optional[str] = None,
+        scan_enabled: Optional[bool] = None,
+        email_alert: Optional[bool] = None,
+    ) -> None:
+        raise NotImplementedError
+
+    def deactivate_instrument(self, instrument: str) -> None:
+        self.upsert_instrument_setting(instrument, active=False, scan_enabled=False, email_alert=False)
+
+    def cleanup_expired_data(self, tz_name: str = "Asia/Kolkata") -> Dict[str, int]:
+        raise NotImplementedError
+
     # Backward-compatible no-op method name from old app.
     def upsert_initialized(self, row: Dict[str, Any]) -> None:
         return None
@@ -160,11 +232,18 @@ class LocalStore(BaseStore):
     def __init__(self, data_dir: str = LOCAL_DATA_DIR):
         self.root = Path(data_dir)
         self.path = self.root / "odme_snapshots.csv"
+        self.settings_path = self.root / "instrument_settings.csv"
 
     def ensure(self) -> None:
         self.root.mkdir(exist_ok=True)
         if not self.path.exists():
             pd.DataFrame(columns=ODME_COLUMNS).to_csv(self.path, index=False)
+        if self.settings_path.exists():
+            settings = pd.read_csv(self.settings_path, dtype=str).fillna("")
+        else:
+            settings = pd.DataFrame(columns=INSTRUMENT_COLUMNS)
+        seeded = _seed_default_settings(settings)
+        seeded.to_csv(self.settings_path, index=False)
 
     def append_odme_snapshot(self, result: Dict[str, Any], meta: Dict[str, Any]) -> None:
         self.ensure()
@@ -187,6 +266,90 @@ class LocalStore(BaseStore):
         if df.empty:
             return {}
         return df.iloc[-1].to_dict()
+
+    def list_instrument_settings(self, active_only: bool = False) -> pd.DataFrame:
+        self.ensure()
+        df = pd.read_csv(self.settings_path, dtype=str).fillna("")
+        for col in INSTRUMENT_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[INSTRUMENT_COLUMNS]
+        if active_only:
+            df = df[df["active"].apply(_as_bool)]
+        return df.reset_index(drop=True)
+
+    def upsert_instrument_setting(
+        self,
+        instrument: str,
+        active: Optional[bool] = None,
+        selected_expiry: Optional[str] = None,
+        scan_enabled: Optional[bool] = None,
+        email_alert: Optional[bool] = None,
+    ) -> None:
+        self.ensure()
+        instrument = str(instrument).upper().strip()
+        if not instrument:
+            raise ValueError("Instrument cannot be blank.")
+        df = pd.read_csv(self.settings_path, dtype=str).fillna("")
+        for col in INSTRUMENT_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        mask = df["instrument"].astype(str).str.upper().eq(instrument)
+        now = utc_now_iso()
+        if mask.any():
+            idx = df.index[mask][-1]
+            if active is not None:
+                df.at[idx, "active"] = "TRUE" if active else "FALSE"
+            if selected_expiry is not None:
+                df.at[idx, "selected_expiry"] = str(selected_expiry)
+            if scan_enabled is not None:
+                df.at[idx, "scan_enabled"] = "TRUE" if scan_enabled else "FALSE"
+            if email_alert is not None:
+                df.at[idx, "email_alert"] = "TRUE" if email_alert else "FALSE"
+            df.at[idx, "updated_at"] = now
+            if not str(df.at[idx, "added_at"]).strip():
+                df.at[idx, "added_at"] = now
+        else:
+            row = {
+                "instrument": instrument,
+                "active": "TRUE" if active is not False else "FALSE",
+                "selected_expiry": str(selected_expiry or ""),
+                "scan_enabled": "TRUE" if scan_enabled else "FALSE",
+                "email_alert": "TRUE" if email_alert else "FALSE",
+                "added_at": now,
+                "updated_at": now,
+            }
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        df[INSTRUMENT_COLUMNS].to_csv(self.settings_path, index=False)
+
+    def cleanup_expired_data(self, tz_name: str = "Asia/Kolkata") -> Dict[str, int]:
+        self.ensure()
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("Asia/Kolkata")
+        today = datetime.now(tz).date()
+
+        snapshots = pd.read_csv(self.path, dtype=str).fillna("")
+        before = len(snapshots)
+        if not snapshots.empty and "expiry" in snapshots.columns:
+            keep = snapshots["expiry"].apply(lambda x: (_expiry_date(x) is None) or (_expiry_date(x) >= today))
+            snapshots = snapshots[keep].copy()
+        deleted = before - len(snapshots)
+        snapshots.to_csv(self.path, index=False)
+
+        settings = pd.read_csv(self.settings_path, dtype=str).fillna("")
+        cleared = 0
+        for idx, row in settings.iterrows():
+            exp = _expiry_date(row.get("selected_expiry", ""))
+            if exp is not None and exp < today:
+                settings.at[idx, "selected_expiry"] = ""
+                settings.at[idx, "scan_enabled"] = "FALSE"
+                settings.at[idx, "email_alert"] = "FALSE"
+                settings.at[idx, "updated_at"] = utc_now_iso()
+                cleared += 1
+        settings[INSTRUMENT_COLUMNS].to_csv(self.settings_path, index=False)
+        return {"deleted_snapshots": deleted, "cleared_scan_settings": cleared}
 
 
 class GoogleSheetStore(BaseStore):
@@ -236,27 +399,40 @@ class GoogleSheetStore(BaseStore):
         except gspread.SpreadsheetNotFound:
             return self.gc.create(sheet_name)
 
-    def _worksheet(self, title: str):
+    def _worksheet(self, title: str, columns: Optional[List[str]] = None):
         if title in self._ws_cache:
             return self._ws_cache[title]
         try:
             ws = self.sheet.worksheet(title)
         except gspread.WorksheetNotFound:
-            ws = self.sheet.add_worksheet(title=title, rows=2000, cols=max(len(ODME_COLUMNS), 30))
-            ws.update("A1", [ODME_COLUMNS])
+            cols = columns or ODME_COLUMNS
+            ws = self.sheet.add_worksheet(title=title, rows=2000, cols=max(len(cols), 30))
+            ws.update("A1", [cols])
         self._ws_cache[title] = ws
         return ws
 
     def ensure(self) -> None:
         if self._ensured:
             return
-        ws = self._worksheet(ODME_TAB)
+        ws = self._worksheet(ODME_TAB, ODME_COLUMNS)
         header = ws.row_values(1)
         if header != ODME_COLUMNS:
-            # Keep it simple and safe for this new light version.
-            # If old heavy tabs exist, they are left untouched. Only this tab is managed.
+            # If old heavy tabs exist, they are left untouched. Only this compact tab is managed.
             ws.clear()
             ws.update("A1", [ODME_COLUMNS])
+
+        sws = self._worksheet(INSTRUMENT_TAB, INSTRUMENT_COLUMNS)
+        sheader = sws.row_values(1)
+        if sheader != INSTRUMENT_COLUMNS:
+            sws.clear()
+            sws.update("A1", [INSTRUMENT_COLUMNS])
+        records = sws.get_all_records()
+        settings = pd.DataFrame(records)
+        seeded = _seed_default_settings(settings)
+        existing_count = len(settings)
+        if len(seeded) > existing_count:
+            for _, row in seeded.iloc[existing_count:].iterrows():
+                sws.append_row([row.get(c, "") for c in INSTRUMENT_COLUMNS], value_input_option="USER_ENTERED")
         self._ensured = True
 
     def append_odme_snapshot(self, result: Dict[str, Any], meta: Dict[str, Any]) -> None:
@@ -287,6 +463,124 @@ class GoogleSheetStore(BaseStore):
         if df.empty:
             return {}
         return df.iloc[-1].to_dict()
+
+
+    def list_instrument_settings(self, active_only: bool = False) -> pd.DataFrame:
+        self.ensure()
+        ws = self._worksheet(INSTRUMENT_TAB, INSTRUMENT_COLUMNS)
+        records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        if df.empty:
+            df = pd.DataFrame(columns=INSTRUMENT_COLUMNS)
+        for col in INSTRUMENT_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[INSTRUMENT_COLUMNS].astype(str).fillna("")
+        if active_only:
+            df = df[df["active"].apply(_as_bool)]
+        return df.reset_index(drop=True)
+
+    def upsert_instrument_setting(
+        self,
+        instrument: str,
+        active: Optional[bool] = None,
+        selected_expiry: Optional[str] = None,
+        scan_enabled: Optional[bool] = None,
+        email_alert: Optional[bool] = None,
+    ) -> None:
+        self.ensure()
+        instrument = str(instrument).upper().strip()
+        if not instrument:
+            raise ValueError("Instrument cannot be blank.")
+        ws = self._worksheet(INSTRUMENT_TAB, INSTRUMENT_COLUMNS)
+        records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        if df.empty:
+            df = pd.DataFrame(columns=INSTRUMENT_COLUMNS)
+        for col in INSTRUMENT_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        mask = df["instrument"].astype(str).str.upper().eq(instrument) if not df.empty else pd.Series(dtype=bool)
+        now = utc_now_iso()
+        if not df.empty and mask.any():
+            idx = df.index[mask][-1]
+            row = {c: str(df.at[idx, c]) for c in INSTRUMENT_COLUMNS}
+            row["instrument"] = instrument
+            if active is not None:
+                row["active"] = "TRUE" if active else "FALSE"
+            if selected_expiry is not None:
+                row["selected_expiry"] = str(selected_expiry)
+            if scan_enabled is not None:
+                row["scan_enabled"] = "TRUE" if scan_enabled else "FALSE"
+            if email_alert is not None:
+                row["email_alert"] = "TRUE" if email_alert else "FALSE"
+            row["updated_at"] = now
+            if not row.get("added_at", "").strip():
+                row["added_at"] = now
+            sheet_row = int(idx) + 2
+            ws.update(f"A{sheet_row}:G{sheet_row}", [[row.get(c, "") for c in INSTRUMENT_COLUMNS]])
+        else:
+            row = {
+                "instrument": instrument,
+                "active": "TRUE" if active is not False else "FALSE",
+                "selected_expiry": str(selected_expiry or ""),
+                "scan_enabled": "TRUE" if scan_enabled else "FALSE",
+                "email_alert": "TRUE" if email_alert else "FALSE",
+                "added_at": now,
+                "updated_at": now,
+            }
+            ws.append_row([row.get(c, "") for c in INSTRUMENT_COLUMNS], value_input_option="USER_ENTERED")
+
+    def cleanup_expired_data(self, tz_name: str = "Asia/Kolkata") -> Dict[str, int]:
+        self.ensure()
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("Asia/Kolkata")
+        today = datetime.now(tz).date()
+
+        ws = self._worksheet(ODME_TAB, ODME_COLUMNS)
+        records = ws.get_all_records()
+        snapshots = pd.DataFrame(records)
+        if snapshots.empty:
+            snapshots = pd.DataFrame(columns=ODME_COLUMNS)
+        for col in ODME_COLUMNS:
+            if col not in snapshots.columns:
+                snapshots[col] = ""
+        before = len(snapshots)
+        if not snapshots.empty:
+            keep = snapshots["expiry"].apply(lambda x: (_expiry_date(x) is None) or (_expiry_date(x) >= today))
+            snapshots = snapshots[keep].copy()
+        deleted = before - len(snapshots)
+        if deleted:
+            ws.clear()
+            ws.update("A1", [ODME_COLUMNS])
+            if not snapshots.empty:
+                ws.update("A2", snapshots[ODME_COLUMNS].astype(str).fillna("").values.tolist())
+
+        sws = self._worksheet(INSTRUMENT_TAB, INSTRUMENT_COLUMNS)
+        srecords = sws.get_all_records()
+        settings = pd.DataFrame(srecords)
+        if settings.empty:
+            settings = pd.DataFrame(columns=INSTRUMENT_COLUMNS)
+        for col in INSTRUMENT_COLUMNS:
+            if col not in settings.columns:
+                settings[col] = ""
+        cleared = 0
+        for idx, row in settings.iterrows():
+            exp = _expiry_date(row.get("selected_expiry", ""))
+            if exp is not None and exp < today:
+                settings.at[idx, "selected_expiry"] = ""
+                settings.at[idx, "scan_enabled"] = "FALSE"
+                settings.at[idx, "email_alert"] = "FALSE"
+                settings.at[idx, "updated_at"] = utc_now_iso()
+                cleared += 1
+        if cleared:
+            sws.clear()
+            sws.update("A1", [INSTRUMENT_COLUMNS])
+            if not settings.empty:
+                sws.update("A2", settings[INSTRUMENT_COLUMNS].astype(str).fillna("").values.tolist())
+        return {"deleted_snapshots": deleted, "cleared_scan_settings": cleared}
 
 
 @st.cache_resource(show_spinner=False)
