@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from odme_config import GOOGLE_SHEET_DEFAULT_NAME, LOCAL_DATA_DIR, SUPPORTED_INSTRUMENTS
+from runtime_config import get_bool, get_gcp_service_account_info, get_secret
 
 try:
     import gspread
@@ -24,7 +25,8 @@ ODME_TAB = "odme_snapshots"
 INSTRUMENT_TAB = "instrument_settings"
 
 INSTRUMENT_COLUMNS = [
-    "instrument", "active", "selected_expiry", "scan_enabled", "email_alert", "added_at", "updated_at"
+    "instrument", "active", "selected_expiry", "scan_enabled", "email_alert", "scan_times",
+    "last_run_slot", "added_at", "updated_at"
 ]
 
 ODME_COLUMNS = [
@@ -77,6 +79,41 @@ def _json_loads(value: Any, default: Any = None) -> Any:
         return default
 
 
+def _column_letter(n: int) -> str:
+    out = ""
+    n = max(int(n), 1)
+    while n:
+        n, rem = divmod(n - 1, 26)
+        out = chr(65 + rem) + out
+    return out
+
+
+def _anchor_state_signature(row: Dict[str, Any]) -> str:
+    """Anchor-independent fingerprint used to ignore duplicate closed-market rows."""
+    base = {
+        "spot": _to_float(row.get("spot")),
+        "poc": _to_float(row.get("option_poc")),
+        "val": _to_float(row.get("value_area_low")),
+        "vah": _to_float(row.get("value_area_high")),
+        "ce_wall": _to_float(row.get("ce_wall")),
+        "pe_wall": _to_float(row.get("pe_wall")),
+        "safer_ce": _to_float(row.get("safer_sell_ce")),
+        "safer_pe": _to_float(row.get("safer_sell_pe")),
+        "hvn": _json_loads(row.get("hvn"), []),
+        "lvn": _json_loads(row.get("lvn"), []),
+    }
+    keys = _json_loads(row.get("key_strikes_json"), {})
+    selected = {}
+    for level in [base["poc"], base["val"], base["vah"], base["ce_wall"], base["pe_wall"], base["safer_ce"], base["safer_pe"]]:
+        if not level:
+            continue
+        k = str(int(round(float(level))))
+        if isinstance(keys, dict) and k in keys:
+            selected[k] = keys.get(k)
+    base["key_levels"] = selected
+    return _json_dumps(base)
+
+
 def select_prior_day_anchor(history: pd.DataFrame, tz_name: str = "Asia/Kolkata") -> Dict[str, Any]:
     """Pick the latest saved snapshot strictly before today's local date as anchor.
 
@@ -103,7 +140,19 @@ def select_prior_day_anchor(history: pd.DataFrame, tz_name: str = "Asia/Kolkata"
     if prior.empty:
         return {}
     prior = prior.sort_values("_ts_utc")
-    return prior.iloc[-1].drop(labels=[c for c in ["_ts_utc", "_local_date"] if c in prior.columns]).to_dict()
+
+    # Collapse duplicate closed-market observations across calendar dates. This
+    # keeps Friday as Monday's anchor when Saturday/Sunday (or a public holiday)
+    # merely repeated the same market state.
+    chosen: Dict[str, Any] = {}
+    last_sig = None
+    for _, r in prior.iterrows():
+        clean = r.drop(labels=[c for c in ["_ts_utc", "_local_date"] if c in r.index]).to_dict()
+        sig = _anchor_state_signature(clean)
+        if sig != last_sig:
+            chosen = clean
+            last_sig = sig
+    return chosen
 
 
 def _as_bool(value: Any) -> bool:
@@ -145,6 +194,8 @@ def _seed_default_settings(df: pd.DataFrame) -> pd.DataFrame:
                 "selected_expiry": "",
                 "scan_enabled": "FALSE",
                 "email_alert": "FALSE",
+                "scan_times": "",
+                "last_run_slot": "",
                 "added_at": now,
                 "updated_at": now,
             })
@@ -214,6 +265,8 @@ class BaseStore:
         selected_expiry: Optional[str] = None,
         scan_enabled: Optional[bool] = None,
         email_alert: Optional[bool] = None,
+        scan_times: Optional[str] = None,
+        last_run_slot: Optional[str] = None,
     ) -> None:
         raise NotImplementedError
 
@@ -285,6 +338,8 @@ class LocalStore(BaseStore):
         selected_expiry: Optional[str] = None,
         scan_enabled: Optional[bool] = None,
         email_alert: Optional[bool] = None,
+        scan_times: Optional[str] = None,
+        last_run_slot: Optional[str] = None,
     ) -> None:
         self.ensure()
         instrument = str(instrument).upper().strip()
@@ -306,6 +361,10 @@ class LocalStore(BaseStore):
                 df.at[idx, "scan_enabled"] = "TRUE" if scan_enabled else "FALSE"
             if email_alert is not None:
                 df.at[idx, "email_alert"] = "TRUE" if email_alert else "FALSE"
+            if scan_times is not None:
+                df.at[idx, "scan_times"] = str(scan_times)
+            if last_run_slot is not None:
+                df.at[idx, "last_run_slot"] = str(last_run_slot)
             df.at[idx, "updated_at"] = now
             if not str(df.at[idx, "added_at"]).strip():
                 df.at[idx, "added_at"] = now
@@ -316,6 +375,8 @@ class LocalStore(BaseStore):
                 "selected_expiry": str(selected_expiry or ""),
                 "scan_enabled": "TRUE" if scan_enabled else "FALSE",
                 "email_alert": "TRUE" if email_alert else "FALSE",
+                "scan_times": str(scan_times or ""),
+                "last_run_slot": str(last_run_slot or ""),
                 "added_at": now,
                 "updated_at": now,
             }
@@ -346,6 +407,7 @@ class LocalStore(BaseStore):
                 settings.at[idx, "selected_expiry"] = ""
                 settings.at[idx, "scan_enabled"] = "FALSE"
                 settings.at[idx, "email_alert"] = "FALSE"
+                settings.at[idx, "last_run_slot"] = ""
                 settings.at[idx, "updated_at"] = utc_now_iso()
                 cleared += 1
         settings[INSTRUMENT_COLUMNS].to_csv(self.settings_path, index=False)
@@ -364,28 +426,21 @@ class GoogleSheetStore(BaseStore):
 
     @staticmethod
     def available_from_secrets() -> bool:
-        try:
-            return bool(st.secrets.get("gcp_service_account"))
-        except Exception:
-            return False
+        return bool(get_gcp_service_account_info())
 
     @staticmethod
     def enabled_from_secrets() -> bool:
-        try:
-            return bool(st.secrets.get("USE_GOOGLE_SHEETS", False))
-        except Exception:
-            return False
+        return get_bool("USE_GOOGLE_SHEETS", False)
 
     @staticmethod
     def sheet_name_from_secrets() -> str:
-        try:
-            return str(st.secrets.get("GOOGLE_SHEET_NAME", GOOGLE_SHEET_DEFAULT_NAME))
-        except Exception:
-            return GOOGLE_SHEET_DEFAULT_NAME
+        return str(get_secret("GOOGLE_SHEET_NAME", GOOGLE_SHEET_DEFAULT_NAME))
 
     @staticmethod
     def _client_from_streamlit_secrets():
-        sa_info = dict(st.secrets["gcp_service_account"])
+        sa_info = get_gcp_service_account_info()
+        if not sa_info:
+            raise RuntimeError("Google service-account credentials are not configured.")
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
@@ -423,16 +478,17 @@ class GoogleSheetStore(BaseStore):
 
         sws = self._worksheet(INSTRUMENT_TAB, INSTRUMENT_COLUMNS)
         sheader = sws.row_values(1)
-        if sheader != INSTRUMENT_COLUMNS:
-            sws.clear()
-            sws.update("A1", [INSTRUMENT_COLUMNS])
-        records = sws.get_all_records()
+        # Preserve existing instrument settings when the schema gains a new column
+        # (for example scan_times). Never wipe the user's saved dropdown/expiry setup.
+        records = sws.get_all_records() if sheader else []
         settings = pd.DataFrame(records)
         seeded = _seed_default_settings(settings)
-        existing_count = len(settings)
-        if len(seeded) > existing_count:
-            for _, row in seeded.iloc[existing_count:].iterrows():
-                sws.append_row([row.get(c, "") for c in INSTRUMENT_COLUMNS], value_input_option="USER_ENTERED")
+        needs_rewrite = sheader != INSTRUMENT_COLUMNS or len(seeded) != len(settings)
+        if needs_rewrite:
+            sws.clear()
+            sws.update("A1", [INSTRUMENT_COLUMNS])
+            if not seeded.empty:
+                sws.update("A2", seeded[INSTRUMENT_COLUMNS].astype(str).fillna("").values.tolist())
         self._ensured = True
 
     def append_odme_snapshot(self, result: Dict[str, Any], meta: Dict[str, Any]) -> None:
@@ -487,6 +543,8 @@ class GoogleSheetStore(BaseStore):
         selected_expiry: Optional[str] = None,
         scan_enabled: Optional[bool] = None,
         email_alert: Optional[bool] = None,
+        scan_times: Optional[str] = None,
+        last_run_slot: Optional[str] = None,
     ) -> None:
         self.ensure()
         instrument = str(instrument).upper().strip()
@@ -514,11 +572,17 @@ class GoogleSheetStore(BaseStore):
                 row["scan_enabled"] = "TRUE" if scan_enabled else "FALSE"
             if email_alert is not None:
                 row["email_alert"] = "TRUE" if email_alert else "FALSE"
+            if scan_times is not None:
+                row["scan_times"] = str(scan_times)
+            if last_run_slot is not None:
+                row["last_run_slot"] = str(last_run_slot)
             row["updated_at"] = now
             if not row.get("added_at", "").strip():
                 row["added_at"] = now
             sheet_row = int(idx) + 2
-            ws.update(f"A{sheet_row}:G{sheet_row}", [[row.get(c, "") for c in INSTRUMENT_COLUMNS]])
+            # Update the full current schema width (not a hard-coded A:H range).
+            end_col = _column_letter(len(INSTRUMENT_COLUMNS))
+            ws.update(f"A{sheet_row}:{end_col}{sheet_row}", [[row.get(c, "") for c in INSTRUMENT_COLUMNS]])
         else:
             row = {
                 "instrument": instrument,
@@ -526,6 +590,8 @@ class GoogleSheetStore(BaseStore):
                 "selected_expiry": str(selected_expiry or ""),
                 "scan_enabled": "TRUE" if scan_enabled else "FALSE",
                 "email_alert": "TRUE" if email_alert else "FALSE",
+                "scan_times": str(scan_times or ""),
+                "last_run_slot": str(last_run_slot or ""),
                 "added_at": now,
                 "updated_at": now,
             }
@@ -573,6 +639,7 @@ class GoogleSheetStore(BaseStore):
                 settings.at[idx, "selected_expiry"] = ""
                 settings.at[idx, "scan_enabled"] = "FALSE"
                 settings.at[idx, "email_alert"] = "FALSE"
+                settings.at[idx, "last_run_slot"] = ""
                 settings.at[idx, "updated_at"] = utc_now_iso()
                 cleared += 1
         if cleared:
@@ -583,14 +650,19 @@ class GoogleSheetStore(BaseStore):
         return {"deleted_snapshots": deleted, "cleared_scan_settings": cleared}
 
 
-@st.cache_resource(show_spinner=False)
-def get_store() -> BaseStore:
+def create_store() -> BaseStore:
+    """Create a store for Streamlit or an unattended worker."""
     if GoogleSheetStore.enabled_from_secrets() and GoogleSheetStore.available_from_secrets():
         store: BaseStore = GoogleSheetStore(GoogleSheetStore.sheet_name_from_secrets())
     else:
         store = LocalStore()
     store.ensure()
     return store
+
+
+@st.cache_resource(show_spinner=False)
+def get_store() -> BaseStore:
+    return create_store()
 
 
 def make_summary_row(result: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:

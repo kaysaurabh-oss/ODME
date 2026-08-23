@@ -13,6 +13,8 @@ import pyotp
 import requests
 import streamlit as st
 
+from runtime_config import get_secret
+
 from odme_config import (
     ANGEL_INSTRUMENT_MASTER_URL,
     LOCAL_CONFIG_PATH,
@@ -43,10 +45,10 @@ class AngelSessionError(RuntimeError):
 
 
 def _read_streamlit_secret(name: str, default: Optional[str] = None) -> Optional[str]:
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return default
+    # Backward-compatible name. The helper now also supports environment variables
+    # so the unattended worker can run outside Streamlit.
+    value = get_secret(name, default)
+    return value
 
 
 def load_angel_totp_secret() -> str:

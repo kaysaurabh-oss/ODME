@@ -605,10 +605,9 @@ def app_header(store) -> None:
                 st.session_state[k] = False if k == "logged_in" else None
             _angel_session_cache().clear()
             st.rerun()
-    mode = "Google Sheets" if store.__class__.__name__ == "GoogleSheetStore" else "Local files"
     angel = st.session_state.get("angel")
     session_text = angel.session_label() if angel is not None and hasattr(angel, "session_label") else "Angel session active"
-    st.caption(f"Memory mode: {mode}. Stored tab: odme_snapshots. Full option-chain rows are not saved. | {session_text}")
+    st.caption(session_text)
 
 
 def fetch_analyze_save(store, angel: AngelConnector, master: pd.DataFrame, instrument: str, expiry: str, force: bool = True) -> Optional[Dict[str, Any]]:
@@ -996,6 +995,16 @@ def _as_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _scan_time_options() -> List[str]:
+    """Full 24-hour IST schedule in 5-minute slots, every day of the week."""
+    return [f"{hour:02d}:{minute:02d}" for hour in range(24) for minute in range(0, 60, 5)]
+
+
+def _parse_scan_times(value: Any) -> List[str]:
+    options = set(_scan_time_options())
+    return [x.strip() for x in str(value or "").split(",") if x.strip() in options]
+
+
 def main_page() -> None:
     inject_css()
     store = get_store()
@@ -1080,6 +1089,14 @@ def main_page() -> None:
         st.caption(f"Saved scan expiry: {saved_expiry or 'Not set'}")
 
         with st.expander("Scheduled scan settings", expanded=True):
+            saved_scan_times = _parse_scan_times(current_setting.get("scan_times", ""))
+            scan_times = st.multiselect(
+                "Scan times (IST)",
+                options=_scan_time_options(),
+                default=saved_scan_times,
+                key=f"scan_times_{instrument}",
+                help="Choose any fixed IST times across the full 24-hour day. The unattended worker can run on weekdays, weekends and holidays; unchanged closed-market reads will not replace the prior anchor.",
+            )
             scan_enabled = st.checkbox(
                 "Enable scheduled scan",
                 value=_as_bool(current_setting.get("scan_enabled", False)),
@@ -1091,16 +1108,23 @@ def main_page() -> None:
                 key=f"email_alert_{instrument}",
                 disabled=not scan_enabled,
             )
+            if scan_enabled and not scan_times:
+                st.warning("Select at least one scan time before enabling scheduled scan.")
             if st.button("Save scan settings", key=f"save_scan_{instrument}", use_container_width=True):
-                store.upsert_instrument_setting(
-                    instrument,
-                    active=True,
-                    selected_expiry=expiry,
-                    scan_enabled=scan_enabled,
-                    email_alert=(email_alert if scan_enabled else False),
-                )
-                st.success(f"Saved: {instrument} / {expiry}")
-                st.rerun()
+                if scan_enabled and not scan_times:
+                    st.error("Scheduled scan is enabled, but no scan time is selected.")
+                else:
+                    store.upsert_instrument_setting(
+                        instrument,
+                        active=True,
+                        selected_expiry=expiry,
+                        scan_enabled=scan_enabled,
+                        email_alert=(email_alert if scan_enabled else False),
+                        scan_times=",".join(scan_times),
+                    )
+                    times_text = ", ".join(scan_times) if scan_times else "No scheduled times"
+                    st.success(f"Saved: {instrument} / {expiry} / {times_text} IST")
+                    st.rerun()
 
         with st.expander("Remove instrument", expanded=False):
             st.caption("Removes it from the dropdown and disables scans. Existing unexpired ODME snapshots are not deleted here.")
@@ -1113,16 +1137,6 @@ def main_page() -> None:
         st.caption(f"Option contracts found: {len(option_rows[option_rows['expiry'].astype(str).eq(str(expiry))])}")
         fetch = st.button("Fetch Live + Save ODME Summary", type="primary")
         auto_on = st.checkbox("Auto-refresh hourly while app is open", value=False)
-        st.divider()
-        st.write("Saved ODME summaries")
-        try:
-            init_df = store.list_initialized()
-            if init_df.empty:
-                st.caption("None yet.")
-            else:
-                st.dataframe(init_df.tail(10), use_container_width=True, hide_index=True, height=240)
-        except Exception as exc:
-            st.warning(f"Could not load saved summary list: {exc}")
 
     if fetch:
         with st.spinner("Fetching live Angel chain, creating ODME commentary, saving compact summary..."):

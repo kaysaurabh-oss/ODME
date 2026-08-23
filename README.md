@@ -111,3 +111,7 @@ Streamlit Cloud file storage is not permanent. Use Google Sheets for persistent 
 ## Automatic Angel TOTP test
 
 For unattended Angel login, add `ANGEL_TOTP_SECRET` as a top-level Streamlit secret (before `[gcp_service_account]`). The login page includes **Automatic Angel login test**, which generates the current 6-digit TOTP internally and verifies a real SmartAPI login without displaying the seed or OTP. Manual TOTP login remains available.
+
+## Unattended scheduled scans
+
+The project now includes `scheduled_worker.py`, `scan_service.py`, `runtime_config.py` and `Dockerfile.worker` for unattended ODME scans. The dashboard stores a manual expiry and one or more 24-hour IST scan times for each instrument. The worker runs those exact expiry selections, never auto-rolls them, sends one consolidated Gmail summary, and skips saving unchanged closed-market data so weekend/holiday reads do not replace the prior trading-session anchor. See `SCHEDULED_WORKER.md`.
