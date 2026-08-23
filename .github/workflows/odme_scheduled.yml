@@ -3,6 +3,10 @@ name: ODME Scheduled Scan
 on:
   workflow_dispatch:
   schedule:
+    - cron: '30 12 * * *'
+      timezone: "Asia/Kolkata"
+    - cron: '0 17 * * *'
+      timezone: "Asia/Kolkata"
     - cron: '5 21 * * *'
       timezone: "Asia/Kolkata"
 
