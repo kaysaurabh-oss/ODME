@@ -87,6 +87,17 @@ def _expansion_label(score: float) -> str:
     return "LOW"
 
 
+def _move_arrow(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if "higher" in text or "up" in text:
+        return "↑"
+    if "lower" in text or "down" in text:
+        return "↓"
+    if "same" in text or "unchanged" in text or "stable" in text:
+        return "="
+    return ""
+
+
 def _instrument_summary(instrument: str, expiry: str, outcome: Dict[str, Any]) -> str:
     result = outcome.get("result", {}) or {}
     scores = result.get("scores", {}) or {}
@@ -94,53 +105,66 @@ def _instrument_summary(instrument: str, expiry: str, outcome: Dict[str, Any]) -
     path = result.get("path_risk", {}) or {}
 
     expansion = float(scores.get("Expansion", 0) or 0)
-    bullish = int(float(scores.get("Bullish", 0) or 0))
-    bearish = int(float(scores.get("Bearish", 0) or 0))
-    range_score = int(float(scores.get("Range", 0) or 0))
-    expansion_i = int(expansion)
 
-    ce_card = cards.get("ce_wall", {}) or {}
-    pe_card = cards.get("pe_wall", {}) or {}
-    sce_card = cards.get("safer_ce", {}) or {}
-    spe_card = cards.get("safer_pe", {}) or {}
-    poc_card = cards.get("poc", {}) or {}
+    ce_wall = result.get("ce_wall")
+    pe_wall = result.get("pe_wall")
+    safer_ce = result.get("safer_sell_ce")
+    safer_pe = result.get("safer_sell_pe")
+    poc = result.get("poc")
+
+    ce_arrow = _move_arrow(result.get("ce_wall_move"))
+    pe_arrow = _move_arrow(result.get("pe_wall_move"))
+    poc_arrow = _move_arrow(result.get("poc_move"))
 
     up_path = path.get("upside", {}) or {}
     dn_path = path.get("downside", {}) or {}
 
-    save_state = "CHANGED — snapshot saved" if outcome.get("saved") else "UNCHANGED — anchor preserved"
-    if not outcome.get("anchor"):
-        save_state = "NEW BASELINE — snapshot saved" if outcome.get("saved") else save_state
-
-    lines = [
-        f"{instrument} | Expiry {expiry}",
-        f"Verdict: {result.get('tilt', 'NA')}",
-        f"Future/Spot: {_fmt_num(outcome.get('future_ltp') or result.get('spot'), 2)} | POC: {_fmt_num(result.get('poc'), 0)} ({result.get('poc_move', 'NA')})",
-        f"Scores: Bull {bullish} | Bear {bearish} | Range {range_score} | Expansion {expansion_i} [{_expansion_label(expansion)}]",
-        f"CE wall: {_fmt_num(result.get('ce_wall'), 0)} ({result.get('ce_wall_move', 'NA')}) | {ce_card.get('state', 'NA')}",
-        f"Safer CE: {_fmt_num(result.get('safer_sell_ce'), 0)} | {sce_card.get('state', 'NA')}",
-        f"PE wall: {_fmt_num(result.get('pe_wall'), 0)} ({result.get('pe_wall_move', 'NA')}) | {pe_card.get('state', 'NA')}",
-        f"Safer PE: {_fmt_num(result.get('safer_sell_pe'), 0)} | {spe_card.get('state', 'NA')}",
-        f"Path: Upside {up_path.get('path', 'NA')} | Downside {dn_path.get('path', 'NA')}",
-    ]
-
-    poc_state = str(poc_card.get("state", "")).strip()
     premium_alert = _first_line(result.get("premium_alert"))
     action = _first_line(result.get("hero_action") or result.get("final_action"))
-    risk_bits: List[str] = []
-    if poc_state:
-        risk_bits.append(poc_state)
-    if premium_alert:
-        risk_bits.append(premium_alert.replace("Premium alert:", "Premium:"))
-    if action:
-        risk_bits.append(action)
-    if risk_bits:
-        lines.append("Risk/Read: " + " | ".join(risk_bits))
 
-    lines.append(f"Data state: {save_state}")
-    anchor_ts = str(result.get("anchor_snapshot_ts") or "").strip()
-    if anchor_ts:
-        lines.append(f"Anchor: {anchor_ts}")
+    poc_card = cards.get("poc", {}) or {}
+    poc_state = _first_line(poc_card.get("state"))
+
+    read_bits: List[str] = []
+
+    if poc_state:
+        read_bits.append(poc_state)
+
+    if premium_alert:
+        clean_premium = premium_alert.replace("Premium alert:", "").strip()
+        if clean_premium:
+            read_bits.append(clean_premium)
+
+    read_text = " ".join(read_bits).strip()
+
+    lines = [
+        f"{instrument} | {expiry} — {result.get('tilt', 'NA')}",
+        "",
+        (
+            f"Market: {_fmt_num(outcome.get('future_ltp') or result.get('spot'), 2)}"
+            f" | POC {_fmt_num(poc, 0)} {poc_arrow}"
+            f" | Expansion {_expansion_label(expansion)}"
+        ),
+        (
+            f"CE: Wall {_fmt_num(ce_wall, 0)} {ce_arrow}"
+            f" | Safer {_fmt_num(safer_ce, 0)}"
+        ),
+        (
+            f"PE: Wall {_fmt_num(pe_wall, 0)} {pe_arrow}"
+            f" | Safer {_fmt_num(safer_pe, 0)}"
+        ),
+        (
+            f"Path: Up {up_path.get('path', 'NA')}"
+            f" | Down {dn_path.get('path', 'NA')}"
+        ),
+    ]
+
+    if read_text:
+        lines.append(f"Read: {read_text}")
+
+    if action:
+        lines.append(f"Action: {action}")
+
     return "\n".join(lines)
 
 
@@ -154,9 +178,6 @@ def _build_email(now_ist: datetime, blocks: List[str]) -> Tuple[str, str]:
     header = [
         "ODME SCHEDULED SUMMARY",
         when,
-        "",
-        "Anchor rule: ODME compares with the latest saved CHANGED snapshot before today. "
-        "If a weekend/holiday/closed-market scan returns unchanged data, no new snapshot is saved and the old anchor is preserved.",
         "",
     ]
     body = "\n".join(header) + ("\n\n" + ("\n\n" + "-" * 72 + "\n\n").join(blocks) if blocks else "No due alert instruments.")
