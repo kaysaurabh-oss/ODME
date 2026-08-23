@@ -12,7 +12,7 @@ from runtime_config import get_list, get_secret
 from scan_service import run_odme_scan
 
 IST = ZoneInfo("Asia/Kolkata")
-DUE_GRACE_MINUTES = 10
+DUE_GRACE_MINUTES = 60
 
 
 def _as_bool(value: Any) -> bool:
@@ -39,11 +39,15 @@ def _slot_id(dt: datetime) -> str:
 
 
 def _find_due_slot(scan_times: List[str], last_run_slot: str, now_ist: datetime) -> Optional[datetime]:
-    """Return the oldest unprocessed selected slot within the grace window.
+    """Return the latest unprocessed selected slot within the grace window.
 
-    The worker is deliberately day-agnostic: weekdays, weekends and holidays are
-    treated the same. If market data is unchanged, scan_service refuses to save a
-    duplicate snapshot, so the prior trading-session anchor remains intact.
+    GitHub scheduled workflows can start later than the nominal cron time. A wider
+    grace window prevents a delayed job from being discarded. If more than one slot
+    is pending, ODME uses the latest one rather than back-filling stale scans.
+
+    Weekdays, weekends and holidays are treated the same. If market data is
+    unchanged, scan_service refuses to save a duplicate snapshot, so the prior
+    trading-session anchor remains intact.
     """
     candidates: List[datetime] = []
     for day in [now_ist.date() - timedelta(days=1), now_ist.date()]:
@@ -55,7 +59,7 @@ def _find_due_slot(scan_times: List[str], last_run_slot: str, now_ist: datetime)
                 candidates.append(dt)
     if not candidates:
         return None
-    return sorted(candidates)[0]
+    return sorted(candidates)[-1]
 
 
 def _fmt_num(value: Any, decimals: int = 0) -> str:

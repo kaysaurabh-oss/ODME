@@ -11,6 +11,7 @@ from angel_connector import AngelConnector, AngelDataError, AngelSessionError, l
 from data_store import get_store, make_key, make_snapshot_id, parse_previous_summary, utc_now_iso
 from odme_config import APP_NAME, REFRESH_INTERVAL_SECONDS, SUPPORTED_INSTRUMENTS
 from odme_engine import analyze_odme, reconstruct_saved_result
+from github_scheduler import scheduler_configured, sync_schedule_from_store
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
@@ -1023,6 +1024,11 @@ def main_page() -> None:
                     f"Expired ODME cleanup: {cleanup.get('deleted_snapshots', 0)} snapshot(s) deleted; "
                     f"{cleanup.get('cleared_scan_settings', 0)} scan setting(s) cleared."
                 )
+                if cleanup.get("cleared_scan_settings", 0) and scheduler_configured():
+                    try:
+                        sync_schedule_from_store(store)
+                    except Exception as sync_exc:
+                        st.warning(f"Expired settings were cleaned, but GitHub schedule sync failed: {sync_exc}")
         except Exception as exc:
             st.warning(f"Expired-history cleanup could not run: {exc}")
 
@@ -1123,14 +1129,32 @@ def main_page() -> None:
                         scan_times=",".join(scan_times),
                     )
                     times_text = ", ".join(scan_times) if scan_times else "No scheduled times"
-                    st.success(f"Saved: {instrument} / {expiry} / {times_text} IST")
+                    if scheduler_configured():
+                        try:
+                            sync_result = sync_schedule_from_store(store)
+                            st.success(
+                                f"Saved and GitHub schedule synced: {instrument} / {expiry} / {times_text} IST "
+                                f"({sync_result.get('count', 0)} unique daily scan time(s))."
+                            )
+                        except Exception as sync_exc:
+                            st.warning(f"Scan settings saved, but GitHub schedule sync failed: {sync_exc}")
+                    else:
+                        st.success(f"Saved: {instrument} / {expiry} / {times_text} IST")
+                        st.info("GitHub scheduling is not connected yet. The saved scan settings are safe; connect GitHub once and save again to activate automatic runs.")
                     st.rerun()
 
         with st.expander("Remove instrument", expanded=False):
             st.caption("Removes it from the dropdown and disables scans. Existing unexpired ODME snapshots are not deleted here.")
             if st.button(f"Remove {instrument} from dropdown", key=f"remove_{instrument}", use_container_width=True):
                 store.deactivate_instrument(instrument)
-                st.success(f"{instrument} removed from the dropdown.")
+                if scheduler_configured():
+                    try:
+                        sync_schedule_from_store(store)
+                        st.success(f"{instrument} removed and GitHub schedule updated.")
+                    except Exception as sync_exc:
+                        st.warning(f"{instrument} removed, but GitHub schedule sync failed: {sync_exc}")
+                else:
+                    st.success(f"{instrument} removed from the dropdown.")
                 st.rerun()
 
         st.caption("Spot/future is fetched from the related Angel futures contract only. If futures LTP or contract mapping cannot be verified, ODME stops instead of assuming data.")
