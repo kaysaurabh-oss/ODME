@@ -10,6 +10,7 @@ from angel_connector import AngelConnector, AngelDataError, AngelSessionError, l
 from data_store import get_store, make_key, make_snapshot_id, parse_previous_summary, utc_now_iso
 from odme_config import APP_NAME, REFRESH_INTERVAL_SECONDS, SUPPORTED_INSTRUMENTS
 from odme_engine import analyze_odme, reconstruct_saved_result
+from email_notifier import send_email
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
@@ -63,6 +64,30 @@ def login_page() -> None:
     with st.form("login_form"):
         totp = st.text_input("Current Angel TOTP", type="password", max_chars=8)
         submitted = st.form_submit_button("Login")
+
+
+    with st.expander("Email alert test", expanded=False):
+        st.caption("This only tests Gmail delivery. It does not run ODME or require Angel login.")
+        if st.button("Send test email to configured recipients", key="send_email_test"):
+            try:
+                sender = str(st.secrets["GMAIL_SENDER"]).strip()
+                app_password = str(st.secrets["GMAIL_APP_PASSWORD"]).strip()
+                recipients = st.secrets["ALERT_EMAILS"]
+                sent_count = send_email(
+                    sender=sender,
+                    app_password=app_password,
+                    recipients=recipients,
+                    subject="ODME Alerts - Email Test",
+                    body=(
+                        "ODME email alert setup is working.\n\n"
+                        "This is only a delivery test; no market scan was run."
+                    ),
+                )
+                st.success(f"Test email sent successfully to {sent_count} recipient(s).")
+            except KeyError as exc:
+                st.error(f"Missing Streamlit secret: {exc}. Check GMAIL_SENDER, GMAIL_APP_PASSWORD and ALERT_EMAILS.")
+            except Exception as exc:
+                st.error(f"Email test failed: {exc}")
 
     if submitted:
         try:
