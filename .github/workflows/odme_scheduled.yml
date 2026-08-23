@@ -5,6 +5,8 @@ on:
   schedule:
     - cron: '25 20 * * *'
       timezone: "Asia/Kolkata"
+    - cron: '5 21 * * *'
+      timezone: "Asia/Kolkata"
 
 permissions:
   contents: read
