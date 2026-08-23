@@ -107,3 +107,7 @@ streamlit run app.py
 ## Important note
 
 Streamlit Cloud file storage is not permanent. Use Google Sheets for persistent ODME memory.
+
+## Automatic Angel TOTP test
+
+For unattended Angel login, add `ANGEL_TOTP_SECRET` as a top-level Streamlit secret (before `[gcp_service_account]`). The login page includes **Automatic Angel login test**, which generates the current 6-digit TOTP internally and verifies a real SmartAPI login without displaying the seed or OTP. Manual TOTP login remains available.

@@ -89,6 +89,25 @@ def login_page() -> None:
             except Exception as exc:
                 st.error(f"Email test failed: {exc}")
 
+    with st.expander("Automatic Angel login test", expanded=False):
+        st.caption(
+            "This generates the current Angel TOTP from ANGEL_TOTP_SECRET and tests a real SmartAPI login. "
+            "The TOTP secret and generated code are never displayed."
+        )
+        if st.button("Test automatic Angel login", key="test_auto_angel_login"):
+            try:
+                creds = load_angel_credentials()
+                test_angel = AngelConnector(creds)
+                test_angel.login_automatic()
+                test_master = test_angel.load_instrument_master()
+                if test_master is None or test_master.empty:
+                    raise RuntimeError("Angel login succeeded but instrument master could not be loaded.")
+                st.success(
+                    f"Automatic Angel login successful. Instrument master loaded ({len(test_master):,} rows)."
+                )
+            except Exception as exc:
+                st.error(f"Automatic Angel login test failed: {exc}")
+
     if submitted:
         try:
             creds = load_angel_credentials()

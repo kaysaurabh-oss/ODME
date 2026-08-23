@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
+import pyotp
 import requests
 import streamlit as st
 
@@ -46,6 +47,28 @@ def _read_streamlit_secret(name: str, default: Optional[str] = None) -> Optional
         return st.secrets.get(name, default)
     except Exception:
         return default
+
+
+def load_angel_totp_secret() -> str:
+    """Load the permanent Angel TOTP seed without ever exposing the generated code."""
+    secret = _read_streamlit_secret("ANGEL_TOTP_SECRET")
+    if not secret:
+        raise RuntimeError(
+            "ANGEL_TOTP_SECRET not found. Add the permanent Angel TOTP secret in Streamlit Secrets."
+        )
+    cleaned = re.sub(r"\s+", "", str(secret)).strip()
+    if not cleaned:
+        raise RuntimeError("ANGEL_TOTP_SECRET is empty.")
+    return cleaned
+
+
+def generate_angel_totp() -> str:
+    """Generate the current 6-digit Angel TOTP from the stored permanent seed."""
+    secret = load_angel_totp_secret()
+    try:
+        return pyotp.TOTP(secret).now()
+    except Exception as exc:
+        raise RuntimeError("Could not generate Angel TOTP from ANGEL_TOTP_SECRET.") from exc
 
 
 def load_angel_credentials() -> AngelCredentials:
@@ -154,6 +177,10 @@ class AngelConnector:
         self.login_time_utc = datetime.now(timezone.utc).isoformat()
         self.last_session_error = ""
         return data
+
+    def login_automatic(self) -> Dict[str, Any]:
+        """Login without manual OTP entry by generating TOTP from Streamlit Secrets."""
+        return self.login(generate_angel_totp())
 
     def ensure_session_ready(self) -> None:
         if self.obj is None or not self.jwt_token:
