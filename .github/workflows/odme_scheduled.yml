@@ -7,6 +7,8 @@ on:
       timezone: "Asia/Kolkata"
     - cron: '0 17 * * *'
       timezone: "Asia/Kolkata"
+    - cron: '30 22 * * *'
+      timezone: "Asia/Kolkata"
 
 permissions:
   contents: read
