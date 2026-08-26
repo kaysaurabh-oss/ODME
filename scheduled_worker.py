@@ -12,7 +12,7 @@ from runtime_config import get_list, get_secret
 from scan_service import run_odme_scan
 
 IST = ZoneInfo("Asia/Kolkata")
-DUE_GRACE_MINUTES = 60
+DUE_GRACE_MINUTES = 240
 
 
 def _as_bool(value: Any) -> bool:
