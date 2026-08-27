@@ -11,7 +11,7 @@ on:
       timezone: "Asia/Kolkata"
     - cron: '5 17 * * *'
       timezone: "Asia/Kolkata"
-    - cron: '30 22 * * *'
+    - cron: '35 22 * * *'
       timezone: "Asia/Kolkata"
 
 permissions:
