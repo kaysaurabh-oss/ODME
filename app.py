@@ -11,7 +11,6 @@ from angel_connector import AngelConnector, AngelDataError, AngelSessionError, l
 from data_store import get_store, make_key, make_snapshot_id, parse_previous_summary, utc_now_iso
 from odme_config import APP_NAME, REFRESH_INTERVAL_SECONDS, SUPPORTED_INSTRUMENTS
 from odme_engine import analyze_odme, reconstruct_saved_result
-from github_scheduler import scheduler_configured, sync_schedule_from_store
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
@@ -997,13 +996,37 @@ def _as_bool(value: Any) -> bool:
 
 
 def _scan_time_options() -> List[str]:
-    """Full 24-hour IST schedule in 5-minute slots, every day of the week."""
-    return [f"{hour:02d}:{minute:02d}" for hour in range(24) for minute in range(0, 60, 5)]
+    """Full 24-hour IST schedule in 30-minute slots."""
+    return [f"{hour:02d}:{minute:02d}" for hour in range(24) for minute in (0, 30)]
 
 
 def _parse_scan_times(value: Any) -> List[str]:
     options = set(_scan_time_options())
     return [x.strip() for x in str(value or "").split(",") if x.strip() in options]
+
+
+def _scan_spacing_issue(scan_times: List[str]) -> Optional[str]:
+    """Return a message when selected daily scan slots are less than 60 minutes apart.
+
+    The comparison is circular across midnight so, for example, 23:30 and 00:00
+    are correctly treated as only 30 minutes apart.
+    """
+    if len(scan_times) < 2:
+        return None
+
+    minutes = sorted(
+        int(hhmm.split(":", 1)[0]) * 60 + int(hhmm.split(":", 1)[1])
+        for hhmm in scan_times
+    )
+    wrapped = minutes + [minutes[0] + 24 * 60]
+    for left, right in zip(wrapped, wrapped[1:]):
+        gap = right - left
+        if gap < 60:
+            left_txt = f"{(left // 60) % 24:02d}:{left % 60:02d}"
+            right_mod = right % (24 * 60)
+            right_txt = f"{right_mod // 60:02d}:{right_mod % 60:02d}"
+            return f"Keep scheduled scans at least 1 hour apart. {left_txt} and {right_txt} are only {gap} minutes apart."
+    return None
 
 
 def main_page() -> None:
@@ -1024,11 +1047,6 @@ def main_page() -> None:
                     f"Expired ODME cleanup: {cleanup.get('deleted_snapshots', 0)} snapshot(s) deleted; "
                     f"{cleanup.get('cleared_scan_settings', 0)} scan setting(s) cleared."
                 )
-                if cleanup.get("cleared_scan_settings", 0) and scheduler_configured():
-                    try:
-                        sync_schedule_from_store(store)
-                    except Exception as sync_exc:
-                        st.warning(f"Expired settings were cleaned, but GitHub schedule sync failed: {sync_exc}")
         except Exception as exc:
             st.warning(f"Expired-history cleanup could not run: {exc}")
 
@@ -1101,7 +1119,10 @@ def main_page() -> None:
                 options=_scan_time_options(),
                 default=saved_scan_times,
                 key=f"scan_times_{instrument}",
-                help="Choose any fixed IST times across the full 24-hour day. The unattended worker can run on weekdays, weekends and holidays; unchanged closed-market reads will not replace the prior anchor.",
+                help=(
+                    "Choose desired IST scan slots in 30-minute increments and keep selected slots at least 1 hour apart. "
+                    "The background scheduler wakes once per hour and runs the latest due unprocessed slot within the recovery window."
+                ),
             )
             scan_enabled = st.checkbox(
                 "Enable scheduled scan",
@@ -1114,11 +1135,18 @@ def main_page() -> None:
                 key=f"email_alert_{instrument}",
                 disabled=not scan_enabled,
             )
+
+            spacing_issue = _scan_spacing_issue(scan_times)
             if scan_enabled and not scan_times:
                 st.warning("Select at least one scan time before enabling scheduled scan.")
+            elif scan_enabled and spacing_issue:
+                st.warning(spacing_issue)
+
             if st.button("Save scan settings", key=f"save_scan_{instrument}", use_container_width=True):
                 if scan_enabled and not scan_times:
                     st.error("Scheduled scan is enabled, but no scan time is selected.")
+                elif scan_enabled and spacing_issue:
+                    st.error(spacing_issue)
                 else:
                     store.upsert_instrument_setting(
                         instrument,
@@ -1129,32 +1157,14 @@ def main_page() -> None:
                         scan_times=",".join(scan_times),
                     )
                     times_text = ", ".join(scan_times) if scan_times else "No scheduled times"
-                    if scheduler_configured():
-                        try:
-                            sync_result = sync_schedule_from_store(store)
-                            st.success(
-                                f"Saved and GitHub schedule synced: {instrument} / {expiry} / {times_text} IST "
-                                f"({sync_result.get('count', 0)} unique daily scan time(s))."
-                            )
-                        except Exception as sync_exc:
-                            st.warning(f"Scan settings saved, but GitHub schedule sync failed: {sync_exc}")
-                    else:
-                        st.success(f"Saved: {instrument} / {expiry} / {times_text} IST")
-                        st.info("GitHub scheduling is not connected yet. The saved scan settings are safe; connect GitHub once and save again to activate automatic runs.")
+                    st.success(f"Saved: {instrument} / {expiry} / {times_text} IST")
                     st.rerun()
 
         with st.expander("Remove instrument", expanded=False):
             st.caption("Removes it from the dropdown and disables scans. Existing unexpired ODME snapshots are not deleted here.")
             if st.button(f"Remove {instrument} from dropdown", key=f"remove_{instrument}", use_container_width=True):
                 store.deactivate_instrument(instrument)
-                if scheduler_configured():
-                    try:
-                        sync_schedule_from_store(store)
-                        st.success(f"{instrument} removed and GitHub schedule updated.")
-                    except Exception as sync_exc:
-                        st.warning(f"{instrument} removed, but GitHub schedule sync failed: {sync_exc}")
-                else:
-                    st.success(f"{instrument} removed from the dropdown.")
+                st.success(f"{instrument} removed from the dropdown.")
                 st.rerun()
 
         st.caption("Spot/future is fetched from the related Angel futures contract only. If futures LTP or contract mapping cannot be verified, ODME stops instead of assuming data.")

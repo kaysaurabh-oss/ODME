@@ -41,9 +41,10 @@ def _slot_id(dt: datetime) -> str:
 def _find_due_slot(scan_times: List[str], last_run_slot: str, now_ist: datetime) -> Optional[datetime]:
     """Return the latest unprocessed selected slot within the grace window.
 
-    GitHub scheduled workflows can start later than the nominal cron time. A wider
-    grace window prevents a delayed job from being discarded. If more than one slot
-    is pending, ODME uses the latest one rather than back-filling stale scans.
+    The background scheduler is an hourly heartbeat rather than an exact-time trigger.
+    The grace window lets a later heartbeat recover a due slot if GitHub is delayed or
+    skips a wake-up. If more than one slot is pending, ODME uses the latest one rather
+    than back-filling stale market reads.
 
     Weekdays, weekends and holidays are treated the same. If market data is
     unchanged, scan_service refuses to save a duplicate snapshot, so the prior
