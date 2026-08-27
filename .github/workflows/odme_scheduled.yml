@@ -5,7 +5,11 @@ on:
   schedule:
     - cron: '30 12 * * *'
       timezone: "Asia/Kolkata"
+    - cron: '35 12 * * *'
+      timezone: "Asia/Kolkata"
     - cron: '0 17 * * *'
+      timezone: "Asia/Kolkata"
+    - cron: '5 17 * * *'
       timezone: "Asia/Kolkata"
     - cron: '30 22 * * *'
       timezone: "Asia/Kolkata"
