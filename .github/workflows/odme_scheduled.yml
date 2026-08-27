@@ -11,6 +11,8 @@ on:
       timezone: "Asia/Kolkata"
     - cron: '5 17 * * *'
       timezone: "Asia/Kolkata"
+    - cron: '25 18 * * *'
+      timezone: "Asia/Kolkata"
     - cron: '35 22 * * *'
       timezone: "Asia/Kolkata"
 
