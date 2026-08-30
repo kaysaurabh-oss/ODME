@@ -9,8 +9,11 @@ import streamlit as st
 
 from angel_connector import AngelConnector, AngelDataError, AngelSessionError, load_angel_credentials
 from data_store import get_store, make_key, make_snapshot_id, parse_previous_summary, utc_now_iso
+from email_notifier import send_email
 from odme_config import APP_NAME, REFRESH_INTERVAL_SECONDS, SUPPORTED_INSTRUMENTS
 from odme_engine import analyze_odme, reconstruct_saved_result
+from runtime_config import get_list, get_secret
+from scan_service import run_odme_scan
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
@@ -58,13 +61,17 @@ def init_session() -> None:
 def login_page() -> None:
     inject_css()
     st.title(APP_NAME)
+    st.caption("Manual ODME batch scanning — no background scheduler required.")
+
+    render_manual_batch_scan("login")
+
+    st.markdown("---")
     st.subheader("Angel login")
-    st.info("Enter only the current Angel TOTP. API key, Client ID and PIN are read from Streamlit Secrets or local config.")
+    st.info("Login is needed only for the interactive dashboard. The Scan All button above uses the stored Angel TOTP secret automatically.")
 
     with st.form("login_form"):
         totp = st.text_input("Current Angel TOTP", type="password", max_chars=8)
         submitted = st.form_submit_button("Login")
-
 
     if submitted:
         try:
@@ -80,7 +87,7 @@ def login_page() -> None:
             cache["angel"] = angel
             cache["master"] = master
             cache["angel_login_at"] = angel.login_time_utc or ""
-            st.success("Angel login successful. Instrument master loaded. Login will be reused while the Streamlit process remains active. Fresh TOTP is needed only after Angel session expiry or Streamlit Cloud restart/sleep.")
+            st.success("Angel login successful. Instrument master loaded. Login will be reused while the Streamlit process remains active.")
             st.rerun()
         except Exception as exc:
             st.session_state.login_error = str(exc)
@@ -995,44 +1002,180 @@ def _as_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _scan_time_options() -> List[str]:
-    """Full 24-hour IST schedule in 30-minute slots."""
-    return [f"{hour:02d}:{minute:02d}" for hour in range(24) for minute in (0, 30)]
+def _first_line(text: Any, max_len: int = 220) -> str:
+    line = str(text or "").strip().splitlines()[0] if str(text or "").strip() else ""
+    if len(line) > max_len:
+        line = line[: max_len - 3].rstrip() + "..."
+    return line
 
 
-def _parse_scan_times(value: Any) -> List[str]:
-    options = set(_scan_time_options())
-    return [x.strip() for x in str(value or "").split(",") if x.strip() in options]
+def _expansion_label(score: float) -> str:
+    if score >= 75:
+        return "HIGH"
+    if score >= 55:
+        return "ELEVATED"
+    if score >= 35:
+        return "WATCH"
+    return "LOW"
 
 
-def _scan_spacing_issue(scan_times: List[str]) -> Optional[str]:
-    """Return a message when selected daily scan slots are less than 60 minutes apart.
+def _move_arrow(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if "higher" in text or "up" in text:
+        return "↑"
+    if "lower" in text or "down" in text:
+        return "↓"
+    if "same" in text or "unchanged" in text or "stable" in text:
+        return "="
+    return ""
 
-    The comparison is circular across midnight so, for example, 23:30 and 00:00
-    are correctly treated as only 30 minutes apart.
-    """
-    if len(scan_times) < 2:
-        return None
 
-    minutes = sorted(
-        int(hhmm.split(":", 1)[0]) * 60 + int(hhmm.split(":", 1)[1])
-        for hhmm in scan_times
+def _batch_instrument_summary(instrument: str, expiry: str, outcome: Dict[str, Any]) -> str:
+    result = outcome.get("result", {}) or {}
+    scores = result.get("scores", {}) or {}
+    cards = result.get("cards", {}) or {}
+    path = result.get("path_risk", {}) or {}
+
+    expansion = float(scores.get("Expansion", 0) or 0)
+    ce_wall = result.get("ce_wall")
+    pe_wall = result.get("pe_wall")
+    safer_ce = result.get("safer_sell_ce")
+    safer_pe = result.get("safer_sell_pe")
+    poc = result.get("poc")
+
+    ce_arrow = _move_arrow(result.get("ce_wall_move"))
+    pe_arrow = _move_arrow(result.get("pe_wall_move"))
+    poc_arrow = _move_arrow(result.get("poc_move"))
+
+    up_path = path.get("upside", {}) or {}
+    dn_path = path.get("downside", {}) or {}
+    premium_alert = _first_line(result.get("premium_alert"))
+    action = _first_line(result.get("hero_action") or result.get("final_action"))
+    poc_card = cards.get("poc", {}) or {}
+    poc_state = _first_line(poc_card.get("state"))
+
+    read_bits: List[str] = []
+    if poc_state:
+        read_bits.append(poc_state)
+    if premium_alert:
+        clean_premium = premium_alert.replace("Premium alert:", "").strip()
+        if clean_premium:
+            read_bits.append(clean_premium)
+    read_text = " ".join(read_bits).strip()
+
+    lines = [
+        f"{instrument} | {expiry} — {result.get('tilt', 'NA')}",
+        "",
+        (
+            f"Market: {_fmt_num(outcome.get('future_ltp') or result.get('spot'), 2)}"
+            f" | POC {_fmt_num(poc, 0)} {poc_arrow}"
+            f" | Expansion {_expansion_label(expansion)}"
+        ),
+        f"CE: Wall {_fmt_num(ce_wall, 0)} {ce_arrow} | Safer {_fmt_num(safer_ce, 0)}",
+        f"PE: Wall {_fmt_num(pe_wall, 0)} {pe_arrow} | Safer {_fmt_num(safer_pe, 0)}",
+        f"Path: Up {up_path.get('path', 'NA')} | Down {dn_path.get('path', 'NA')}",
+    ]
+    if read_text:
+        lines.append(f"Read: {read_text}")
+    if action:
+        lines.append(f"Action: {action}")
+    return "\n".join(lines)
+
+
+def _run_enabled_batch_scan() -> Dict[str, Any]:
+    """Immediately scan every active instrument marked Enable Scan and email one summary."""
+    store = get_store()
+    settings = store.list_instrument_settings(active_only=True)
+    if settings is None or settings.empty:
+        raise RuntimeError("No active instruments are configured.")
+
+    enabled = settings[settings["scan_enabled"].apply(_as_bool)].copy()
+    if enabled.empty:
+        raise RuntimeError("No instruments have Enable Scan turned on.")
+
+    angel = AngelConnector(load_angel_credentials())
+    angel.login_automatic()
+    master = angel.load_instrument_master()
+
+    blocks: List[str] = []
+    details: List[str] = []
+    ok_count = 0
+
+    for _, row in enabled.iterrows():
+        item = row.to_dict()
+        instrument = str(item.get("instrument", "")).upper().strip()
+        expiry = str(item.get("selected_expiry", "")).strip()
+        if not instrument:
+            continue
+        if not expiry:
+            blocks.append(f"{instrument} | Expiry not saved\nSCAN ERROR: Select and save an expiry in the dashboard first.")
+            details.append(f"{instrument}: missing saved expiry")
+            continue
+        try:
+            outcome = run_odme_scan(
+                store,
+                angel,
+                master,
+                instrument,
+                expiry,
+                save_only_if_changed=True,
+            )
+            blocks.append(_batch_instrument_summary(instrument, expiry, outcome))
+            details.append(
+                f"{instrument}: OK; changed={outcome.get('changed')} saved={outcome.get('saved')}"
+            )
+            ok_count += 1
+        except Exception as exc:
+            blocks.append(f"{instrument} | {expiry}\nSCAN ERROR: {type(exc).__name__}: {exc}")
+            details.append(f"{instrument}: ERROR — {exc}")
+
+    if not blocks:
+        raise RuntimeError("No enabled instruments could be scanned.")
+
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    sender = str(get_secret("GMAIL_SENDER", "") or "").strip()
+    password = str(get_secret("GMAIL_APP_PASSWORD", "") or "")
+    recipients = get_list("ALERT_EMAILS")
+    subject = f"ODME Manual Scan — {now_ist.strftime('%d %b %Y %H:%M IST')} — {len(blocks)} instrument(s)"
+    body = (
+        "ODME MANUAL SCAN\n"
+        + now_ist.strftime("%d %b %Y %H:%M IST")
+        + "\n\n"
+        + ("\n\n" + "-" * 72 + "\n\n").join(blocks)
     )
-    wrapped = minutes + [minutes[0] + 24 * 60]
-    for left, right in zip(wrapped, wrapped[1:]):
-        gap = right - left
-        if gap < 60:
-            left_txt = f"{(left // 60) % 24:02d}:{left % 60:02d}"
-            right_mod = right % (24 * 60)
-            right_txt = f"{right_mod // 60:02d}:{right_mod % 60:02d}"
-            return f"Keep scheduled scans at least 1 hour apart. {left_txt} and {right_txt} are only {gap} minutes apart."
-    return None
+    sent = send_email(sender, password, recipients, subject, body)
+    return {
+        "instrument_count": len(blocks),
+        "ok_count": ok_count,
+        "recipient_count": sent,
+        "details": details,
+    }
+
+
+def render_manual_batch_scan(key_suffix: str) -> None:
+    st.subheader("Manual Scan All")
+    st.caption("Scans every instrument with Enable Scan switched on, saves changed ODME state, and emails one consolidated summary immediately. No GitHub scheduler is used.")
+    if st.button("Scan All Enabled + Email", type="primary", use_container_width=True, key=f"manual_scan_all_{key_suffix}"):
+        with st.spinner("Automatic Angel login → scanning enabled instruments → sending ODME email..."):
+            try:
+                report = _run_enabled_batch_scan()
+                st.success(
+                    f"Completed {report['ok_count']}/{report['instrument_count']} scan(s). "
+                    f"Email sent to {report['recipient_count']} recipient(s)."
+                )
+                failed = [x for x in report.get("details", []) if "ERROR" in x or "missing" in x]
+                if failed:
+                    st.warning("Some instruments need attention: " + " | ".join(failed))
+            except Exception as exc:
+                st.error(f"Manual batch scan failed: {exc}")
 
 
 def main_page() -> None:
     inject_css()
     store = get_store()
     app_header(store)
+    render_manual_batch_scan("main")
+    st.markdown("---")
     angel: AngelConnector = st.session_state.angel
     master: pd.DataFrame = st.session_state.master
 
@@ -1108,57 +1251,33 @@ def main_page() -> None:
         key = make_key(instrument, expiry)
 
         st.caption(
-            "This exact expiry is used for the dashboard. Scheduled scanning will also use the manually saved expiry below; it will never auto-roll to the nearest expiry."
+            "This exact expiry is used for the dashboard and for Manual Scan All. It never auto-rolls to another expiry."
         )
-        st.caption(f"Saved scan expiry: {saved_expiry or 'Not set'}")
+        st.caption(f"Saved batch-scan expiry: {saved_expiry or 'Not set'}")
 
-        with st.expander("Scheduled scan settings", expanded=True):
-            saved_scan_times = _parse_scan_times(current_setting.get("scan_times", ""))
-            scan_times = st.multiselect(
-                "Scan times (IST)",
-                options=_scan_time_options(),
-                default=saved_scan_times,
-                key=f"scan_times_{instrument}",
-                help=(
-                    "Choose desired IST scan slots in 30-minute increments and keep selected slots at least 1 hour apart. "
-                    "The background scheduler wakes once per hour and runs the latest due unprocessed slot within the recovery window."
-                ),
-            )
+        with st.expander("Manual batch scan", expanded=True):
             scan_enabled = st.checkbox(
-                "Enable scheduled scan",
+                "Enable Scan",
                 value=_as_bool(current_setting.get("scan_enabled", False)),
                 key=f"scan_enabled_{instrument}",
-            )
-            email_alert = st.checkbox(
-                "Send email alert",
-                value=_as_bool(current_setting.get("email_alert", False)),
-                key=f"email_alert_{instrument}",
-                disabled=not scan_enabled,
+                help="When enabled, this instrument is included whenever Scan All Enabled + Email is pressed.",
             )
 
-            spacing_issue = _scan_spacing_issue(scan_times)
-            if scan_enabled and not scan_times:
-                st.warning("Select at least one scan time before enabling scheduled scan.")
-            elif scan_enabled and spacing_issue:
-                st.warning(spacing_issue)
-
-            if st.button("Save scan settings", key=f"save_scan_{instrument}", use_container_width=True):
-                if scan_enabled and not scan_times:
-                    st.error("Scheduled scan is enabled, but no scan time is selected.")
-                elif scan_enabled and spacing_issue:
-                    st.error(spacing_issue)
-                else:
-                    store.upsert_instrument_setting(
-                        instrument,
-                        active=True,
-                        selected_expiry=expiry,
-                        scan_enabled=scan_enabled,
-                        email_alert=(email_alert if scan_enabled else False),
-                        scan_times=",".join(scan_times),
-                    )
-                    times_text = ", ".join(scan_times) if scan_times else "No scheduled times"
-                    st.success(f"Saved: {instrument} / {expiry} / {times_text} IST")
-                    st.rerun()
+            if st.button("Save expiry + scan setting", key=f"save_scan_{instrument}", use_container_width=True):
+                store.upsert_instrument_setting(
+                    instrument,
+                    active=True,
+                    selected_expiry=expiry,
+                    scan_enabled=scan_enabled,
+                    email_alert=scan_enabled,
+                    scan_times="",
+                    last_run_slot="",
+                )
+                st.success(
+                    f"Saved: {instrument} / {expiry} / "
+                    + ("included in Manual Scan All" if scan_enabled else "not included in Manual Scan All")
+                )
+                st.rerun()
 
         with st.expander("Remove instrument", expanded=False):
             st.caption("Removes it from the dropdown and disables scans. Existing unexpired ODME snapshots are not deleted here.")
@@ -1170,7 +1289,6 @@ def main_page() -> None:
         st.caption("Spot/future is fetched from the related Angel futures contract only. If futures LTP or contract mapping cannot be verified, ODME stops instead of assuming data.")
         st.caption(f"Option contracts found: {len(option_rows[option_rows['expiry'].astype(str).eq(str(expiry))])}")
         fetch = st.button("Fetch Live + Save ODME Summary", type="primary")
-        auto_on = st.checkbox("Auto-refresh hourly while app is open", value=False)
 
     if fetch:
         with st.spinner("Fetching live Angel chain, creating ODME commentary, saving compact summary..."):
@@ -1188,14 +1306,6 @@ def main_page() -> None:
                 st.info("ODME did not save a snapshot because the live data was not verified. Try another expiry/instrument or fetch again after Angel quotes update.")
             except Exception as exc:
                 st.error(f"Unexpected fetch error: {exc}")
-
-    if auto_on and store.is_initialized(key):
-        try:
-            auto_res = fetch_analyze_save(store, angel, master, instrument, expiry, force=False)
-            if auto_res:
-                st.toast("Hourly ODME summary refreshed.")
-        except Exception as exc:
-            st.warning(f"Auto refresh failed. No snapshot saved: {exc}")
 
     st.markdown("---")
     st.subheader(f"Selected: {instrument} / {expiry}")
