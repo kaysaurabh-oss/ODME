@@ -1,0 +1,17 @@
+SUPERBRAIN PHASE 2 DEPLOYMENT
+
+1. Replace your Streamlit project files with this package.
+2. Keep existing Streamlit secrets unchanged.
+3. Deploy the included Apps Script webhook as a new version:
+   Superbrain_TV_Webhook_Code_v14_NO_EVENT_SHEET.gs
+4. Open the webhook URL in a browser and confirm version:
+   V14_NO_EVENT_SHEET
+5. In Apps Script, run cleanupLegacyEventSheetV14() once.
+   This removes the now-unused TV_TEST_EVENTS sheet.
+6. Restart/redeploy Streamlit.
+7. Open the public terminal and press Ask SuperBrain once for any instrument.
+8. Confirm a new Google Sheet tab `superbrain_memory` is created with one STATE row for that instrument.
+9. Press Ask SuperBrain a second time.
+   The terminal should say previous SuperBrain memory was loaded.
+
+No TradingView alert recreation is required for webhook v14 because the webhook URL does not change.

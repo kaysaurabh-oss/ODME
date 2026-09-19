@@ -24,11 +24,21 @@ except Exception:  # pragma: no cover
 ODME_TAB = "odme_snapshots"
 INSTRUMENT_TAB = "instrument_settings"
 TV_CURRENT_TAB = "TV_TEST_CURRENT"
-TV_EVENTS_TAB = "TV_TEST_EVENTS"
+SUPERBRAIN_TAB = "superbrain_memory"
 
 INSTRUMENT_COLUMNS = [
     "instrument", "active", "selected_expiry", "scan_enabled", "email_alert", "scan_times",
     "last_run_slot", "added_at", "updated_at"
+]
+
+
+SUPERBRAIN_COLUMNS = [
+    "record_id", "record_type", "instrument", "trade_id", "status",
+    "strategy_type", "direction", "created_at", "updated_at", "closed_at",
+    "scan_id", "previous_scan_id", "input_fingerprint", "mode", "action",
+    "thesis", "entry_reference", "target", "invalidation", "expected_eta",
+    "risk", "reward", "rr", "legs_json", "market_state_json",
+    "previous_state_json", "metadata_json", "close_reason"
 ]
 
 ODME_COLUMNS = [
@@ -376,15 +386,28 @@ class BaseStore:
     ) -> int:
         raise NotImplementedError
 
-    def delete_tv_event_history(
+    def load_superbrain_state(self, instrument: str) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def upsert_superbrain_state(self, instrument: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist one current SuperBrain state row per instrument and return the prior row."""
+        raise NotImplementedError
+
+    def list_superbrain_trades(self, instrument: Optional[str] = None, open_only: bool = False) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def upsert_superbrain_trade(self, trade: Dict[str, Any]) -> Dict[str, Any]:
+        """Create/update a SuperBrain-owned theoretical trade. No broker positions are read."""
+        raise NotImplementedError
+
+    def delete_superbrain_history(
         self,
         instrument: str,
         start_date: Optional[Any] = None,
         end_date: Optional[Any] = None,
         tz_name: str = "Asia/Singapore",
     ) -> int:
-        """Delete TV_TEST_EVENTS history only; TV_TEST_CURRENT is never touched."""
-        return 0
+        raise NotImplementedError
 
     # Backward-compatible no-op method name from old app.
     def upsert_initialized(self, row: Dict[str, Any]) -> None:
@@ -396,6 +419,7 @@ class LocalStore(BaseStore):
         self.root = Path(data_dir)
         self.path = self.root / "odme_snapshots.csv"
         self.settings_path = self.root / "instrument_settings.csv"
+        self.superbrain_path = self.root / "superbrain_memory.csv"
 
     def ensure(self) -> None:
         self.root.mkdir(exist_ok=True)
@@ -407,6 +431,8 @@ class LocalStore(BaseStore):
             settings = pd.DataFrame(columns=INSTRUMENT_COLUMNS)
         seeded = _seed_default_settings(settings)
         seeded.to_csv(self.settings_path, index=False)
+        if not self.superbrain_path.exists():
+            pd.DataFrame(columns=SUPERBRAIN_COLUMNS).to_csv(self.superbrain_path, index=False)
 
     def append_odme_snapshot(self, result: Dict[str, Any], meta: Dict[str, Any]) -> None:
         self.ensure()
@@ -542,6 +568,126 @@ class LocalStore(BaseStore):
         return deleted
 
 
+    def _load_superbrain_df(self) -> pd.DataFrame:
+        self.ensure()
+        try:
+            df = pd.read_csv(self.superbrain_path, dtype=str).fillna("")
+        except Exception:
+            df = pd.DataFrame(columns=SUPERBRAIN_COLUMNS)
+        for col in SUPERBRAIN_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        return df[SUPERBRAIN_COLUMNS].astype(str).fillna("")
+
+    def _save_superbrain_df(self, df: pd.DataFrame) -> None:
+        for col in SUPERBRAIN_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        df[SUPERBRAIN_COLUMNS].astype(str).fillna("").to_csv(self.superbrain_path, index=False)
+
+    def load_superbrain_state(self, instrument: str) -> Dict[str, Any]:
+        df = self._load_superbrain_df()
+        key = str(instrument or "").upper().strip()
+        if not key or df.empty:
+            return {}
+        matched = df[
+            df["record_type"].astype(str).str.upper().eq("STATE")
+            & df["instrument"].astype(str).str.upper().str.strip().eq(key)
+        ]
+        if matched.empty:
+            return {}
+        return matched.iloc[-1].to_dict()
+
+    def upsert_superbrain_state(self, instrument: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        df = self._load_superbrain_df()
+        key = str(instrument or "").upper().strip()
+        if not key:
+            raise ValueError("Instrument cannot be blank.")
+        mask = (
+            df["record_type"].astype(str).str.upper().eq("STATE")
+            & df["instrument"].astype(str).str.upper().str.strip().eq(key)
+        ) if not df.empty else pd.Series(dtype=bool)
+        prior = df.loc[mask].iloc[-1].to_dict() if not df.empty and mask.any() else {}
+        now = utc_now_iso()
+        row = {c: "" for c in SUPERBRAIN_COLUMNS}
+        row.update({k: ("" if v is None else str(v)) for k, v in (state or {}).items() if k in row})
+        row["record_id"] = f"STATE::{key}"
+        row["record_type"] = "STATE"
+        row["instrument"] = key
+        row["created_at"] = prior.get("created_at", "") or row.get("created_at", "") or now
+        row["updated_at"] = row.get("updated_at", "") or now
+        if not df.empty and mask.any():
+            first_idx = df.index[mask][-1]
+            df.loc[first_idx, SUPERBRAIN_COLUMNS] = [row[c] for c in SUPERBRAIN_COLUMNS]
+        else:
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        self._save_superbrain_df(df)
+        return prior
+
+    def list_superbrain_trades(self, instrument: Optional[str] = None, open_only: bool = False) -> pd.DataFrame:
+        df = self._load_superbrain_df()
+        if df.empty:
+            return pd.DataFrame(columns=SUPERBRAIN_COLUMNS)
+        df = df[df["record_type"].astype(str).str.upper().eq("TRADE")].copy()
+        if instrument:
+            key = str(instrument).upper().strip()
+            df = df[df["instrument"].astype(str).str.upper().str.strip().eq(key)]
+        if open_only:
+            closed = {"CLOSED", "EXIT", "TARGET", "INVALIDATED", "EXPIRED", "CANCELLED"}
+            df = df[~df["status"].astype(str).str.upper().isin(closed)]
+        return df.reset_index(drop=True)
+
+    def upsert_superbrain_trade(self, trade: Dict[str, Any]) -> Dict[str, Any]:
+        df = self._load_superbrain_df()
+        key = str((trade or {}).get("instrument", "")).upper().strip()
+        trade_id = str((trade or {}).get("trade_id", "")).strip() or f"SB-{uuid.uuid4().hex[:12].upper()}"
+        if not key:
+            raise ValueError("Trade instrument cannot be blank.")
+        mask = (
+            df["record_type"].astype(str).str.upper().eq("TRADE")
+            & df["trade_id"].astype(str).eq(trade_id)
+        ) if not df.empty else pd.Series(dtype=bool)
+        prior = df.loc[mask].iloc[-1].to_dict() if not df.empty and mask.any() else {}
+        now = utc_now_iso()
+        row = {c: "" for c in SUPERBRAIN_COLUMNS}
+        row.update({k: ("" if v is None else str(v)) for k, v in (trade or {}).items() if k in row})
+        row["record_id"] = f"TRADE::{trade_id}"
+        row["record_type"] = "TRADE"
+        row["instrument"] = key
+        row["trade_id"] = trade_id
+        row["created_at"] = prior.get("created_at", "") or row.get("created_at", "") or now
+        row["updated_at"] = now
+        terminal_statuses = {"CLOSED", "EXIT", "TARGET", "INVALIDATED", "EXPIRED", "CANCELLED"}
+        if str(row.get("status", "")).upper() in terminal_statuses and not str(row.get("closed_at", "")).strip():
+            row["closed_at"] = now
+        if not df.empty and mask.any():
+            idx = df.index[mask][-1]
+            df.loc[idx, SUPERBRAIN_COLUMNS] = [row[c] for c in SUPERBRAIN_COLUMNS]
+        else:
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        self._save_superbrain_df(df)
+        return row
+
+    def delete_superbrain_history(
+        self,
+        instrument: str,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        tz_name: str = "Asia/Singapore",
+    ) -> int:
+        df = self._load_superbrain_df()
+        if df.empty:
+            return 0
+        key = str(instrument or "").upper().strip()
+        remove = df["instrument"].astype(str).str.upper().str.strip().eq(key)
+        ts = df["updated_at"].where(df["updated_at"].astype(str).str.strip().ne(""), df["created_at"])
+        remove &= _history_date_mask(ts, start_date, end_date, tz_name)
+        deleted = int(remove.sum())
+        if deleted:
+            self._save_superbrain_df(df.loc[~remove].copy())
+        return deleted
+
+
 class GoogleSheetStore(BaseStore):
     def __init__(self, sheet_name: str = GOOGLE_SHEET_DEFAULT_NAME):
         if gspread is None or Credentials is None:
@@ -617,6 +763,20 @@ class GoogleSheetStore(BaseStore):
             sws.update("A1", [INSTRUMENT_COLUMNS])
             if not seeded.empty:
                 sws.update("A2", seeded[INSTRUMENT_COLUMNS].astype(str).fillna("").values.tolist())
+
+        mws = self._worksheet(SUPERBRAIN_TAB, SUPERBRAIN_COLUMNS)
+        mheader = mws.row_values(1)
+        if mheader != SUPERBRAIN_COLUMNS:
+            # Memory is a compact app-owned tab. Preserve any compatible rows when schema evolves.
+            mrecords = mws.get_all_records() if mheader else []
+            mdf = pd.DataFrame(mrecords)
+            for col in SUPERBRAIN_COLUMNS:
+                if col not in mdf.columns:
+                    mdf[col] = ""
+            mws.clear()
+            mws.update("A1", [SUPERBRAIN_COLUMNS])
+            if not mdf.empty:
+                mws.update("A2", mdf[SUPERBRAIN_COLUMNS].astype(str).fillna("").values.tolist())
         self._ensured = True
 
     def append_odme_snapshot(self, result: Dict[str, Any], meta: Dict[str, Any]) -> None:
@@ -819,7 +979,106 @@ class GoogleSheetStore(BaseStore):
                 ws.delete_rows(start_row, end_row)
         return deleted
 
-    def delete_tv_event_history(
+    def _load_superbrain_df(self) -> pd.DataFrame:
+        self.ensure()
+        ws = self._worksheet(SUPERBRAIN_TAB, SUPERBRAIN_COLUMNS)
+        records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        if df.empty:
+            return pd.DataFrame(columns=SUPERBRAIN_COLUMNS)
+        for col in SUPERBRAIN_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        return df[SUPERBRAIN_COLUMNS].astype(str).fillna("")
+
+    def load_superbrain_state(self, instrument: str) -> Dict[str, Any]:
+        df = self._load_superbrain_df()
+        key = str(instrument or "").upper().strip()
+        if not key or df.empty:
+            return {}
+        matched = df[
+            df["record_type"].astype(str).str.upper().eq("STATE")
+            & df["instrument"].astype(str).str.upper().str.strip().eq(key)
+        ]
+        if matched.empty:
+            return {}
+        return matched.iloc[-1].to_dict()
+
+    def upsert_superbrain_state(self, instrument: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        self.ensure()
+        key = str(instrument or "").upper().strip()
+        if not key:
+            raise ValueError("Instrument cannot be blank.")
+        ws = self._worksheet(SUPERBRAIN_TAB, SUPERBRAIN_COLUMNS)
+        df = self._load_superbrain_df()
+        mask = (
+            df["record_type"].astype(str).str.upper().eq("STATE")
+            & df["instrument"].astype(str).str.upper().str.strip().eq(key)
+        ) if not df.empty else pd.Series(dtype=bool)
+        prior = df.loc[mask].iloc[-1].to_dict() if not df.empty and mask.any() else {}
+        now = utc_now_iso()
+        row = {c: "" for c in SUPERBRAIN_COLUMNS}
+        row.update({k: ("" if v is None else str(v)) for k, v in (state or {}).items() if k in row})
+        row["record_id"] = f"STATE::{key}"
+        row["record_type"] = "STATE"
+        row["instrument"] = key
+        row["created_at"] = prior.get("created_at", "") or row.get("created_at", "") or now
+        row["updated_at"] = row.get("updated_at", "") or now
+        if not df.empty and mask.any():
+            sheet_row = int(df.index[mask][-1]) + 2
+            end_col = _column_letter(len(SUPERBRAIN_COLUMNS))
+            ws.update(f"A{sheet_row}:{end_col}{sheet_row}", [[row[c] for c in SUPERBRAIN_COLUMNS]])
+        else:
+            ws.append_row([row[c] for c in SUPERBRAIN_COLUMNS], value_input_option="USER_ENTERED")
+        return prior
+
+    def list_superbrain_trades(self, instrument: Optional[str] = None, open_only: bool = False) -> pd.DataFrame:
+        df = self._load_superbrain_df()
+        if df.empty:
+            return pd.DataFrame(columns=SUPERBRAIN_COLUMNS)
+        df = df[df["record_type"].astype(str).str.upper().eq("TRADE")].copy()
+        if instrument:
+            key = str(instrument).upper().strip()
+            df = df[df["instrument"].astype(str).str.upper().str.strip().eq(key)]
+        if open_only:
+            closed = {"CLOSED", "EXIT", "TARGET", "INVALIDATED", "EXPIRED", "CANCELLED"}
+            df = df[~df["status"].astype(str).str.upper().isin(closed)]
+        return df.reset_index(drop=True)
+
+    def upsert_superbrain_trade(self, trade: Dict[str, Any]) -> Dict[str, Any]:
+        self.ensure()
+        ws = self._worksheet(SUPERBRAIN_TAB, SUPERBRAIN_COLUMNS)
+        df = self._load_superbrain_df()
+        key = str((trade or {}).get("instrument", "")).upper().strip()
+        trade_id = str((trade or {}).get("trade_id", "")).strip() or f"SB-{uuid.uuid4().hex[:12].upper()}"
+        if not key:
+            raise ValueError("Trade instrument cannot be blank.")
+        mask = (
+            df["record_type"].astype(str).str.upper().eq("TRADE")
+            & df["trade_id"].astype(str).eq(trade_id)
+        ) if not df.empty else pd.Series(dtype=bool)
+        prior = df.loc[mask].iloc[-1].to_dict() if not df.empty and mask.any() else {}
+        now = utc_now_iso()
+        row = {c: "" for c in SUPERBRAIN_COLUMNS}
+        row.update({k: ("" if v is None else str(v)) for k, v in (trade or {}).items() if k in row})
+        row["record_id"] = f"TRADE::{trade_id}"
+        row["record_type"] = "TRADE"
+        row["instrument"] = key
+        row["trade_id"] = trade_id
+        row["created_at"] = prior.get("created_at", "") or row.get("created_at", "") or now
+        row["updated_at"] = now
+        terminal_statuses = {"CLOSED", "EXIT", "TARGET", "INVALIDATED", "EXPIRED", "CANCELLED"}
+        if str(row.get("status", "")).upper() in terminal_statuses and not str(row.get("closed_at", "")).strip():
+            row["closed_at"] = now
+        if not df.empty and mask.any():
+            sheet_row = int(df.index[mask][-1]) + 2
+            end_col = _column_letter(len(SUPERBRAIN_COLUMNS))
+            ws.update(f"A{sheet_row}:{end_col}{sheet_row}", [[row[c] for c in SUPERBRAIN_COLUMNS]])
+        else:
+            ws.append_row([row[c] for c in SUPERBRAIN_COLUMNS], value_input_option="USER_ENTERED")
+        return row
+
+    def delete_superbrain_history(
         self,
         instrument: str,
         start_date: Optional[Any] = None,
@@ -827,36 +1086,21 @@ class GoogleSheetStore(BaseStore):
         tz_name: str = "Asia/Singapore",
     ) -> int:
         self.ensure()
-        try:
-            ws = self.sheet.worksheet(TV_EVENTS_TAB)
-        except gspread.WorksheetNotFound:
+        ws = self._worksheet(SUPERBRAIN_TAB, SUPERBRAIN_COLUMNS)
+        df = self._load_superbrain_df()
+        if df.empty:
             return 0
-        values = ws.get_all_values()
-        if not values:
-            return 0
-        headers = [str(x) for x in values[0]]
-        if not headers or "instrument" not in headers:
-            return 0
-        rows = values[1:]
-        if not rows:
-            return 0
-        width = len(headers)
-        padded = [(row + [""] * width)[:width] for row in rows]
-        df = pd.DataFrame(padded, columns=headers)
-        key = str(instrument).upper().strip()
+        key = str(instrument or "").upper().strip()
         remove = df["instrument"].astype(str).str.upper().str.strip().eq(key)
-        time_col = "received_at" if "received_at" in df.columns else ("bar_time" if "bar_time" in df.columns else None)
-        if time_col:
-            remove &= _history_date_mask(df[time_col], start_date, end_date, tz_name)
-        elif start_date is not None or end_date is not None:
-            # Do not perform a period delete when the sheet has no usable time column.
-            return 0
+        ts = df["updated_at"].where(df["updated_at"].astype(str).str.strip().ne(""), df["created_at"])
+        remove &= _history_date_mask(ts, start_date, end_date, tz_name)
         deleted = int(remove.sum())
         if deleted:
             sheet_rows = [int(i) + 2 for i in df.index[remove].tolist()]
             for start_row, end_row in reversed(_contiguous_ranges(sheet_rows)):
                 ws.delete_rows(start_row, end_row)
         return deleted
+
 
 
 def create_store() -> BaseStore:

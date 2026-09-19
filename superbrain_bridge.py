@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import pandas as pd
 
 from angel_connector import AngelConnector, load_angel_credentials
-from data_store import BaseStore, make_key
+from data_store import BaseStore
 from scan_service import run_odme_scan
 
 
@@ -15,6 +19,25 @@ def _norm(value: Any) -> str:
 
 def _as_bool(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def _safe_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+    clean = df.copy().fillna("")
+    return clean.to_dict(orient="records")
+
+
+def _open_trade_records(store: BaseStore, instrument: str) -> List[Dict[str, Any]]:
+    try:
+        trades = store.list_superbrain_trades(instrument=instrument, open_only=True)
+    except Exception:
+        return []
+    return _safe_records(trades)
 
 
 def build_instrument_map(store: BaseStore) -> pd.DataFrame:
@@ -80,12 +103,81 @@ def build_instrument_map(store: BaseStore) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("instrument").reset_index(drop=True)
 
 
-def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]:
-    """Phase-1 orchestration packet for Ask SuperBrain.
+def _persist_scan_memory(
+    store: BaseStore,
+    instrument: str,
+    mode: str,
+    mapping: Dict[str, Any],
+    tv_rows: pd.DataFrame,
+    latest_odme: Dict[str, Any],
+    odme_live: bool,
+    odme_error: str,
+    open_trades: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Persist current SuperBrain evidence without creating any trade opinion.
 
-    This does not generate trade decisions yet. It proves the instrument bridge,
-    refreshes ODME when the exact matching instrument is enabled for scanning,
-    and returns the freshest inputs to the Streamlit terminal.
+    One STATE row exists per instrument. The row carries the current exact input
+    snapshot plus the immediately previous input snapshot so the future reasoning
+    engine can compare what changed across scans. TRADE rows are maintained
+    independently by SuperBrain itself; broker positions are never consulted.
+    """
+    previous = store.load_superbrain_state(instrument) or {}
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    scan_id = f"SBSCAN-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+    tv_records = _safe_records(tv_rows)
+
+    evidence = {
+        "scan_id": scan_id,
+        "scanned_at": now,
+        "instrument": instrument,
+        "mode": mode,
+        "mapping": mapping,
+        "tv_rows": tv_records,
+        "latest_odme": latest_odme or {},
+        "odme_live": bool(odme_live),
+        "odme_error": odme_error or "",
+        "open_trade_ids": [str(x.get("trade_id", "")) for x in open_trades if str(x.get("trade_id", "")).strip()],
+    }
+
+    fingerprint_payload = {
+        "instrument": instrument,
+        "mode": mode,
+        "tv_rows": tv_records,
+        "latest_odme": latest_odme or {},
+    }
+    fingerprint = hashlib.sha256(_json_dumps(fingerprint_payload).encode("utf-8")).hexdigest()
+
+    state_row = {
+        "status": "ACTIVE",
+        "scan_id": scan_id,
+        "previous_scan_id": str(previous.get("scan_id", "") or ""),
+        "input_fingerprint": fingerprint,
+        "mode": mode,
+        # Intentionally blank until the actual reasoning engine is added.
+        "action": "",
+        "thesis": "",
+        "market_state_json": _json_dumps(evidence),
+        "previous_state_json": str(previous.get("market_state_json", "") or ""),
+        "metadata_json": _json_dumps({"open_trade_count": len(open_trades)}),
+        "updated_at": now,
+    }
+    prior_row = store.upsert_superbrain_state(instrument, state_row)
+
+    return {
+        "scan_id": scan_id,
+        "previous_scan_id": str(previous.get("scan_id", "") or ""),
+        "had_previous_state": bool(previous),
+        "prior_state": prior_row or previous,
+        "input_fingerprint": fingerprint,
+    }
+
+
+def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]:
+    """Phase-2 orchestration packet for Ask SuperBrain.
+
+    This still does not invent trade decisions. It refreshes the exact market
+    inputs, loads SuperBrain-owned open trade memory, and persists the current
+    evidence so the next scan has a durable previous state to compare against.
     """
     instrument = _norm(instrument)
     mapping = build_instrument_map(store)
@@ -93,6 +185,10 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
     if matched.empty:
         raise ValueError(f"{instrument} is not present in TV_TEST_CURRENT.")
     map_row = matched.iloc[0].to_dict()
+
+    # Read any SuperBrain-owned exposure before refreshing inputs. Future
+    # reasoning uses this to manage its own prior decisions, not broker positions.
+    open_trades = _open_trade_records(store, instrument)
 
     tv_rows = store.load_tv_current(instrument)
     odme_outcome: Dict[str, Any] = {}
@@ -123,9 +219,22 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
     if tv_rows is not None and not tv_rows.empty and "source" in tv_rows.columns:
         sources = sorted({str(x).strip() for x in tv_rows["source"] if str(x).strip()})
 
+    mode = "TV + ODME" if odme_live else "TV only"
+    memory = _persist_scan_memory(
+        store=store,
+        instrument=instrument,
+        mode=mode,
+        mapping=map_row,
+        tv_rows=tv_rows,
+        latest_odme=latest_odme,
+        odme_live=odme_live,
+        odme_error=odme_error,
+        open_trades=open_trades,
+    )
+
     return {
         "instrument": instrument,
-        "mode": "TV + ODME" if odme_live else "TV only",
+        "mode": mode,
         "tv_rows": tv_rows,
         "tv_sources": sources,
         "mapping": map_row,
@@ -133,4 +242,6 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
         "odme_outcome": odme_outcome,
         "latest_odme": latest_odme,
         "odme_error": odme_error,
+        "open_trades": open_trades,
+        "memory": memory,
     }

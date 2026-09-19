@@ -155,6 +155,15 @@ def render_public_superbrain() -> None:
         if packet.get("odme_error"):
             st.warning(f"ODME refresh was not usable, so this scan stayed TV-only: {packet.get('odme_error')}")
 
+    memory = packet.get("memory", {}) or {}
+    open_trades = packet.get("open_trades", []) or []
+    if memory.get("had_previous_state"):
+        st.caption(
+            f"SuperBrain memory loaded from the previous scan; {len(open_trades)} open SuperBrain exposure(s) are remembered."
+        )
+    else:
+        st.caption("SuperBrain memory initialized for this instrument. No broker positions are read.")
+
 
 def _run_expired_cleanup_once(store: Any, show_notice: bool = True) -> None:
     """Automatically remove finished-expiry ODME snapshots once per India date."""
@@ -1238,7 +1247,10 @@ def render_manual_batch_scan(key_suffix: str) -> None:
 def render_history_management(store: Any, instrument: str) -> None:
     """Authenticated destructive history controls for the selected instrument."""
     with st.expander("History data management", expanded=False):
-        st.caption("Finished-expiry ODME snapshots are cleaned automatically. TV current state is never deleted here.")
+        st.caption(
+            "Finished-expiry ODME snapshots are cleaned automatically. "
+            "TradingView current state is live truth and is never deleted here."
+        )
         history_instruments = {str(instrument).upper().strip()}
         try:
             odme_hist = store.load_odme_history(limit=100000)
@@ -1256,6 +1268,14 @@ def render_history_management(store: Any, instrument: str) -> None:
                 )
         except Exception:
             pass
+        try:
+            sb_trades = store.list_superbrain_trades()
+            if sb_trades is not None and not sb_trades.empty and "instrument" in sb_trades.columns:
+                history_instruments.update(
+                    str(x).upper().strip() for x in sb_trades["instrument"] if str(x).strip()
+                )
+        except Exception:
+            pass
         history_instruments = sorted(x for x in history_instruments if x)
         default_index = history_instruments.index(str(instrument).upper().strip()) if str(instrument).upper().strip() in history_instruments else 0
         history_instrument = st.selectbox(
@@ -1266,7 +1286,7 @@ def render_history_management(store: Any, instrument: str) -> None:
         )
         history_types = st.multiselect(
             "History to delete",
-            ["ODME snapshots", "TradingView event history"],
+            ["ODME snapshots", "SuperBrain memory + trades"],
             key="history_types_delete",
         )
         period = st.selectbox(
@@ -1305,14 +1325,14 @@ def render_history_management(store: Any, instrument: str) -> None:
             disabled=not bool(history_types) or not confirmed or (period == "Custom" and (start_date is None or end_date is None)),
         ):
             deleted_odme = 0
-            deleted_tv = 0
+            deleted_sb = 0
             try:
                 if "ODME snapshots" in history_types:
                     deleted_odme = store.delete_odme_history(history_instrument, start_date, end_date)
-                if "TradingView event history" in history_types:
-                    deleted_tv = store.delete_tv_event_history(history_instrument, start_date, end_date)
+                if "SuperBrain memory + trades" in history_types:
+                    deleted_sb = store.delete_superbrain_history(history_instrument, start_date, end_date)
                 st.success(
-                    f"Deleted {deleted_odme} ODME snapshot(s) and {deleted_tv} TradingView event row(s) for {history_instrument}."
+                    f"Deleted {deleted_odme} ODME snapshot(s) and {deleted_sb} SuperBrain memory/trade row(s) for {history_instrument}."
                 )
             except Exception as exc:
                 st.error(f"History deletion failed: {exc}")
