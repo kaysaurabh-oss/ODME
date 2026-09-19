@@ -1,0 +1,48 @@
+SuperBrain SB3.4 — FINAL Market Action + ODME + Theta + Exposure
+==============================================================
+
+Replace these exact runtime files in the GitHub/Streamlit project root:
+- app.py
+- superbrain_bridge.py
+- superbrain_reasoner.py
+
+Do NOT replace data_store.py. Existing Phase 2.2 persistent-memory storage remains compatible.
+No TradingView alert, webhook, or Google Sheet schema change is required.
+
+Expected build label:
+SB3.4_FINAL_MARKET_ACTION_ODME_THETA
+
+Final behaviour
+---------------
+- One concise market-language narrative: market action, entry logic, path/hurdles, next action and what to watch.
+- Feed timestamps are shown in SGT.
+- Internal indicator names are not used in the trader-facing narrative.
+- TV-only instruments get a subtle note that no options-positioning layer is configured.
+- Fresh ODME is integrated into directional trades, path/ETA, hurdles, strike selection and non-arrival/theta decisions.
+- SuperBrain automatically checks, when ODME is available, for:
+  * directional futures long/short
+  * Short CE
+  * Short PE
+  * Short strangle / range non-arrival theta
+- A directional setup may be entered as late-but-still-valid when the cleaner trigger was slightly earlier but the present location/path is still acceptable. Otherwise SuperBrain gives the preferred pullback/re-entry condition rather than chasing.
+- When a trade is issued the narrative explicitly says: "SuperBrain is taking this exposure now."
+- That exposure is written as one TRADE row and later scans manage the same row as HOLD / ADD / REDUCE / EXIT.
+- Broker positions are never read.
+- Options are model exposures by strike + underlying spot basis; exact option premium is retained when available but is not required for the visible trade sentence.
+- No background shadow trading occurs between scans. Exposure begins only when a scan actually issues a trade.
+
+Non-arrival theta
+-----------------
+- Bearish positioning may produce a Short CE when the current ODME side-action says CE selling is acceptable and price/momentum are not actively accelerating toward the strike.
+- Bullish positioning may produce a Short PE on the mirrored logic.
+- Range-bound theta may produce a Short Strangle when the options map favors containment and directional pressure/momentum are balanced.
+- Expansion/trap conditions block fresh theta and can reduce/exit existing theta exposure.
+
+Validation performed
+--------------------
+- Python syntax compilation for all 3 runtime files.
+- Direct tests for Short CE non-arrival selection, Short PE non-arrival selection, Short Strangle theta selection, and blocked theta under expansion/adverse directional acceleration.
+- Exposure-management tests for HOLD/REDUCE/EXIT on one-sided theta logic.
+- Existing SB3.3 directional/late-entry architecture retained.
+
+After deployment, test once on BTCUSD and once on one ODME-enabled instrument. Verify the build label and the TRADE row if SuperBrain takes exposure.

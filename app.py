@@ -127,9 +127,9 @@ def render_public_superbrain() -> None:
     instrument = st.selectbox("Instrument", instruments, key="public_superbrain_instrument")
     row = mapping[mapping["instrument"].eq(instrument)].iloc[0].to_dict()
     if row.get("odme_scan_enabled"):
-        st.caption(f"{instrument}: TradingView + ODME enabled ({row.get('selected_expiry')}).")
+        st.caption(f"{instrument}: market + options positioning available ({row.get('selected_expiry')}).")
     else:
-        st.caption(f"{instrument}: TradingView mode. ODME will be used only when this exact instrument is enabled for ODME scanning.")
+        st.caption(f"{instrument}: market view available; no options-positioning layer is configured for this instrument in the terminal.")
 
     if st.button("Ask SuperBrain", type="primary", use_container_width=True, key="ask_superbrain_public"):
         with st.spinner("Refreshing market inputs..."):
@@ -144,41 +144,38 @@ def render_public_superbrain() -> None:
     if not packet or str(packet.get("instrument", "")) != instrument:
         return
 
-    sources = ", ".join(packet.get("tv_sources", [])) or "TradingView"
     if packet.get("odme_live"):
-        expiry = str(packet.get("mapping", {}).get("selected_expiry", "") or "")
-        st.success(f"{instrument}: {sources} + fresh ODME ({expiry}) are ready in the terminal.")
-        outcome = packet.get("odme_outcome", {}) or {}
-        if outcome:
-            st.text(_batch_instrument_summary(instrument, expiry, outcome))
+        st.success(f"{instrument}: latest market and options-positioning inputs are ready.")
     else:
-        st.success(f"{instrument}: {sources} are ready. SuperBrain is operating in TV-only mode for this scan.")
+        st.success(f"{instrument}: latest market inputs are ready.")
         if packet.get("odme_error"):
-            st.warning(f"ODME refresh was not usable, so this scan stayed TV-only: {packet.get('odme_error')}")
+            st.warning(f"The options-positioning refresh was not usable, so this scan used market data only: {packet.get('odme_error')}")
 
     analysis = packet.get("analysis", {}) or {}
     if analysis:
-        posture = str(analysis.get("posture", "WAIT") or "WAIT")
-        if posture == "LONG_ELIGIBLE":
-            st.success("SuperBrain posture: LONG setup eligible")
-        elif posture == "SHORT_ELIGIBLE":
-            st.success("SuperBrain posture: SHORT setup eligible")
-        elif posture == "NO_TRADE":
-            st.error("SuperBrain posture: NO TRADE")
-        else:
-            st.warning("SuperBrain posture: WAIT")
+        if analysis.get("freshness_line"):
+            st.caption(str(analysis.get("freshness_line")))
+        if analysis.get("option_note"):
+            st.caption(str(analysis.get("option_note")))
 
-        st.markdown("#### Market view")
-        for line in analysis.get("lines", []) or []:
-            st.markdown(f"- {line}")
+        st.markdown("#### SuperBrain view")
+        narrative = str(analysis.get("narrative", "") or "").strip()
+        if narrative:
+            st.markdown(narrative)
+        else:
+            st.markdown("Market conditions were read successfully, but no actionable narrative was produced for this scan.")
+
+        exposure = analysis.get("recorded_exposure", {}) or {}
+        if exposure:
+            action = str(exposure.get("action", "") or "").upper()
+            trade_id = str(exposure.get("trade_id", "") or "")
+            if action in {"ENTER", "OPEN"}:
+                st.caption(f"SuperBrain exposure recorded: {trade_id}. Future scans will manage this exposure; broker positions are not read.")
+            elif action:
+                st.caption(f"SuperBrain exposure {trade_id} updated: {action}. Broker positions are not read.")
 
     memory = packet.get("memory", {}) or {}
-    open_trades = packet.get("open_trades", []) or []
-    if memory.get("had_previous_state"):
-        st.caption(
-            f"SuperBrain memory loaded from the previous scan; {len(open_trades)} open SuperBrain exposure(s) are remembered."
-        )
-    else:
+    if not memory.get("had_previous_state"):
         st.caption("SuperBrain memory initialized for this instrument. No broker positions are read.")
 
 

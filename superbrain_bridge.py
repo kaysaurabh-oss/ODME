@@ -13,7 +13,7 @@ from data_store import BaseStore
 from scan_service import run_odme_scan
 from superbrain_reasoner import analyze_market, REASONER_VERSION
 
-SUPERBRAIN_BRIDGE_VERSION = "SB3.1_LOCKED_RULES_CONTEXT_FIRST"
+SUPERBRAIN_BRIDGE_VERSION = "SB3.4_FINAL_MARKET_ACTION_ODME_THETA"
 
 
 def _norm(value: Any) -> str:
@@ -144,9 +144,111 @@ def _compact_odme(row: Dict[str, Any]) -> Dict[str, Any]:
         "ce_wall_shift", "pe_wall_shift", "poc_shift", "range_shift",
         "bullish_score", "bearish_score", "range_score", "expansion_score",
         "odme_tilt", "safer_sell_ce", "active_ce_wall", "safer_sell_pe",
-        "active_pe_wall", "usable_oi_count", "source",
+        "active_pe_wall", "usable_oi_count", "source", "commentary",
     ]
     return {k: row.get(k) for k in fields if row.get(k) not in (None, "")}
+
+
+def _compact_live_odme(result: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
+    if not result:
+        return {}
+    scores = result.get("scores", {}) or {}
+    out: Dict[str, Any] = {
+        "snapshot_id": meta.get("snapshot_id", ""),
+        "ts": result.get("ts") or meta.get("ts", ""),
+        "instrument": meta.get("instrument", ""),
+        "exchange": meta.get("exchange", ""),
+        "expiry": meta.get("expiry", ""),
+        "spot": result.get("spot") or result.get("future_ltp", ""),
+        "option_poc": result.get("poc", ""),
+        "value_area_low": result.get("value_area_low", ""),
+        "value_area_high": result.get("value_area_high", ""),
+        "ce_wall": result.get("ce_wall", ""),
+        "pe_wall": result.get("pe_wall", ""),
+        "active_ce_wall": result.get("ce_wall", ""),
+        "active_pe_wall": result.get("pe_wall", ""),
+        "safer_sell_ce": result.get("safer_sell_ce", ""),
+        "safer_sell_pe": result.get("safer_sell_pe", ""),
+        "ce_wall_shift": result.get("ce_wall_move", ""),
+        "pe_wall_shift": result.get("pe_wall_move", ""),
+        "poc_shift": result.get("poc_move", ""),
+        "range_shift": result.get("range_move", ""),
+        "bullish_score": scores.get("Bullish", 0),
+        "bearish_score": scores.get("Bearish", 0),
+        "range_score": scores.get("Range", 0),
+        "expansion_score": scores.get("Expansion", 0),
+        "odme_tilt": result.get("tilt", ""),
+        "commentary": result.get("commentary", ""),
+        "premium_alert": result.get("premium_alert", ""),
+        "final_action": result.get("final_action", ""),
+        "hero_action": result.get("hero_action", ""),
+        "ce_action": result.get("ce_action", ""),
+        "pe_action": result.get("pe_action", ""),
+        "path_risk": result.get("path_risk", {}) or {},
+        "usable_oi_count": meta.get("usable_oi_count", ""),
+        "source": meta.get("source", ""),
+    }
+    keys = result.get("key_strikes", {}) or {}
+    premiums: Dict[str, Any] = {}
+    for name in ("ce_wall", "pe_wall", "safer_sell_ce", "safer_sell_pe"):
+        level = result.get(name)
+        try:
+            k = str(int(round(float(level))))
+        except Exception:
+            continue
+        row = keys.get(k, {}) if isinstance(keys, dict) else {}
+        if row:
+            premiums[k] = {"strike": row.get("strike", level), "ce_ltp": row.get("ce_ltp", 0), "pe_ltp": row.get("pe_ltp", 0)}
+    if premiums:
+        out["key_premiums"] = premiums
+    return {k: v for k, v in out.items() if v not in (None, "")}
+
+
+def _apply_trade_plan(store: BaseStore, instrument: str, mode: str, scan_id: str, analysis: Dict[str, Any], open_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    plan = analysis.get("trade_plan", {}) or {}
+    kind = str(plan.get("kind", "") or "").upper()
+    if kind not in {"NEW", "MANAGE"}:
+        return {}
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    if kind == "NEW":
+        trade = {
+            "instrument": instrument,
+            "status": "ACTIVE",
+            "strategy_type": plan.get("strategy_type", ""),
+            "direction": plan.get("direction", ""),
+            "scan_id": scan_id,
+            "mode": mode,
+            "action": "ENTER",
+            "thesis": plan.get("reason", ""),
+            "entry_reference": plan.get("entry_reference", ""),
+            "target": plan.get("target", ""),
+            "invalidation": plan.get("invalidation", ""),
+            "expected_eta": plan.get("expected_eta", ""),
+            "risk": plan.get("risk", ""),
+            "reward": plan.get("reward", ""),
+            "rr": plan.get("rr", ""),
+            "legs_json": _json_dumps(plan.get("legs", []) or []),
+            "market_state_json": _json_dumps({"entry_scan_id": scan_id, "entry_price": plan.get("entry_reference", ""), "entry_quality": plan.get("entry_quality", ""), "posture": analysis.get("posture", "")}),
+            "metadata_json": _json_dumps({"entry_quality": plan.get("entry_quality", ""), "late": bool(plan.get("late")), "pullback_low": plan.get("pullback_low", ""), "pullback_high": plan.get("pullback_high", ""), "reasoner_version": analysis.get("reasoner_version", "")}),
+            "created_at": now,
+            "updated_at": now,
+        }
+        saved = store.upsert_superbrain_trade(trade)
+    else:
+        trade_id = str(plan.get("trade_id", "") or "")
+        existing = next((dict(x) for x in open_trades if str(x.get("trade_id", "")) == trade_id), {})
+        if not existing:
+            return {}
+        trade = dict(existing)
+        action = str(plan.get("action", "HOLD") or "HOLD").upper()
+        status = str(plan.get("status", "ACTIVE") or "ACTIVE").upper()
+        trade.update({"instrument": instrument, "trade_id": trade_id, "status": status, "scan_id": scan_id, "mode": mode, "action": action, "thesis": plan.get("reason", trade.get("thesis", "")), "updated_at": now})
+        if action == "EXIT":
+            trade["close_reason"] = plan.get("reason", "")
+        saved = store.upsert_superbrain_trade(trade)
+    analysis["recorded_exposure"] = {"trade_id": saved.get("trade_id", ""), "status": saved.get("status", ""), "strategy_type": saved.get("strategy_type", ""), "direction": saved.get("direction", ""), "action": saved.get("action", "")}
+    plan["trade_id"] = saved.get("trade_id", "")
+    return saved
 
 
 def _load_json_object(value: Any) -> Dict[str, Any]:
@@ -235,6 +337,8 @@ def _persist_scan_memory(
     mapping: Dict[str, Any],
     tv_rows: pd.DataFrame,
     latest_odme: Dict[str, Any],
+    live_odme_result: Dict[str, Any],
+    live_odme_meta: Dict[str, Any],
     odme_live: bool,
     odme_error: str,
     open_trades: List[Dict[str, Any]],
@@ -252,7 +356,7 @@ def _persist_scan_memory(
     # Persistent memory stores a compact comparison state only. Detailed live
     # truth remains in TV_TEST_CURRENT / odme_snapshots and is reread each scan.
     tv_compact = _latest_tv_rows(tv_rows)
-    odme_compact = _compact_odme(latest_odme or {})
+    odme_compact = _compact_live_odme(live_odme_result or {}, live_odme_meta or {}) if odme_live and live_odme_result else _compact_odme(latest_odme or {})
     mapping_compact = {
         "instrument": mapping.get("instrument", instrument),
         "odme_scan_enabled": bool(mapping.get("odme_scan_enabled")),
@@ -275,6 +379,16 @@ def _persist_scan_memory(
 
     previous_compact = _load_json_object(previous.get("market_state_json", ""))
     analysis = analyze_market(evidence, previous_compact, open_trades=open_trades)
+    saved_trade = _apply_trade_plan(store, instrument, mode, scan_id, analysis, open_trades)
+    active_ids = [str(x.get("trade_id", "")) for x in open_trades if str(x.get("trade_id", "")).strip()]
+    if saved_trade:
+        tid = str(saved_trade.get("trade_id", "") or "")
+        terminal = {"CLOSED", "EXIT", "TARGET", "INVALIDATED", "EXPIRED", "CANCELLED"}
+        if str(saved_trade.get("status", "")).upper() in terminal:
+            active_ids = [x for x in active_ids if x != tid]
+        elif tid and tid not in active_ids:
+            active_ids.append(tid)
+    evidence["open_trade_ids"] = active_ids
     evidence["analysis"] = analysis
 
     # Fingerprint the exact inputs in memory, but do not write that huge payload
@@ -299,7 +413,7 @@ def _persist_scan_memory(
         "market_state_json": _json_dumps(evidence),
         "previous_state_json": _json_dumps(previous_compact) if previous_compact else "",
         "metadata_json": _json_dumps({
-            "open_trade_count": len(open_trades),
+            "open_trade_count": len(evidence.get("open_trade_ids", [])),
             "memory_schema": "SBMEM2_COMPACT",
             "bridge_version": SUPERBRAIN_BRIDGE_VERSION,
             "reasoner_version": REASONER_VERSION,
@@ -320,7 +434,7 @@ def _persist_scan_memory(
 
 
 def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]:
-    """Phase-2 orchestration packet for Ask SuperBrain with explicit stage diagnostics.
+    """Ask SuperBrain orchestration packet with explicit stage diagnostics.
 
     No trade decisions are invented here. BTCUSD and any other instrument without
     ODME remain on the TV-only path. Each failure reports the exact orchestration
@@ -380,6 +494,8 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
             mapping=map_row,
             tv_rows=tv_rows,
             latest_odme=latest_odme,
+            live_odme_result=(odme_outcome.get("result", {}) if odme_outcome else {}),
+            live_odme_meta=(odme_outcome.get("meta", {}) if odme_outcome else {}),
             odme_live=odme_live,
             odme_error=odme_error,
             open_trades=open_trades,
