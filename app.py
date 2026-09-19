@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, List
 
@@ -9,11 +9,10 @@ import streamlit as st
 
 from angel_connector import AngelConnector, AngelDataError, AngelSessionError, load_angel_credentials
 from data_store import get_store, make_key, make_snapshot_id, parse_previous_summary, utc_now_iso
-from email_notifier import send_email
 from odme_config import APP_NAME, REFRESH_INTERVAL_SECONDS, SUPPORTED_INSTRUMENTS
 from odme_engine import analyze_odme, reconstruct_saved_result
-from runtime_config import get_list, get_secret
 from scan_service import run_odme_scan
+from superbrain_bridge import build_instrument_map, prepare_superbrain_scan
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
@@ -42,6 +41,7 @@ def init_session() -> None:
         "last_result_by_key": {},
         "login_error": "",
         "angel_login_at": "",
+        "public_superbrain_last": None,
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
@@ -61,13 +61,13 @@ def init_session() -> None:
 def login_page() -> None:
     inject_css()
     st.title(APP_NAME)
-    st.caption("Manual ODME batch scanning — no background scheduler required.")
+    st.caption("ODME + TradingView market intelligence terminal")
 
-    render_manual_batch_scan("login")
+    render_public_superbrain()
 
     st.markdown("---")
     st.subheader("Angel login")
-    st.info("Login is needed only for the interactive dashboard. The Scan All button above uses the stored Angel TOTP secret automatically.")
+    st.info("Login is needed only for ODME setup, manual controls and history management.")
 
     with st.form("login_form"):
         totp = st.text_input("Current Angel TOTP", type="password", max_chars=8)
@@ -92,6 +92,82 @@ def login_page() -> None:
         except Exception as exc:
             st.session_state.login_error = str(exc)
             st.error(str(exc))
+
+
+def render_public_superbrain() -> None:
+    """Public, no-login SuperBrain entry point.
+
+    The instrument list is derived only from TV_TEST_CURRENT. ODME attachment is
+    an exact instrument-column match; there is no manual alias registry.
+    """
+    st.subheader("Ask SuperBrain")
+    try:
+        store = get_store()
+    except Exception as exc:
+        st.error(f"Could not load SuperBrain instruments: {exc}")
+        return
+    try:
+        _run_expired_cleanup_once(store, show_notice=False)
+    except Exception:
+        # Cleanup must never block public market access. The authenticated UI
+        # will surface cleanup errors if they persist.
+        pass
+    try:
+        mapping = build_instrument_map(store)
+    except Exception as exc:
+        st.error(f"Could not load SuperBrain instruments: {exc}")
+        return
+
+    if mapping is None or mapping.empty:
+        st.info("No TradingView instruments are currently available in TV_TEST_CURRENT.")
+        return
+
+    instruments = mapping["instrument"].astype(str).tolist()
+    instrument = st.selectbox("Instrument", instruments, key="public_superbrain_instrument")
+    row = mapping[mapping["instrument"].eq(instrument)].iloc[0].to_dict()
+    if row.get("odme_scan_enabled"):
+        st.caption(f"{instrument}: TradingView + ODME enabled ({row.get('selected_expiry')}).")
+    else:
+        st.caption(f"{instrument}: TradingView mode. ODME will be used only when this exact instrument is enabled for ODME scanning.")
+
+    if st.button("Ask SuperBrain", type="primary", use_container_width=True, key="ask_superbrain_public"):
+        with st.spinner("Refreshing market inputs..."):
+            try:
+                packet = prepare_superbrain_scan(store, instrument)
+                st.session_state.public_superbrain_last = packet
+            except Exception as exc:
+                st.error(f"SuperBrain scan failed: {exc}")
+                return
+
+    packet = st.session_state.get("public_superbrain_last")
+    if not packet or str(packet.get("instrument", "")) != instrument:
+        return
+
+    sources = ", ".join(packet.get("tv_sources", [])) or "TradingView"
+    if packet.get("odme_live"):
+        expiry = str(packet.get("mapping", {}).get("selected_expiry", "") or "")
+        st.success(f"{instrument}: {sources} + fresh ODME ({expiry}) are ready in the terminal.")
+        outcome = packet.get("odme_outcome", {}) or {}
+        if outcome:
+            st.text(_batch_instrument_summary(instrument, expiry, outcome))
+    else:
+        st.success(f"{instrument}: {sources} are ready. SuperBrain is operating in TV-only mode for this scan.")
+        if packet.get("odme_error"):
+            st.warning(f"ODME refresh was not usable, so this scan stayed TV-only: {packet.get('odme_error')}")
+
+
+def _run_expired_cleanup_once(store: Any, show_notice: bool = True) -> None:
+    """Automatically remove finished-expiry ODME snapshots once per India date."""
+    india_date = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+    if st.session_state.get("last_expiry_cleanup_date") == india_date:
+        return
+    cleanup = store.cleanup_expired_data(tz_name="Asia/Kolkata")
+    st.session_state["last_expiry_cleanup_date"] = india_date
+    if show_notice and (cleanup.get("deleted_snapshots", 0) or cleanup.get("cleared_scan_settings", 0)):
+        st.toast(
+            f"Expired ODME cleanup: {cleanup.get('deleted_snapshots', 0)} snapshot(s) deleted; "
+            f"{cleanup.get('cleared_scan_settings', 0)} scan setting(s) cleared."
+        )
 
 
 # =============================================================================
@@ -1083,7 +1159,7 @@ def _batch_instrument_summary(instrument: str, expiry: str, outcome: Dict[str, A
 
 
 def _run_enabled_batch_scan() -> Dict[str, Any]:
-    """Immediately scan every active instrument marked Enable Scan and email one summary."""
+    """Immediately scan every active instrument marked Enable Scan."""
     store = get_store()
     settings = store.list_instrument_settings(active_only=True)
     if settings is None or settings.empty:
@@ -1132,42 +1208,114 @@ def _run_enabled_batch_scan() -> Dict[str, Any]:
     if not blocks:
         raise RuntimeError("No enabled instruments could be scanned.")
 
-    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
-    sender = str(get_secret("GMAIL_SENDER", "") or "").strip()
-    password = str(get_secret("GMAIL_APP_PASSWORD", "") or "")
-    recipients = get_list("ALERT_EMAILS")
-    subject = f"ODME Manual Scan — {now_ist.strftime('%d %b %Y %H:%M IST')} — {len(blocks)} instrument(s)"
-    body = (
-        "ODME MANUAL SCAN\n"
-        + now_ist.strftime("%d %b %Y %H:%M IST")
-        + "\n\n"
-        + ("\n\n" + "-" * 72 + "\n\n").join(blocks)
-    )
-    sent = send_email(sender, password, recipients, subject, body)
     return {
         "instrument_count": len(blocks),
         "ok_count": ok_count,
-        "recipient_count": sent,
         "details": details,
+        "blocks": blocks,
     }
 
 
 def render_manual_batch_scan(key_suffix: str) -> None:
     st.subheader("Manual Scan All")
-    st.caption("Scans every instrument with Enable Scan switched on, saves changed ODME state, and emails one consolidated summary immediately. No GitHub scheduler is used.")
-    if st.button("Scan All Enabled + Email", type="primary", use_container_width=True, key=f"manual_scan_all_{key_suffix}"):
-        with st.spinner("Automatic Angel login → scanning enabled instruments → sending ODME email..."):
+    st.caption("Scans every instrument with Enable Scan switched on, saves changed ODME state, and shows the consolidated result here.")
+    if st.button("Scan All Enabled", type="primary", use_container_width=True, key=f"manual_scan_all_{key_suffix}"):
+        with st.spinner("Automatic Angel login → scanning enabled instruments..."):
             try:
                 report = _run_enabled_batch_scan()
                 st.success(
-                    f"Completed {report['ok_count']}/{report['instrument_count']} scan(s). "
-                    f"Email sent to {report['recipient_count']} recipient(s)."
+                    f"Completed {report['ok_count']}/{report['instrument_count']} scan(s)."
                 )
+                for block in report.get("blocks", []):
+                    st.text(block)
                 failed = [x for x in report.get("details", []) if "ERROR" in x or "missing" in x]
                 if failed:
                     st.warning("Some instruments need attention: " + " | ".join(failed))
             except Exception as exc:
                 st.error(f"Manual batch scan failed: {exc}")
+
+
+def render_history_management(store: Any, instrument: str) -> None:
+    """Authenticated destructive history controls for the selected instrument."""
+    with st.expander("History data management", expanded=False):
+        st.caption("Finished-expiry ODME snapshots are cleaned automatically. TV current state is never deleted here.")
+        history_instruments = {str(instrument).upper().strip()}
+        try:
+            odme_hist = store.load_odme_history(limit=100000)
+            if odme_hist is not None and not odme_hist.empty and "instrument" in odme_hist.columns:
+                history_instruments.update(
+                    str(x).upper().strip() for x in odme_hist["instrument"] if str(x).strip()
+                )
+        except Exception:
+            pass
+        try:
+            tv_current = store.load_tv_current()
+            if tv_current is not None and not tv_current.empty and "instrument" in tv_current.columns:
+                history_instruments.update(
+                    str(x).upper().strip() for x in tv_current["instrument"] if str(x).strip()
+                )
+        except Exception:
+            pass
+        history_instruments = sorted(x for x in history_instruments if x)
+        default_index = history_instruments.index(str(instrument).upper().strip()) if str(instrument).upper().strip() in history_instruments else 0
+        history_instrument = st.selectbox(
+            "Instrument history",
+            history_instruments,
+            index=default_index,
+            key="history_management_instrument",
+        )
+        history_types = st.multiselect(
+            "History to delete",
+            ["ODME snapshots", "TradingView event history"],
+            key="history_types_delete",
+        )
+        period = st.selectbox(
+            "Period",
+            ["Today", "Last 7 days", "Last 30 days", "Custom", "All history"],
+            key="history_period_delete",
+        )
+
+        today = datetime.now(ZoneInfo("Asia/Singapore")).date()
+        start_date = end_date = None
+        if period == "Today":
+            start_date = end_date = today
+        elif period == "Last 7 days":
+            start_date, end_date = today - timedelta(days=6), today
+        elif period == "Last 30 days":
+            start_date, end_date = today - timedelta(days=29), today
+        elif period == "Custom":
+            dates = st.date_input(
+                "Date range",
+                value=(today - timedelta(days=7), today),
+                key="history_dates_delete",
+            )
+            if isinstance(dates, (list, tuple)) and len(dates) == 2:
+                start_date, end_date = dates[0], dates[1]
+            else:
+                st.info("Select both start and end dates.")
+
+        confirmed = st.checkbox(
+            f"Confirm deletion for {history_instrument}",
+            key="history_confirm_delete",
+        )
+        if st.button(
+            "Delete selected history",
+            key="history_delete_selected",
+            use_container_width=True,
+            disabled=not bool(history_types) or not confirmed or (period == "Custom" and (start_date is None or end_date is None)),
+        ):
+            deleted_odme = 0
+            deleted_tv = 0
+            try:
+                if "ODME snapshots" in history_types:
+                    deleted_odme = store.delete_odme_history(history_instrument, start_date, end_date)
+                if "TradingView event history" in history_types:
+                    deleted_tv = store.delete_tv_event_history(history_instrument, start_date, end_date)
+                st.success(
+                    f"Deleted {deleted_odme} ODME snapshot(s) and {deleted_tv} TradingView event row(s) for {history_instrument}."
+                )
+            except Exception as exc:
+                st.error(f"History deletion failed: {exc}")
 
 
 def main_page() -> None:
@@ -1180,18 +1328,10 @@ def main_page() -> None:
     master: pd.DataFrame = st.session_state.master
 
     # Expired option history is not comparable. Clean it once per India date.
-    india_date = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
-    if st.session_state.get("last_expiry_cleanup_date") != india_date:
-        try:
-            cleanup = store.cleanup_expired_data(tz_name="Asia/Kolkata")
-            st.session_state["last_expiry_cleanup_date"] = india_date
-            if cleanup.get("deleted_snapshots", 0) or cleanup.get("cleared_scan_settings", 0):
-                st.toast(
-                    f"Expired ODME cleanup: {cleanup.get('deleted_snapshots', 0)} snapshot(s) deleted; "
-                    f"{cleanup.get('cleared_scan_settings', 0)} scan setting(s) cleared."
-                )
-        except Exception as exc:
-            st.warning(f"Expired-history cleanup could not run: {exc}")
+    try:
+        _run_expired_cleanup_once(store, show_notice=True)
+    except Exception as exc:
+        st.warning(f"Expired-history cleanup could not run: {exc}")
 
     with st.sidebar:
         st.header("Instrument")
@@ -1260,7 +1400,7 @@ def main_page() -> None:
                 "Enable Scan",
                 value=_as_bool(current_setting.get("scan_enabled", False)),
                 key=f"scan_enabled_{instrument}",
-                help="When enabled, this instrument is included whenever Scan All Enabled + Email is pressed.",
+                help="When enabled, this instrument is included whenever Scan All Enabled is pressed and is eligible for fresh ODME during Ask SuperBrain.",
             )
 
             if st.button("Save expiry + scan setting", key=f"save_scan_{instrument}", use_container_width=True):
@@ -1269,7 +1409,7 @@ def main_page() -> None:
                     active=True,
                     selected_expiry=expiry,
                     scan_enabled=scan_enabled,
-                    email_alert=scan_enabled,
+                    email_alert=False,
                     scan_times="",
                     last_run_slot="",
                 )
@@ -1285,6 +1425,8 @@ def main_page() -> None:
                 store.deactivate_instrument(instrument)
                 st.success(f"{instrument} removed from the dropdown.")
                 st.rerun()
+
+        render_history_management(store, instrument)
 
         st.caption("Spot/future is fetched from the related Angel futures contract only. If futures LTP or contract mapping cannot be verified, ODME stops instead of assuming data.")
         st.caption(f"Option contracts found: {len(option_rows[option_rows['expiry'].astype(str).eq(str(expiry))])}")

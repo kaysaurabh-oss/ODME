@@ -22,9 +22,6 @@ jobs:
       ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
       ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
       ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
-      GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
-      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-      ALERT_EMAILS: ${{ secrets.ALERT_EMAILS }}
       USE_GOOGLE_SHEETS: "true"
       GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME }}
       GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}

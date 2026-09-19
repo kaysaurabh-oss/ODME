@@ -23,6 +23,8 @@ except Exception:  # pragma: no cover
 
 ODME_TAB = "odme_snapshots"
 INSTRUMENT_TAB = "instrument_settings"
+TV_CURRENT_TAB = "TV_TEST_CURRENT"
+TV_EVENTS_TAB = "TV_TEST_EVENTS"
 
 INSTRUMENT_COLUMNS = [
     "instrument", "active", "selected_expiry", "scan_enabled", "email_alert", "scan_times",
@@ -204,6 +206,70 @@ def _seed_default_settings(df: pd.DataFrame) -> pd.DataFrame:
     return df[INSTRUMENT_COLUMNS].astype(str).fillna("")
 
 
+def _history_date_mask(
+    values: pd.Series,
+    start_date: Optional[Any],
+    end_date: Optional[Any],
+    tz_name: str,
+) -> pd.Series:
+    """Inclusive date-range mask for mixed Sheet timestamp formats."""
+    if start_date is None and end_date is None:
+        return pd.Series(True, index=values.index)
+
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+
+    start = pd.Timestamp(start_date).date() if start_date is not None else None
+    end = pd.Timestamp(end_date).date() if end_date is not None else None
+
+    def local_date(value: Any):
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        # ODME timestamps are ISO/UTC. Apps Script TV timestamps may be locale
+        # strings with an explicit GMT offset or simple sheet-formatted dates.
+        looks_iso = len(raw) >= 10 and raw[4:5] == "-" and raw[7:8] == "-"
+        parsed = pd.to_datetime(raw, errors="coerce", dayfirst=not looks_iso)
+        if pd.isna(parsed):
+            return None
+        try:
+            if parsed.tzinfo is not None:
+                return parsed.tz_convert(tz).date()
+        except Exception:
+            pass
+        try:
+            return parsed.date()
+        except Exception:
+            return None
+
+    dates = values.apply(local_date)
+    mask = pd.Series(True, index=values.index)
+    if start is not None:
+        mask &= dates.apply(lambda d: d is not None and d >= start)
+    if end is not None:
+        mask &= dates.apply(lambda d: d is not None and d <= end)
+    return mask
+
+
+def _contiguous_ranges(row_numbers: List[int]) -> List[tuple[int, int]]:
+    """Collapse sorted sheet row numbers into inclusive contiguous ranges."""
+    nums = sorted({int(x) for x in row_numbers if int(x) > 0})
+    if not nums:
+        return []
+    ranges: List[tuple[int, int]] = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        ranges.append((start, prev))
+        start = prev = n
+    ranges.append((start, prev))
+    return ranges
+
+
 
 class BaseStore:
     def ensure(self) -> None:
@@ -275,6 +341,50 @@ class BaseStore:
 
     def cleanup_expired_data(self, tz_name: str = "Asia/Kolkata") -> Dict[str, int]:
         raise NotImplementedError
+
+    def load_tv_current(self, instrument: Optional[str] = None) -> pd.DataFrame:
+        """Return the current TradingView terminal state.
+
+        Local CSV mode has no TradingView webhook backing store, so subclasses
+        may return an empty frame. Google Sheets mode reads TV_TEST_CURRENT.
+        """
+        return pd.DataFrame()
+
+    def load_latest_odme_for_instrument(self, instrument: str) -> Dict[str, Any]:
+        """Return the newest ODME snapshot for an exact instrument match."""
+        instrument = str(instrument or "").upper().strip()
+        if not instrument:
+            return {}
+        hist = self.load_odme_history(limit=100000)
+        if hist is None or hist.empty or "instrument" not in hist.columns:
+            return {}
+        matched = hist[
+            hist["instrument"].astype(str).str.upper().str.strip().eq(instrument)
+        ].copy()
+        if matched.empty:
+            return {}
+        if "ts" in matched.columns:
+            matched = matched.sort_values("ts")
+        return matched.iloc[-1].to_dict()
+
+    def delete_odme_history(
+        self,
+        instrument: str,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        tz_name: str = "Asia/Kolkata",
+    ) -> int:
+        raise NotImplementedError
+
+    def delete_tv_event_history(
+        self,
+        instrument: str,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        tz_name: str = "Asia/Singapore",
+    ) -> int:
+        """Delete TV_TEST_EVENTS history only; TV_TEST_CURRENT is never touched."""
+        return 0
 
     # Backward-compatible no-op method name from old app.
     def upsert_initialized(self, row: Dict[str, Any]) -> None:
@@ -412,6 +522,24 @@ class LocalStore(BaseStore):
                 cleared += 1
         settings[INSTRUMENT_COLUMNS].to_csv(self.settings_path, index=False)
         return {"deleted_snapshots": deleted, "cleared_scan_settings": cleared}
+
+    def delete_odme_history(
+        self,
+        instrument: str,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        tz_name: str = "Asia/Kolkata",
+    ) -> int:
+        self.ensure()
+        df = pd.read_csv(self.path, dtype=str).fillna("")
+        if df.empty or "instrument" not in df.columns:
+            return 0
+        remove = df["instrument"].astype(str).str.upper().str.strip().eq(str(instrument).upper().strip())
+        remove &= _history_date_mask(df.get("ts", pd.Series(index=df.index, dtype=str)), start_date, end_date, tz_name)
+        deleted = int(remove.sum())
+        if deleted:
+            df.loc[~remove].to_csv(self.path, index=False)
+        return deleted
 
 
 class GoogleSheetStore(BaseStore):
@@ -648,6 +776,87 @@ class GoogleSheetStore(BaseStore):
             if not settings.empty:
                 sws.update("A2", settings[INSTRUMENT_COLUMNS].astype(str).fillna("").values.tolist())
         return {"deleted_snapshots": deleted, "cleared_scan_settings": cleared}
+
+    def load_tv_current(self, instrument: Optional[str] = None) -> pd.DataFrame:
+        self.ensure()
+        try:
+            ws = self.sheet.worksheet(TV_CURRENT_TAB)
+        except gspread.WorksheetNotFound:
+            return pd.DataFrame()
+        records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        if df.empty:
+            return df
+        df = df.astype(str).fillna("")
+        if instrument and "instrument" in df.columns:
+            key = str(instrument).upper().strip()
+            df = df[df["instrument"].astype(str).str.upper().str.strip().eq(key)]
+        return df.reset_index(drop=True)
+
+    def delete_odme_history(
+        self,
+        instrument: str,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        tz_name: str = "Asia/Kolkata",
+    ) -> int:
+        self.ensure()
+        ws = self._worksheet(ODME_TAB, ODME_COLUMNS)
+        records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        if df.empty:
+            return 0
+        for col in ODME_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        key = str(instrument).upper().strip()
+        remove = df["instrument"].astype(str).str.upper().str.strip().eq(key)
+        remove &= _history_date_mask(df.get("ts", pd.Series(index=df.index, dtype=str)), start_date, end_date, tz_name)
+        deleted = int(remove.sum())
+        if deleted:
+            sheet_rows = [int(i) + 2 for i in df.index[remove].tolist()]
+            for start_row, end_row in reversed(_contiguous_ranges(sheet_rows)):
+                ws.delete_rows(start_row, end_row)
+        return deleted
+
+    def delete_tv_event_history(
+        self,
+        instrument: str,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        tz_name: str = "Asia/Singapore",
+    ) -> int:
+        self.ensure()
+        try:
+            ws = self.sheet.worksheet(TV_EVENTS_TAB)
+        except gspread.WorksheetNotFound:
+            return 0
+        values = ws.get_all_values()
+        if not values:
+            return 0
+        headers = [str(x) for x in values[0]]
+        if not headers or "instrument" not in headers:
+            return 0
+        rows = values[1:]
+        if not rows:
+            return 0
+        width = len(headers)
+        padded = [(row + [""] * width)[:width] for row in rows]
+        df = pd.DataFrame(padded, columns=headers)
+        key = str(instrument).upper().strip()
+        remove = df["instrument"].astype(str).str.upper().str.strip().eq(key)
+        time_col = "received_at" if "received_at" in df.columns else ("bar_time" if "bar_time" in df.columns else None)
+        if time_col:
+            remove &= _history_date_mask(df[time_col], start_date, end_date, tz_name)
+        elif start_date is not None or end_date is not None:
+            # Do not perform a period delete when the sheet has no usable time column.
+            return 0
+        deleted = int(remove.sum())
+        if deleted:
+            sheet_rows = [int(i) + 2 for i in df.index[remove].tolist()]
+            for start_row, end_row in reversed(_contiguous_ranges(sheet_rows)):
+                ws.delete_rows(start_row, end_row)
+        return deleted
 
 
 def create_store() -> BaseStore:
