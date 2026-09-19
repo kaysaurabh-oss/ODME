@@ -25,6 +25,7 @@ ODME_TAB = "odme_snapshots"
 INSTRUMENT_TAB = "instrument_settings"
 TV_CURRENT_TAB = "TV_TEST_CURRENT"
 SUPERBRAIN_TAB = "superbrain_memory"
+SUPERBRAIN_STORE_VERSION = "SBSTORE2.2_HARD_CELL_GUARD"
 
 INSTRUMENT_COLUMNS = [
     "instrument", "active", "selected_expiry", "scan_enabled", "email_alert", "scan_times",
@@ -90,6 +91,44 @@ def _json_loads(value: Any, default: Any = None) -> Any:
     except Exception:
         return default
 
+
+def _sheet_safe_superbrain_value(field: str, value: Any, max_chars: int = 45000) -> str:
+    """Keep SuperBrain writes below the Google Sheets 50k single-cell limit.
+
+    Compact persistence should normally stay far below this threshold. This is a
+    last-resort guard so a future oversized diagnostic or JSON field cannot abort
+    the whole scan. JSON fields are replaced by a small valid reference object.
+    """
+    text = "" if value is None else str(value)
+    if len(text) <= max_chars:
+        return text
+    if field.endswith("_json"):
+        import hashlib
+        return json.dumps({
+            "storage_guard": "TRUNCATED_OVERSIZE_CELL",
+            "field": field,
+            "original_chars": len(text),
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }, separators=(",", ":"))
+    return text[:max_chars]
+
+
+
+def _final_superbrain_row_values(row: Dict[str, Any], max_chars: int = 20000) -> List[str]:
+    """Hard final guard applied to every cell sent to superbrain_memory.
+
+    Google Sheets rejects any cell above 50,000 characters. Applying this to the
+    fully assembled row (not just selected JSON inputs) makes that API error
+    impossible from the SuperBrain memory write.
+    """
+    out: List[str] = []
+    for field in SUPERBRAIN_COLUMNS:
+        value = _sheet_safe_superbrain_value(field, row.get(field, ""), max_chars=max_chars)
+        text = "" if value is None else str(value)
+        if len(text) > max_chars:
+            raise RuntimeError(f"SuperBrain cell guard failed for {field}: {len(text)} chars")
+        out.append(text)
+    return out
 
 def _column_letter(n: int) -> str:
     out = ""
@@ -610,7 +649,7 @@ class LocalStore(BaseStore):
         prior = df.loc[mask].iloc[-1].to_dict() if not df.empty and mask.any() else {}
         now = utc_now_iso()
         row = {c: "" for c in SUPERBRAIN_COLUMNS}
-        row.update({k: ("" if v is None else str(v)) for k, v in (state or {}).items() if k in row})
+        row.update({k: _sheet_safe_superbrain_value(k, v) for k, v in (state or {}).items() if k in row})
         row["record_id"] = f"STATE::{key}"
         row["record_type"] = "STATE"
         row["instrument"] = key
@@ -650,7 +689,7 @@ class LocalStore(BaseStore):
         prior = df.loc[mask].iloc[-1].to_dict() if not df.empty and mask.any() else {}
         now = utc_now_iso()
         row = {c: "" for c in SUPERBRAIN_COLUMNS}
-        row.update({k: ("" if v is None else str(v)) for k, v in (trade or {}).items() if k in row})
+        row.update({k: _sheet_safe_superbrain_value(k, v) for k, v in (trade or {}).items() if k in row})
         row["record_id"] = f"TRADE::{trade_id}"
         row["record_type"] = "TRADE"
         row["instrument"] = key
@@ -1018,7 +1057,7 @@ class GoogleSheetStore(BaseStore):
         prior = df.loc[mask].iloc[-1].to_dict() if not df.empty and mask.any() else {}
         now = utc_now_iso()
         row = {c: "" for c in SUPERBRAIN_COLUMNS}
-        row.update({k: ("" if v is None else str(v)) for k, v in (state or {}).items() if k in row})
+        row.update({k: _sheet_safe_superbrain_value(k, v) for k, v in (state or {}).items() if k in row})
         row["record_id"] = f"STATE::{key}"
         row["record_type"] = "STATE"
         row["instrument"] = key
@@ -1027,9 +1066,9 @@ class GoogleSheetStore(BaseStore):
         if not df.empty and mask.any():
             sheet_row = int(df.index[mask][-1]) + 2
             end_col = _column_letter(len(SUPERBRAIN_COLUMNS))
-            ws.update(f"A{sheet_row}:{end_col}{sheet_row}", [[row[c] for c in SUPERBRAIN_COLUMNS]])
+            ws.update(f"A{sheet_row}:{end_col}{sheet_row}", [_final_superbrain_row_values(row)])
         else:
-            ws.append_row([row[c] for c in SUPERBRAIN_COLUMNS], value_input_option="USER_ENTERED")
+            ws.append_row(_final_superbrain_row_values(row), value_input_option="USER_ENTERED")
         return prior
 
     def list_superbrain_trades(self, instrument: Optional[str] = None, open_only: bool = False) -> pd.DataFrame:
@@ -1060,7 +1099,7 @@ class GoogleSheetStore(BaseStore):
         prior = df.loc[mask].iloc[-1].to_dict() if not df.empty and mask.any() else {}
         now = utc_now_iso()
         row = {c: "" for c in SUPERBRAIN_COLUMNS}
-        row.update({k: ("" if v is None else str(v)) for k, v in (trade or {}).items() if k in row})
+        row.update({k: _sheet_safe_superbrain_value(k, v) for k, v in (trade or {}).items() if k in row})
         row["record_id"] = f"TRADE::{trade_id}"
         row["record_type"] = "TRADE"
         row["instrument"] = key
@@ -1073,9 +1112,9 @@ class GoogleSheetStore(BaseStore):
         if not df.empty and mask.any():
             sheet_row = int(df.index[mask][-1]) + 2
             end_col = _column_letter(len(SUPERBRAIN_COLUMNS))
-            ws.update(f"A{sheet_row}:{end_col}{sheet_row}", [[row[c] for c in SUPERBRAIN_COLUMNS]])
+            ws.update(f"A{sheet_row}:{end_col}{sheet_row}", [_final_superbrain_row_values(row)])
         else:
-            ws.append_row([row[c] for c in SUPERBRAIN_COLUMNS], value_input_option="USER_ENTERED")
+            ws.append_row(_final_superbrain_row_values(row), value_input_option="USER_ENTERED")
         return row
 
     def delete_superbrain_history(

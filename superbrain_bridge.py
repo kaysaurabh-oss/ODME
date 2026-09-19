@@ -12,6 +12,8 @@ from angel_connector import AngelConnector, load_angel_credentials
 from data_store import BaseStore
 from scan_service import run_odme_scan
 
+SUPERBRAIN_BRIDGE_VERSION = "SB2.2_TV_ONLY_MEMORY_FIX"
+
 
 def _norm(value: Any) -> str:
     return str(value or "").upper().strip()
@@ -30,6 +32,114 @@ def _safe_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
         return []
     clean = df.copy().fillna("")
     return clean.to_dict(orient="records")
+
+
+def _latest_tv_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Return one decision-relevant current row per TradingView source.
+
+    TV_TEST_CURRENT intentionally retains rows from old test timeframes. Persistent
+    SuperBrain memory should not duplicate the whole 297-column sheet. We keep the
+    freshest row for each source and only the fields needed to compare market state
+    across scans. Detailed live truth remains in TV_TEST_CURRENT and is reread on
+    every scan.
+    """
+    if df is None or df.empty:
+        return []
+    work = df.copy().fillna("")
+    if "source" not in work.columns:
+        return []
+
+    common = ["updated_at", "source", "tf", "bar_time", "close", "schema_version"]
+    source_fields = {
+        "AURORA": [
+            "aurora_state", "aurora_prev", "aurora_change", "eta_up_level",
+            "eta_up_regime", "eta_up_locked_remaining_bars", "eta_down_level",
+            "eta_down_regime", "eta_down_locked_remaining_bars", "eta_current_atr",
+        ],
+        "STRUCTURE": [
+            "structure_trend", "struct_high", "struct_low", "last_clean_price",
+            "last_clean_time", "fork_valid", "fork_slope", "fork_slope_flip",
+            "fork_position", "fork_reclaimed_2sd", "fork_active_kind", "fork_median",
+            "fork_upper_1sd", "fork_upper_2sd", "fork_lower_1sd", "fork_lower_2sd",
+        ],
+        "LIQUIDITY": [
+            "liq_buy_level", "liq_buy_count", "liq_buy_distance", "liq_sell_level",
+            "liq_sell_count", "liq_sell_distance", "liq_pending_count",
+            "liq_history_count", "liq_last_event", "liq_event_level",
+            "liq_event_count", "liq_event_reclaimed", "liq_event1_type",
+            "liq_event1_side", "liq_event1_level", "liq_event1_confirm_time",
+            "liq_event2_type", "liq_event2_side", "liq_event2_level",
+            "liq_event2_confirm_time", "liq_event3_type", "liq_event3_side",
+            "liq_event3_level", "liq_event3_confirm_time",
+        ],
+        "EDGE": [
+            "macro", "macro_tf", "macro_score", "battlefield_paired",
+            "defender_tf", "defender_side", "defender_low", "defender_high",
+            "defender_state", "challenger_tf", "challenger_side", "challenger_low",
+            "challenger_high", "challenger_state", "exec_tf", "exec_of",
+            "exec_of_score", "exec_move_quality", "fp_valid", "fp_side", "fp_low",
+            "fp_high", "fp_strength", "fp_strength_score", "fp_status", "fp_hold",
+            "fp_interacting", "fp_context_state", "fp_event_type", "fp_event_score",
+            "fp_distance_atr", "edge_tracking_state", "edge_required_exec_tf",
+            "edge_needs_alert_change", "edge_tracking_reason", "raw_json",
+        ],
+    }
+
+    out: List[Dict[str, Any]] = []
+    for source, group in work.groupby(work["source"].astype(str).str.upper().str.strip(), sort=True):
+        group = group.copy()
+        # Prefer ACTIVE EDGE authority when present, then the greatest bar_time.
+        if source == "EDGE" and "edge_tracking_state" in group.columns:
+            active = group[group["edge_tracking_state"].astype(str).str.upper().eq("ACTIVE")]
+            if not active.empty:
+                group = active
+        if "bar_time" in group.columns:
+            order = pd.to_numeric(group["bar_time"], errors="coerce").fillna(-1)
+            row = group.loc[order.idxmax()]
+        else:
+            row = group.iloc[-1]
+
+        keys = common + source_fields.get(source, [])
+        compact: Dict[str, Any] = {}
+        for key in keys:
+            if key not in row.index:
+                continue
+            value = row.get(key, "")
+            if value is None or str(value) == "":
+                continue
+            if key == "raw_json":
+                try:
+                    value = json.loads(str(value))
+                except Exception:
+                    # Keep a bounded raw fallback; malformed raw JSON should not
+                    # make persistence fail.
+                    value = str(value)[:12000]
+            compact[key] = value
+        out.append(compact)
+    return out
+
+
+def _compact_odme(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep prior ODME anchors needed for change comparison, not the full chain blob."""
+    if not row:
+        return {}
+    fields = [
+        "snapshot_id", "ts", "instrument", "exchange", "expiry", "spot",
+        "option_poc", "value_area_low", "value_area_high", "ce_wall", "pe_wall",
+        "ce_wall_shift", "pe_wall_shift", "poc_shift", "range_shift",
+        "bullish_score", "bearish_score", "range_score", "expansion_score",
+        "odme_tilt", "safer_sell_ce", "active_ce_wall", "safer_sell_pe",
+        "active_pe_wall", "usable_oi_count", "source",
+    ]
+    return {k: row.get(k) for k in fields if row.get(k) not in (None, "")}
+
+
+def _load_json_object(value: Any) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(str(value or ""))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
 
 
 def _open_trade_records(store: BaseStore, instrument: str) -> List[Dict[str, Any]]:
@@ -124,29 +234,42 @@ def _persist_scan_memory(
     previous = store.load_superbrain_state(instrument) or {}
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     scan_id = f"SBSCAN-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
-    tv_records = _safe_records(tv_rows)
+    # Persistent memory stores a compact comparison state only. Detailed live
+    # truth remains in TV_TEST_CURRENT / odme_snapshots and is reread each scan.
+    tv_compact = _latest_tv_rows(tv_rows)
+    odme_compact = _compact_odme(latest_odme or {})
+    mapping_compact = {
+        "instrument": mapping.get("instrument", instrument),
+        "odme_scan_enabled": bool(mapping.get("odme_scan_enabled")),
+        "selected_expiry": mapping.get("selected_expiry", ""),
+        "mode_hint": mapping.get("mode_hint", ""),
+    }
 
     evidence = {
         "scan_id": scan_id,
         "scanned_at": now,
         "instrument": instrument,
         "mode": mode,
-        "mapping": mapping,
-        "tv_rows": tv_records,
-        "latest_odme": latest_odme or {},
+        "mapping": mapping_compact,
+        "tv": tv_compact,
+        "odme": odme_compact,
         "odme_live": bool(odme_live),
         "odme_error": odme_error or "",
         "open_trade_ids": [str(x.get("trade_id", "")) for x in open_trades if str(x.get("trade_id", "")).strip()],
     }
 
+    # Fingerprint the exact inputs in memory, but do not write that huge payload
+    # into a Sheet cell. This preserves accurate change detection without storage
+    # bloat.
     fingerprint_payload = {
         "instrument": instrument,
         "mode": mode,
-        "tv_rows": tv_records,
+        "tv_rows": _safe_records(tv_rows),
         "latest_odme": latest_odme or {},
     }
     fingerprint = hashlib.sha256(_json_dumps(fingerprint_payload).encode("utf-8")).hexdigest()
 
+    previous_compact = _load_json_object(previous.get("market_state_json", ""))
     state_row = {
         "status": "ACTIVE",
         "scan_id": scan_id,
@@ -157,8 +280,13 @@ def _persist_scan_memory(
         "action": "",
         "thesis": "",
         "market_state_json": _json_dumps(evidence),
-        "previous_state_json": str(previous.get("market_state_json", "") or ""),
-        "metadata_json": _json_dumps({"open_trade_count": len(open_trades)}),
+        "previous_state_json": _json_dumps(previous_compact) if previous_compact else "",
+        "metadata_json": _json_dumps({
+            "open_trade_count": len(open_trades),
+            "memory_schema": "SBMEM2_COMPACT",
+            "bridge_version": SUPERBRAIN_BRIDGE_VERSION,
+            "tv_source_count": len(tv_compact),
+        }),
         "updated_at": now,
     }
     prior_row = store.upsert_superbrain_state(instrument, state_row)
@@ -173,75 +301,87 @@ def _persist_scan_memory(
 
 
 def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]:
-    """Phase-2 orchestration packet for Ask SuperBrain.
+    """Phase-2 orchestration packet for Ask SuperBrain with explicit stage diagnostics.
 
-    This still does not invent trade decisions. It refreshes the exact market
-    inputs, loads SuperBrain-owned open trade memory, and persists the current
-    evidence so the next scan has a durable previous state to compare against.
+    No trade decisions are invented here. BTCUSD and any other instrument without
+    ODME remain on the TV-only path. Each failure reports the exact orchestration
+    stage so Sheet write issues cannot be misdiagnosed as ODME problems.
     """
     instrument = _norm(instrument)
-    mapping = build_instrument_map(store)
-    matched = mapping[mapping["instrument"].eq(instrument)] if not mapping.empty else pd.DataFrame()
-    if matched.empty:
-        raise ValueError(f"{instrument} is not present in TV_TEST_CURRENT.")
-    map_row = matched.iloc[0].to_dict()
+    stage = "START"
+    try:
+        stage = "BUILD_INSTRUMENT_MAP"
+        mapping = build_instrument_map(store)
+        matched = mapping[mapping["instrument"].eq(instrument)] if not mapping.empty else pd.DataFrame()
+        if matched.empty:
+            raise ValueError(f"{instrument} is not present in TV_TEST_CURRENT.")
+        map_row = matched.iloc[0].to_dict()
 
-    # Read any SuperBrain-owned exposure before refreshing inputs. Future
-    # reasoning uses this to manage its own prior decisions, not broker positions.
-    open_trades = _open_trade_records(store, instrument)
+        stage = "LOAD_OPEN_SUPERBRAIN_TRADES"
+        open_trades = _open_trade_records(store, instrument)
 
-    tv_rows = store.load_tv_current(instrument)
-    odme_outcome: Dict[str, Any] = {}
-    odme_error = ""
-    odme_live = False
+        stage = "LOAD_TV_CURRENT"
+        tv_rows = store.load_tv_current(instrument)
+        odme_outcome: Dict[str, Any] = {}
+        odme_error = ""
+        odme_live = False
 
-    if bool(map_row.get("odme_scan_enabled")):
-        expiry = str(map_row.get("selected_expiry", "") or "").strip()
-        try:
-            angel = AngelConnector(load_angel_credentials())
-            angel.login_automatic()
-            master = angel.load_instrument_master()
-            odme_outcome = run_odme_scan(
-                store,
-                angel,
-                master,
-                instrument,
-                expiry,
-                save_only_if_changed=True,
-            )
-            odme_live = True
-        except Exception as exc:
-            # SuperBrain remains usable in TV-only mode if ODME refresh fails.
-            odme_error = f"{type(exc).__name__}: {exc}"
+        # Exact-match ODME is optional. TV-only instruments never call Angel/ODME.
+        if bool(map_row.get("odme_scan_enabled")):
+            stage = "OPTIONAL_ODME_REFRESH"
+            expiry = str(map_row.get("selected_expiry", "") or "").strip()
+            try:
+                angel = AngelConnector(load_angel_credentials())
+                angel.login_automatic()
+                master = angel.load_instrument_master()
+                odme_outcome = run_odme_scan(
+                    store,
+                    angel,
+                    master,
+                    instrument,
+                    expiry,
+                    save_only_if_changed=True,
+                )
+                odme_live = True
+            except Exception as exc:
+                odme_error = f"{type(exc).__name__}: {exc}"
 
-    latest_odme = store.load_latest_odme_for_instrument(instrument)
-    sources = []
-    if tv_rows is not None and not tv_rows.empty and "source" in tv_rows.columns:
-        sources = sorted({str(x).strip() for x in tv_rows["source"] if str(x).strip()})
+        stage = "LOAD_MATCHED_ODME_HISTORY"
+        latest_odme = store.load_latest_odme_for_instrument(instrument)
+        sources = []
+        if tv_rows is not None and not tv_rows.empty and "source" in tv_rows.columns:
+            sources = sorted({str(x).strip() for x in tv_rows["source"] if str(x).strip()})
 
-    mode = "TV + ODME" if odme_live else "TV only"
-    memory = _persist_scan_memory(
-        store=store,
-        instrument=instrument,
-        mode=mode,
-        mapping=map_row,
-        tv_rows=tv_rows,
-        latest_odme=latest_odme,
-        odme_live=odme_live,
-        odme_error=odme_error,
-        open_trades=open_trades,
-    )
+        mode = "TV + ODME" if odme_live else "TV only"
+        stage = "WRITE_SUPERBRAIN_MEMORY"
+        memory = _persist_scan_memory(
+            store=store,
+            instrument=instrument,
+            mode=mode,
+            mapping=map_row,
+            tv_rows=tv_rows,
+            latest_odme=latest_odme,
+            odme_live=odme_live,
+            odme_error=odme_error,
+            open_trades=open_trades,
+        )
 
-    return {
-        "instrument": instrument,
-        "mode": mode,
-        "tv_rows": tv_rows,
-        "tv_sources": sources,
-        "mapping": map_row,
-        "odme_live": odme_live,
-        "odme_outcome": odme_outcome,
-        "latest_odme": latest_odme,
-        "odme_error": odme_error,
-        "open_trades": open_trades,
-        "memory": memory,
-    }
+        return {
+            "instrument": instrument,
+            "mode": mode,
+            "tv_rows": tv_rows,
+            "tv_sources": sources,
+            "mapping": map_row,
+            "odme_live": odme_live,
+            "odme_outcome": odme_outcome,
+            "latest_odme": latest_odme,
+            "odme_error": odme_error,
+            "open_trades": open_trades,
+            "memory": memory,
+            "superbrain_build": SUPERBRAIN_BRIDGE_VERSION,
+        }
+    except Exception as exc:
+        raise RuntimeError(
+            f"{SUPERBRAIN_BRIDGE_VERSION} [{stage}] {type(exc).__name__}: {exc}"
+        ) from exc
+
