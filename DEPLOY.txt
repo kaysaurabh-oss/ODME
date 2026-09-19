@@ -1,0 +1,17 @@
+SuperBrain Phase 3.1 runtime patch
+
+Replace these exact files in the ROOT of your Streamlit/GitHub project:
+- app.py
+- superbrain_bridge.py
+- superbrain_reasoner.py
+
+Do not place them in a new subfolder and do not rename them.
+
+After Streamlit redeploys, the Ask SuperBrain section must show:
+Core build: SB3.1_LOCKED_RULES_CONTEXT_FIRST
+
+After one BTCUSD scan, superbrain_memory metadata_json must include:
+"bridge_version":"SB3.1_LOCKED_RULES_CONTEXT_FIRST"
+"reasoner_version":"SB3.1_LOCKED_RULES_CONTEXT_FIRST"
+
+The STATE row action/thesis should also no longer be blank.

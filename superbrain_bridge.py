@@ -11,8 +11,9 @@ import pandas as pd
 from angel_connector import AngelConnector, load_angel_credentials
 from data_store import BaseStore
 from scan_service import run_odme_scan
+from superbrain_reasoner import analyze_market, REASONER_VERSION
 
-SUPERBRAIN_BRIDGE_VERSION = "SB2.2_TV_ONLY_MEMORY_FIX"
+SUPERBRAIN_BRIDGE_VERSION = "SB3.1_LOCKED_RULES_CONTEXT_FIRST"
 
 
 def _norm(value: Any) -> str:
@@ -55,12 +56,17 @@ def _latest_tv_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
             "aurora_state", "aurora_prev", "aurora_change", "eta_up_level",
             "eta_up_regime", "eta_up_locked_remaining_bars", "eta_down_level",
             "eta_down_regime", "eta_down_locked_remaining_bars", "eta_current_atr",
+            "eta_up_model_bars", "eta_up_model_distance", "eta_up_model_atr",
+            "eta_up_speed_price_per_bar", "eta_up_speed_atr_per_bar",
+            "eta_down_model_bars", "eta_down_model_distance", "eta_down_model_atr",
+            "eta_down_speed_price_per_bar", "eta_down_speed_atr_per_bar",
         ],
         "STRUCTURE": [
             "structure_trend", "struct_high", "struct_low", "last_clean_price",
             "last_clean_time", "fork_valid", "fork_slope", "fork_slope_flip",
             "fork_position", "fork_reclaimed_2sd", "fork_active_kind", "fork_median",
             "fork_upper_1sd", "fork_upper_2sd", "fork_lower_1sd", "fork_lower_2sd",
+            "fork_reclaim_side",
         ],
         "LIQUIDITY": [
             "liq_buy_level", "liq_buy_count", "liq_buy_distance", "liq_sell_level",
@@ -81,7 +87,16 @@ def _latest_tv_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
             "fp_high", "fp_strength", "fp_strength_score", "fp_status", "fp_hold",
             "fp_interacting", "fp_context_state", "fp_event_type", "fp_event_score",
             "fp_distance_atr", "edge_tracking_state", "edge_required_exec_tf",
-            "edge_needs_alert_change", "edge_tracking_reason", "raw_json",
+            "edge_needs_alert_change", "edge_tracking_reason",
+            "fp_d_valid", "fp_d_zone_id", "fp_d_low", "fp_d_high",
+            "fp_d_strength_score", "fp_d_strength", "fp_d_hold", "fp_d_status",
+            "fp_d_context_state", "fp_d_interacting", "fp_d_waiting_confirmation",
+            "fp_d_breach_pending", "fp_d_event_type", "fp_d_event_score", "fp_d_distance_atr",
+            "fp_s_valid", "fp_s_zone_id", "fp_s_low", "fp_s_high",
+            "fp_s_strength_score", "fp_s_strength", "fp_s_hold", "fp_s_status",
+            "fp_s_context_state", "fp_s_interacting", "fp_s_waiting_confirmation",
+            "fp_s_breach_pending", "fp_s_event_type", "fp_s_event_score", "fp_s_distance_atr",
+            "raw_json",
         ],
     }
 
@@ -258,6 +273,10 @@ def _persist_scan_memory(
         "open_trade_ids": [str(x.get("trade_id", "")) for x in open_trades if str(x.get("trade_id", "")).strip()],
     }
 
+    previous_compact = _load_json_object(previous.get("market_state_json", ""))
+    analysis = analyze_market(evidence, previous_compact, open_trades=open_trades)
+    evidence["analysis"] = analysis
+
     # Fingerprint the exact inputs in memory, but do not write that huge payload
     # into a Sheet cell. This preserves accurate change detection without storage
     # bloat.
@@ -269,22 +288,21 @@ def _persist_scan_memory(
     }
     fingerprint = hashlib.sha256(_json_dumps(fingerprint_payload).encode("utf-8")).hexdigest()
 
-    previous_compact = _load_json_object(previous.get("market_state_json", ""))
     state_row = {
         "status": "ACTIVE",
         "scan_id": scan_id,
         "previous_scan_id": str(previous.get("scan_id", "") or ""),
         "input_fingerprint": fingerprint,
         "mode": mode,
-        # Intentionally blank until the actual reasoning engine is added.
-        "action": "",
-        "thesis": "",
+        "action": str(analysis.get("posture", "") or ""),
+        "thesis": " ".join(analysis.get("lines", [])[:3]),
         "market_state_json": _json_dumps(evidence),
         "previous_state_json": _json_dumps(previous_compact) if previous_compact else "",
         "metadata_json": _json_dumps({
             "open_trade_count": len(open_trades),
             "memory_schema": "SBMEM2_COMPACT",
             "bridge_version": SUPERBRAIN_BRIDGE_VERSION,
+            "reasoner_version": REASONER_VERSION,
             "tv_source_count": len(tv_compact),
         }),
         "updated_at": now,
@@ -297,6 +315,7 @@ def _persist_scan_memory(
         "had_previous_state": bool(previous),
         "prior_state": prior_row or previous,
         "input_fingerprint": fingerprint,
+        "analysis": analysis,
     }
 
 
@@ -378,6 +397,7 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
             "odme_error": odme_error,
             "open_trades": open_trades,
             "memory": memory,
+            "analysis": memory.get("analysis", {}),
             "superbrain_build": SUPERBRAIN_BRIDGE_VERSION,
         }
     except Exception as exc:

@@ -12,7 +12,7 @@ from data_store import get_store, make_key, make_snapshot_id, parse_previous_sum
 from odme_config import APP_NAME, REFRESH_INTERVAL_SECONDS, SUPPORTED_INSTRUMENTS
 from odme_engine import analyze_odme, reconstruct_saved_result
 from scan_service import run_odme_scan
-from superbrain_bridge import build_instrument_map, prepare_superbrain_scan
+from superbrain_bridge import build_instrument_map, prepare_superbrain_scan, SUPERBRAIN_BRIDGE_VERSION
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
@@ -101,6 +101,7 @@ def render_public_superbrain() -> None:
     an exact instrument-column match; there is no manual alias registry.
     """
     st.subheader("Ask SuperBrain")
+    st.caption(f"Core build: {SUPERBRAIN_BRIDGE_VERSION}")
     try:
         store = get_store()
     except Exception as exc:
@@ -154,6 +155,22 @@ def render_public_superbrain() -> None:
         st.success(f"{instrument}: {sources} are ready. SuperBrain is operating in TV-only mode for this scan.")
         if packet.get("odme_error"):
             st.warning(f"ODME refresh was not usable, so this scan stayed TV-only: {packet.get('odme_error')}")
+
+    analysis = packet.get("analysis", {}) or {}
+    if analysis:
+        posture = str(analysis.get("posture", "WAIT") or "WAIT")
+        if posture == "LONG_ELIGIBLE":
+            st.success("SuperBrain posture: LONG setup eligible")
+        elif posture == "SHORT_ELIGIBLE":
+            st.success("SuperBrain posture: SHORT setup eligible")
+        elif posture == "NO_TRADE":
+            st.error("SuperBrain posture: NO TRADE")
+        else:
+            st.warning("SuperBrain posture: WAIT")
+
+        st.markdown("#### Market view")
+        for line in analysis.get("lines", []) or []:
+            st.markdown(f"- {line}")
 
     memory = packet.get("memory", {}) or {}
     open_trades = packet.get("open_trades", []) or []
