@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
-REASONER_VERSION = "SB3.4_FINAL_MARKET_ACTION_ODME_THETA"
+REASONER_VERSION = "SB3.5_FINAL_POLISH_LIVE_TEST"
 
 
 def _s(v: Any) -> str:
@@ -1081,7 +1081,7 @@ def analyze_market(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], 
 # and one concise trader-language narrative. No Pine formula is recreated here.
 
 _analyze_market_sb32 = analyze_market
-REASONER_VERSION = "SB3.4_FINAL_MARKET_ACTION_ODME_THETA"
+REASONER_VERSION = "SB3.5_FINAL_POLISH_LIVE_TEST"
 
 
 def _json_obj(value: Any) -> Dict[str, Any]:
@@ -1536,7 +1536,7 @@ def _narrative(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, A
         sent = f"SuperBrain is taking this exposure now: {action} at spot {_fmt(price)}."
         sent += " The cleaner entry was slightly earlier, but the setup remains valid now; this is late-but-still-valid rather than a chase." if plan.get("late") else " The current scan satisfies the entry conditions."
         if plan.get("reason"):
-            sent += " " + _s(plan.get("reason")).capitalize() + "."
+            sent += " " + _sentence_case(plan.get("reason")) + "."
         if plan.get("target") is not None: sent += f" The first objective is around {_fmt(plan.get('target'))}."
         if plan.get("invalidation") is not None: sent += f" The thesis is invalidated around {_fmt(plan.get('invalidation'))} or by confirmed acceptance beyond the relevant decision area."
         if plan.get("expected_eta"): sent += " " + _s(plan.get("expected_eta"))
@@ -1558,7 +1558,7 @@ def _narrative(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, A
     waits = [str(x).strip() for x in (base.get("waiting_for", []) or []) if str(x).strip()]
     sent = "No SuperBrain exposure is taken on this scan."
     if plan.get("reason"):
-        sent += " " + _s(plan.get("reason")).capitalize() + "."
+        sent += " " + _sentence_case(plan.get("reason")) + "."
         if plan.get("pullback_low") is not None and plan.get("pullback_high") is not None and _u(plan.get("direction")) in {"BULLISH", "BEARISH"}:
             sent += f" Prefer a pullback toward {_fmt(plan.get('pullback_low'))}–{_fmt(plan.get('pullback_high'))} only if short-term pressure stays aligned and momentum is {_reentry_phrase(_u(plan.get('direction')))}."
     elif waits:
@@ -1575,5 +1575,488 @@ def analyze_market(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], 
     if not plan: plan = {"kind": "NONE", "action": "WAIT"}
     base["reasoner_version"] = REASONER_VERSION
     base["trade_plan"] = plan
+    base["narrative"] = _narrative(base, evidence, plan)
+    return base
+
+
+# =============================================================================
+# SB3.5 final polish overrides
+# =============================================================================
+# The market-state and trade rules above remain authority. These overrides only
+# refine common-candle freshness, liquidity-aware execution, readable narrative,
+# view labels, and follow-on exposure wording for live testing.
+
+_market_lines_sb34 = _market_lines
+_candidate_levels_sb34 = _candidate_levels
+_new_entry_plan_sb34 = _new_entry_plan
+_manage_existing_sb34 = _manage_existing
+
+
+def _tf_minutes(tf: Any) -> Optional[int]:
+    s = _u(tf)
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except Exception:
+        pass
+    if s.endswith("H"):
+        try:
+            return int(float(s[:-1]) * 60)
+        except Exception:
+            return None
+    if s in {"D", "1D"}:
+        return 1440
+    if s in {"W", "1W"}:
+        return 10080
+    return None
+
+
+def _source_close_dt(source: str, row: Dict[str, Any]) -> Optional[datetime]:
+    raw = row.get("bar_time") or row.get("updated_at")
+    dt = _dt_from_any(raw)
+    if dt is None:
+        return None
+    # STRUCTURE and LIQUIDITY alerts carry Pine `time` (bar open); AURORA and
+    # EDGE carry the confirmed close timestamp. Normalize all four to bar close.
+    if row.get("bar_time") not in (None, "") and _u(source) in {"STRUCTURE", "LIQUIDITY"}:
+        mins = _tf_minutes(row.get("tf"))
+        if mins:
+            dt = dt + timedelta(minutes=mins)
+    return dt
+
+
+def _freshness_line(evidence: Dict[str, Any], current: Dict[str, Dict[str, Any]]) -> str:
+    refs: List[Tuple[str, datetime, Optional[float]]] = []
+    for src in ("AURORA", "EDGE", "STRUCTURE", "LIQUIDITY"):
+        row = current.get(src, {}) or {}
+        if not row:
+            continue
+        dt = _source_close_dt(src, row)
+        if dt is not None:
+            refs.append((src, dt, _f(row.get("close"))))
+    if not refs:
+        return f"Basis latest confirmed market conditions — scan {_clock(evidence.get('scanned_at'))} SGT."
+
+    # Earliest normalized close is the newest candle confirmed by every live
+    # source, avoiding a display that mixes 07:45 and 07:30 for the same market.
+    ref_dt = min(x[1] for x in refs)
+    price = None
+    for pref in ("EDGE", "AURORA", "STRUCTURE", "LIQUIDITY"):
+        for src, dt, close in refs:
+            if src == pref and abs((dt - ref_dt).total_seconds()) < 1 and close is not None:
+                price = close
+                break
+        if price is not None:
+            break
+    if price is None:
+        for pref in ("EDGE", "AURORA", "STRUCTURE", "LIQUIDITY"):
+            row = current.get(pref, {}) or {}
+            price = _f(row.get("close"))
+            if price is not None:
+                break
+    px = f" | Latest price {_fmt(price)}" if price is not None else ""
+    return f"Basis latest confirmed market conditions — {ref_dt.strftime('%H:%M')} SGT candle close{px}."
+
+
+def _option_note(evidence: Dict[str, Any]) -> str:
+    # Availability is already shown beside the instrument selector in the UI.
+    return ""
+
+
+def _liquidity_commentary(price: Optional[float], liquidity: Dict[str, Any], exec_dir: str, posture: str) -> List[str]:
+    out: List[str] = []
+    event = _u(liquidity.get("event"))
+    lvl = _f(liquidity.get("level"))
+    if event and lvl is not None:
+        if event.startswith("BUY_") and event.endswith("_RUN"):
+            out.append(f"Recent upside liquidity around {_fmt(lvl)} was cleared and price held above it, so that pool has been run rather than left unfinished.")
+        elif event.startswith("BUY_") and event.endswith("_SWEEP"):
+            out.append(f"Recent upside liquidity around {_fmt(lvl)} was swept and reclaimed back below, showing rejection after the liquidity grab.")
+        elif event.startswith("SELL_") and event.endswith("_RUN"):
+            out.append(f"Recent downside liquidity around {_fmt(lvl)} was cleared and price held below it, so that pool has been run rather than left unfinished.")
+        elif event.startswith("SELL_") and event.endswith("_SWEEP"):
+            out.append(f"Recent downside liquidity around {_fmt(lvl)} was swept and reclaimed back above, showing rejection after the liquidity grab.")
+
+    above = _f(liquidity.get("above_level")); below = _f(liquidity.get("below_level"))
+    has_above = above is not None and price is not None and above > price
+    has_below = below is not None and price is not None and below < price
+    short_context = posture == "SHORT_ELIGIBLE" or exec_dir == "BEARISH"
+    long_context = posture == "LONG_ELIGIBLE" or exec_dir == "BULLISH"
+    if short_context:
+        bits = []
+        if has_above:
+            bits.append(f"unfinished liquidity above around {_fmt(above)} is a threat to an early short and should be cleared or reclaimed before a fresh short is taken if it lies inside the trade's risk area")
+        if has_below:
+            bits.append(f"liquidity below around {_fmt(below)} is a natural downside magnet if bearish conditions activate")
+        if bits:
+            
+            if len(bits) > 1:
+                first = bits[0][0].upper() + bits[0][1:]
+                second = bits[1]
+                out.append(first + ". At the same time, " + second + ".")
+            else:
+                sentence = bits[0]
+                out.append(sentence[0].upper() + sentence[1:] + ".")
+    elif long_context:
+        bits = []
+        if has_below:
+            bits.append(f"unfinished liquidity below around {_fmt(below)} is a threat to an early long and should be cleared or reclaimed before a fresh long is taken if it lies inside the trade's risk area")
+        if has_above:
+            bits.append(f"liquidity above around {_fmt(above)} is a natural upside magnet if bullish conditions activate")
+        if bits:
+            
+            if len(bits) > 1:
+                first = bits[0][0].upper() + bits[0][1:]
+                second = bits[1]
+                out.append(first + ". At the same time, " + second + ".")
+            else:
+                sentence = bits[0]
+                out.append(sentence[0].upper() + sentence[1:] + ".")
+    else:
+        bits = []
+        if has_above: bits.append(f"liquidity remains above around {_fmt(above)}")
+        if has_below: bits.append(f"liquidity remains below around {_fmt(below)}")
+        if bits:
+            out.append("Unfinished " + " and ".join(bits) + "; these levels can attract price before the next directional move is cleanly established.")
+    return out
+
+
+def _market_lines(
+    price: Optional[float], macro: str, defender: Dict[str, Any], challenger: Dict[str, Any], battlefield_half: str,
+    aurora: Dict[str, str], aurora_transition: str, exec_dir: str, fork: Dict[str, Any], liquidity: Dict[str, Any],
+    poi: Optional[Dict[str, Any]], hurdles: List[Dict[str, Any]], odme: Dict[str, Any], posture: str,
+) -> List[str]:
+    lines: List[str] = []
+    if _zone_valid(defender):
+        z = f"{_fmt(defender['low'])}–{_fmt(defender['high'])}"
+        noun = "support" if defender.get("side") == "DEMAND" else "resistance"
+        if defender.get("transition") in {"HELD_AND_REJECTED", "MOVING_AWAY"}:
+            bg = "support" if defender.get("side") == "DEMAND" else "resistance"
+            lines.append(f"Price has moved away from the major {noun} area at {z}; that earlier location has done its job and now acts as background {bg} for the move rather than a fresh entry location.")
+        elif defender.get("condition") == "UNDER_TEST":
+            lines.append(f"Price is testing the major {noun} area at {z}. The location is still live, but it is under pressure and deserves caution until the reaction is clearer.")
+        elif defender.get("transition") in {"FRESH_CONFIRMED_BREACH", "BREACH_PRESENT_AWAIT_NEXT_EDGE_BAR"}:
+            lines.append(f"The major {noun} area at {z} has been breached. Any setup that depends on that location should be treated cautiously until price reclaims it or a new market structure forms.")
+        elif defender.get("transition") == "ACCEPTED_BEYOND":
+            lines.append(f"Price has remained beyond the former {noun} area at {z} on a later confirmed bar; the old location should no longer be treated as intact.")
+        elif defender.get("transition") == "RECLAIMED":
+            lines.append(f"The major {noun} area at {z} has been reclaimed after a prior breach, improving the location again but not by itself creating an entry.")
+
+    if _zone_valid(challenger):
+        z = f"{_fmt(challenger['low'])}–{_fmt(challenger['high'])}"
+        noun = "resistance" if challenger.get("side") == "SUPPLY" else "support"
+        if challenger.get("condition") == "UNDER_TEST":
+            lines.append(f"Price is now inside the broader {noun} area at {z}; this is an active decision zone rather than a clean continuation area.")
+        elif challenger.get("transition") in {"FRESH_CONFIRMED_CROSS", "CROSS_PRESENT_AWAIT_NEXT_EDGE_BAR"}:
+            lines.append(f"Price has just crossed the broader {noun} area at {z}; the first break is not chased until later price action shows acceptance or reclaim.")
+        elif challenger.get("transition") == "ACCEPTED_BEYOND":
+            lines.append(f"Price has remained beyond the broader {noun} area at {z} on a later confirmed bar, so that barrier is no longer treated as intact.")
+        elif challenger.get("transition") in {"REJECTED", "RECLAIMED", "RECLAIMING_INSIDE"}:
+            lines.append(f"The broader {noun} area at {z} has rejected the attempt through it and remains relevant.")
+        elif battlefield_half == "CHALLENGER_HALF":
+            side = "upper" if challenger.get("side") == "SUPPLY" else "lower"
+            lines.append(f"Price is trading in the {side} part of the current range, with broader {noun} still ahead at {z}. That makes chasing the move less attractive and increases the importance of the next demand/supply reaction.")
+
+    lines.append(_momentum_sentence(aurora_transition, aurora.get("state", ""), exec_dir))
+    lines.extend(_liquidity_commentary(price, liquidity, exec_dir, posture))
+
+    if fork.get("position") == "ABOVE_UPPER_2SD":
+        lines.append("Price is structurally extended above its normal path. Fresh longs here would be stretched; the extension can make overhead supply more relevant, but it does not trigger a short by itself.")
+    elif fork.get("position") == "BELOW_LOWER_2SD":
+        lines.append("Price is structurally extended below its normal path. Fresh shorts here would be stretched; the extension can make lower demand more relevant, but it does not trigger a long by itself.")
+    elif fork.get("reclaimed_2sd"):
+        lines.append("Price has reclaimed back inside an extreme structural boundary, which improves reversal location if the remaining entry conditions also line up.")
+
+    future = None
+    if posture in {"WAIT", "SHORT_ELIGIBLE", "NO_TRADE"}:
+        future = next((h for h in hurdles if h.get("side") == "SUPPLY" and (price is None or h.get("low", 0) >= price)), None)
+    if future is None and posture in {"WAIT", "LONG_ELIGIBLE", "NO_TRADE"}:
+        future = next((h for h in hurdles if h.get("side") == "DEMAND" and (price is None or h.get("high", 0) <= price)), None)
+    if future:
+        z = f"{_fmt(future['low'])}–{_fmt(future['high'])}"
+        side = "supply" if future.get("side") == "SUPPLY" else "demand"
+        parent = " inside the broader opposing decision area" if future.get("parent") == "CHALLENGER" else " inside the major supporting decision area" if future.get("parent") == "DEFENDER" else ""
+        lines.append(f"A qualified {side} pocket is waiting at {z}{parent}. That is a more precise location to watch for the next reaction than chasing price in between levels.")
+
+    lines.extend(_odme_lines(odme))
+    return lines[:12]
+
+
+def _candidate_levels(base: Dict[str, Any], evidence: Dict[str, Any], direction: str) -> Dict[str, Any]:
+    out = dict(_candidate_levels_sb34(base, evidence, direction) or {})
+    price = _f(base.get("price")); liq = base.get("liquidity", {}) or {}
+    if price is None:
+        return out
+    magnet = _f(liq.get("above_level")) if direction == "BULLISH" else _f(liq.get("below_level"))
+    if direction == "BULLISH" and magnet is not None and magnet > price:
+        cur = _f(out.get("target"))
+        if cur is None or magnet < cur:
+            out["target"] = magnet
+    if direction == "BEARISH" and magnet is not None and magnet < price:
+        cur = _f(out.get("target"))
+        if cur is None or magnet > cur:
+            out["target"] = magnet
+    risk = _f(out.get("risk")); target = _f(out.get("target"))
+    out["reward"] = abs(target - price) if target is not None else None
+    out["rr"] = (out["reward"] / risk) if risk and out.get("reward") is not None and risk > 0 else None
+    return out
+
+
+def _adverse_liquidity_threat(base: Dict[str, Any], direction: str, levels: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    price = _f(base.get("price")); liq = base.get("liquidity", {}) or {}
+    if price is None or direction not in {"BULLISH", "BEARISH"}:
+        return {}
+    lv = levels or _candidate_levels(base, {}, direction)
+    inv = _f(lv.get("invalidation")) if isinstance(lv, dict) else None
+    if direction == "BEARISH":
+        level = _f(liq.get("above_level"))
+        if level is not None and level > price and (inv is None or level < inv):
+            return {"side": "ABOVE", "level": level, "reason": f"unfinished upside liquidity around {_fmt(level)} remains inside the short's risk area"}
+    else:
+        level = _f(liq.get("below_level"))
+        if level is not None and level < price and (inv is None or level > inv):
+            return {"side": "BELOW", "level": level, "reason": f"unfinished downside liquidity around {_fmt(level)} remains inside the long's risk area"}
+    return {}
+
+
+def _option_liquidity_threat(base: Dict[str, Any], plan: Dict[str, Any]) -> Dict[str, Any]:
+    price = _f(base.get("price")); liq = base.get("liquidity", {}) or {}; st = _u(plan.get("strategy_type"))
+    legs = plan.get("legs", []) or []
+    if price is None:
+        return {}
+    if st == "SHORT_CE":
+        strike = next((_f(x.get("strike")) for x in legs if _u(x.get("option")) == "CE"), None)
+        above = _f(liq.get("above_level"))
+        if strike is not None and above is not None and above > price and above >= strike:
+            return {"level": above, "reason": f"unfinished upside liquidity around {_fmt(above)} reaches or extends beyond the proposed sold call strike"}
+    if st == "SHORT_PE":
+        strike = next((_f(x.get("strike")) for x in legs if _u(x.get("option")) == "PE"), None)
+        below = _f(liq.get("below_level"))
+        if strike is not None and below is not None and below < price and below <= strike:
+            return {"level": below, "reason": f"unfinished downside liquidity around {_fmt(below)} reaches or extends beyond the proposed sold put strike"}
+    return {}
+
+
+def _new_entry_plan(base: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    plan = dict(_new_entry_plan_sb34(base, evidence) or {})
+    if _u(plan.get("kind")) != "NEW":
+        return plan
+    direction = _u(plan.get("direction")); strategy = _u(plan.get("strategy_type"))
+    if strategy.startswith("FUTURES") and direction in {"BULLISH", "BEARISH"}:
+        threat = _adverse_liquidity_threat(base, direction, plan)
+        if threat:
+            return {
+                "kind": "NONE", "action": "WAIT", "direction": direction,
+                "pullback_low": plan.get("pullback_low"), "pullback_high": plan.get("pullback_high"),
+                "reason": threat["reason"] + "; let that liquidity clear or be swept/reclaimed before taking the fresh directional entry",
+            }
+    if strategy in {"SHORT_CE", "SHORT_PE"}:
+        threat = _option_liquidity_threat(base, plan)
+        if threat:
+            return {"kind": "NONE", "action": "WAIT", "direction": direction, "reason": threat["reason"] + "; the non-arrival entry is deferred until that risk is removed"}
+    return plan
+
+
+def _manage_existing(base: Dict[str, Any], evidence: Dict[str, Any], open_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    plan = dict(_manage_existing_sb34(base, evidence, open_trades) or {})
+    if _u(plan.get("kind")) != "MANAGE":
+        return plan
+    direction = _u(plan.get("direction")); action = _u(plan.get("action")); strategy = _u(plan.get("strategy_type"))
+    if direction in {"BULLISH", "BEARISH"} and strategy.startswith("FUTURES"):
+        levels = _candidate_levels(base, evidence, direction)
+        threat = _adverse_liquidity_threat(base, direction, levels)
+        if threat and action == "ADD":
+            plan.update({"action": "HOLD", "fresh_entry_now": False, "reason": "the existing thesis remains intact, but " + threat["reason"] + "; adding is premature until it clears or is reclaimed"})
+        elif threat and action == "HOLD" and plan.get("fresh_entry_now"):
+            plan["fresh_entry_now"] = False
+            plan["reason"] = _s(plan.get("reason")) + "; however, " + threat["reason"] + ", so a fresh user should wait rather than copy the entry now"
+    return plan
+
+
+def _view_label(base: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    kind = _u(plan.get("kind")); action = _u(plan.get("action")); direction = _u(plan.get("direction"))
+    if kind == "NEW":
+        if direction == "BULLISH": return "LONG"
+        if direction == "BEARISH": return "SHORT"
+        return "WATCH"
+    if kind == "MANAGE":
+        if action == "EXIT": return "WATCH"
+        if direction == "BULLISH": return "LONG"
+        if direction == "BEARISH": return "SHORT"
+        return "WATCH"
+    if plan.get("reason") or base.get("waiting_for"):
+        return "WATCH"
+    return "WAIT"
+
+
+
+
+def _sentence_case(text: Any) -> str:
+    s = _s(text)
+    return s[:1].upper() + s[1:] if s else ""
+
+def _strategy_from_trade_plan(plan: Dict[str, Any]) -> str:
+    st = _u(plan.get("strategy_type")); legs = plan.get("legs", []) or []
+    if st == "FUTURES_LONG": return "long futures exposure"
+    if st == "FUTURES_SHORT": return "short futures exposure"
+    if st == "SHORT_CE":
+        leg = next((x for x in legs if _u(x.get("option")) == "CE"), {})
+        return f"{_fmt(leg.get('strike'))} CE short" if leg else "call short"
+    if st == "SHORT_PE":
+        leg = next((x for x in legs if _u(x.get("option")) == "PE"), {})
+        return f"{_fmt(leg.get('strike'))} PE short" if leg else "put short"
+    if st == "SHORT_STRANGLE":
+        ce = next((x for x in legs if _u(x.get("option")) == "CE"), {})
+        pe = next((x for x in legs if _u(x.get("option")) == "PE"), {})
+        if ce and pe:
+            return f"{_fmt(ce.get('strike'))} CE / {_fmt(pe.get('strike'))} PE short strangle"
+        return "short strangle"
+    return st.lower().replace("_", " ") or "exposure"
+
+
+def _narrative(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    price = _f(base.get("price"))
+    lines = [str(x).strip() for x in (base.get("lines", []) or []) if str(x).strip()]
+    odme_prefixes = ("Options positioning", "The options map", "For non-arrival risk", "Options premium behaviour")
+    market = [x for x in lines if not x.startswith(odme_prefixes)]
+    option_lines = [x for x in lines if x.startswith(odme_prefixes)]
+
+    momentum = [x for x in market if x.startswith("Short-term")]
+    liquidity = [x for x in market if "liquidity" in x.lower()]
+    stretch = [x for x in market if "structurally extended" in x.lower() or "extreme structural boundary" in x.lower()]
+    pocket = [x for x in market if x.startswith("A qualified")]
+    used = set(momentum + liquidity + stretch + pocket)
+    location = [x for x in market if x not in used]
+
+    paragraphs: List[str] = []
+    if location:
+        paragraphs.append(" ".join(location[:2]))
+    if momentum:
+        paragraphs.append(" ".join(momentum[:1]))
+    if liquidity:
+        paragraphs.append(" ".join(liquidity[:2]))
+    if stretch:
+        paragraphs.append(" ".join(stretch[:1]))
+
+    odme = evidence.get("odme", {}) or {}
+    if _s(evidence.get("mode")) == "TV + ODME" and odme:
+        if not option_lines:
+            option_lines = _odme_lines(odme)
+        pa = _s(odme.get("premium_alert"))
+        if pa:
+            pa = pa.replace("Premium alert:", "Options premium behaviour:").strip()
+            if pa not in option_lines:
+                option_lines.append(pa)
+        if option_lines:
+            paragraphs.append(" ".join(option_lines[:3]))
+
+    kind = _u(plan.get("kind"))
+    if kind == "NEW":
+        direction = _u(plan.get("direction")); action_text = _strategy_text(plan)
+        action = f"**SuperBrain is taking this exposure now: {action_text} at spot {_fmt(price)}.**"
+        if plan.get("late"):
+            action += " The cleaner entry developed slightly earlier, but the setup remains valid at the current scan price; this is late-but-still-valid rather than a chase."
+        else:
+            action += " The current scan satisfies the entry conditions."
+        if plan.get("reason"):
+            action += " " + _sentence_case(plan.get("reason")) + "."
+        paragraphs.append(action)
+
+        next_bits: List[str] = []
+        if plan.get("target") is not None:
+            next_bits.append(f"The first objective is around {_fmt(plan.get('target'))}.")
+        if plan.get("invalidation") is not None:
+            next_bits.append(f"The thesis is invalidated around {_fmt(plan.get('invalidation'))} or by confirmed acceptance beyond the relevant decision area.")
+        if plan.get("expected_eta"):
+            next_bits.append(_s(plan.get("expected_eta")))
+        if plan.get("pullback_low") is not None and plan.get("pullback_high") is not None and direction in {"BULLISH", "BEARISH"}:
+            next_bits.append(f"For an add or better re-entry, watch approximately {_fmt(plan.get('pullback_low'))}–{_fmt(plan.get('pullback_high'))}; use it only if the area still holds, short-term pressure remains aligned and momentum is {_reentry_phrase(direction)}.")
+        next_bits.append("Future scans will manage this same SuperBrain exposure as HOLD, ADD, REDUCE or EXIT rather than treating it as a new trade.")
+        paragraphs.append(" ".join(next_bits))
+
+    elif kind == "MANAGE":
+        action = _u(plan.get("action")); direction = _u(plan.get("direction")); strategy = _u(plan.get("strategy_type"))
+        entry = _f(plan.get("entry_reference")); strat_text = _strategy_from_trade_plan(plan)
+        if action == "HOLD":
+            msg = f"**SuperBrain is holding the existing {strat_text}"
+            if entry is not None: msg += f" from spot {_fmt(entry)}"
+            msg += ".** " + _sentence_case(plan.get("reason")) + "."
+        elif action == "ADD":
+            msg = f"**SuperBrain is adding to the existing {strat_text} now at spot {_fmt(price)}.** " + _sentence_case(plan.get("reason")) + "."
+        elif action == "REDUCE":
+            msg = f"**SuperBrain is reducing the existing {strat_text} now.** " + _sentence_case(plan.get("reason")) + "."
+        elif action == "EXIT":
+            msg = f"**SuperBrain is exiting the existing {strat_text} now at spot {_fmt(price)}.** " + _sentence_case(plan.get("reason")) + "."
+        else:
+            msg = f"**SuperBrain action: {action or 'WATCH'}.** " + _sentence_case(plan.get("reason")) + "."
+        paragraphs.append(msg)
+
+        follow: List[str] = []
+        if action not in {"EXIT"}:
+            if plan.get("fresh_entry_now"):
+                follow.append("A new user can still enter on the present scan at the current market level, using the same thesis and invalidation discipline rather than assuming the older entry price.")
+            elif direction in {"BULLISH", "BEARISH"} and strategy.startswith("FUTURES"):
+                lv = _candidate_levels(base, evidence, direction)
+                if lv.get("pullback_low") is not None and lv.get("pullback_high") is not None:
+                    follow.append(f"For a new user, do not chase the existing exposure; wait for a pullback toward {_fmt(lv.get('pullback_low'))}–{_fmt(lv.get('pullback_high'))} and use it only if pressure remains aligned and momentum is {_reentry_phrase(direction)}.")
+            elif strategy == "SHORT_CE":
+                follow.append("For a fresh call sale, wait until call-side protection remains intact and price is not accelerating upward toward the sold strike; rising expansion risk or weakening call-side protection is a reason to stand aside.")
+            elif strategy == "SHORT_PE":
+                follow.append("For a fresh put sale, wait until put-side protection remains intact and price is not accelerating downward toward the sold strike; rising expansion risk or weakening put-side protection is a reason to stand aside.")
+            elif strategy == "SHORT_STRANGLE":
+                follow.append("For a fresh strangle, range containment must still dominate expansion risk and neither side should show active directional acceleration toward the sold strikes.")
+        else:
+            follow.append("No immediate re-entry is assumed after the exit; wait for a fresh qualifying location, continuation setup or renewed non-arrival condition on a later scan.")
+
+        if strategy == "SHORT_CE" and action not in {"EXIT"}:
+            follow.append("Continue to HOLD only while the sold call remains protected; REDUCE if call-side protection shifts higher or expansion risk builds, and EXIT if spot reaches the sold strike or bullish pressure and momentum become actively adverse.")
+        elif strategy == "SHORT_PE" and action not in {"EXIT"}:
+            follow.append("Continue to HOLD only while the sold put remains protected; REDUCE if put-side protection shifts lower or expansion risk builds, and EXIT if spot reaches the sold strike or bearish pressure and momentum become actively adverse.")
+        elif strategy == "SHORT_STRANGLE" and action not in {"EXIT"}:
+            follow.append("Continue to HOLD while range containment remains intact; EXIT if options positioning shifts decisively toward expansion or either side's protection fails.")
+        elif direction in {"BULLISH", "BEARISH"} and action not in {"EXIT"}:
+            inv = _f(plan.get("invalidation"))
+            if inv is not None:
+                follow.append(f"The existing directional thesis remains invalidated around {_fmt(inv)}; additions are allowed only on a qualified pullback with pressure and momentum still aligned.")
+        if follow:
+            paragraphs.append(" ".join(follow))
+
+    else:
+        action = "**No SuperBrain exposure is taken on this scan.**"
+        if plan.get("reason"):
+            action += " " + _sentence_case(plan.get("reason")) + "."
+        paragraphs.append(action)
+        watch: List[str] = []
+        if pocket:
+            watch.extend(pocket[:1])
+        waits = [str(x).strip() for x in (base.get("waiting_for", []) or []) if str(x).strip()]
+        watch.extend(waits[:2])
+        if base.get("view_change"):
+            watch.append(_s(base.get("view_change")))
+        if plan.get("pullback_low") is not None and plan.get("pullback_high") is not None and _u(plan.get("direction")) in {"BULLISH", "BEARISH"}:
+            watch.append(f"A better entry is around {_fmt(plan.get('pullback_low'))}–{_fmt(plan.get('pullback_high'))} only if short-term pressure remains aligned and momentum is {_reentry_phrase(_u(plan.get('direction')))}.")
+        if watch:
+            paragraphs.append(" ".join(watch))
+
+    return "\n\n".join(x for x in paragraphs if x).strip()
+
+
+def analyze_market(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], open_trades: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    base = _analyze_market_sb32(evidence, previous_evidence, open_trades=open_trades)
+    trades = open_trades or []
+    plan = _manage_existing(base, evidence, trades) if trades else _new_entry_plan(base, evidence)
+    if not plan:
+        plan = {"kind": "NONE", "action": "WAIT"}
+    if _u(plan.get("kind")) == "MANAGE":
+        tid = _s(plan.get("trade_id"))
+        t = next((dict(x) for x in trades if _s(x.get("trade_id")) == tid), dict(trades[0]) if trades else {})
+        plan.setdefault("entry_reference", _f(t.get("entry_reference")))
+        plan.setdefault("target", _f(t.get("target")))
+        plan.setdefault("invalidation", _f(t.get("invalidation")))
+        plan.setdefault("legs", _json_list(t.get("legs_json")))
+    base["reasoner_version"] = REASONER_VERSION
+    base["trade_plan"] = plan
+    base["view_label"] = _view_label(base, plan)
     base["narrative"] = _narrative(base, evidence, plan)
     return base

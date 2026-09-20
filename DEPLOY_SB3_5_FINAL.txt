@@ -1,0 +1,68 @@
+SuperBrain SB3.5 — FINAL POLISH / LIVE TEST BUILD
+================================================
+
+Replace these exact runtime files in the GitHub/Streamlit project root:
+- app.py
+- superbrain_bridge.py
+- superbrain_reasoner.py
+
+Do NOT replace data_store.py. Existing persistent-memory storage remains compatible.
+No TradingView alert, webhook, Google Sheet schema or ODME engine change is required.
+
+Internal build/version:
+SB3.5_FINAL_POLISH_LIVE_TEST
+(The public Core build caption is intentionally removed.)
+
+UI polish
+---------
+- Main title is now: EDGE — Execution & Decision Guidance Engine.
+- The separate "Ask SuperBrain" heading and Core build caption are removed; the button remains.
+- The market freshness line uses one normalized common confirmed candle-close time across the four TradingView market feeds and adds the latest common price.
+- The duplicated TV-only/options-unavailable note below the scan result is removed; availability remains beside the instrument selector.
+- The result heading now reads: SuperBrain view — WAIT / WATCH / LONG / SHORT, using the actual current state.
+- The narrative is split into short readable paragraphs rather than one dense block.
+
+Liquidity intelligence
+----------------------
+- The narrative identifies the most recent liquidity RUN or SWEEP/reclaim event when present.
+- It states the nearest unfinished liquidity above and below price and interprets them in context.
+- For a fresh directional short, unfinished liquidity above price is treated as an adverse entry threat when it lies inside the proposed trade's risk area; SuperBrain waits for it to clear or be swept/reclaimed before entering.
+- For a fresh directional long, the mirrored rule applies to unfinished liquidity below price.
+- Liquidity in the intended direction is treated as a useful target magnet; it can become the first objective even when it is a single nearby pool.
+- A directional ADD is suppressed while adverse unfinished liquidity remains inside the risk area.
+- For Short CE / Short PE, a proposed sold strike is rejected if unfinished adverse-side liquidity reaches or extends beyond that strike.
+
+Trade and exposure behaviour
+----------------------------
+- The scan-driven architecture is unchanged: SuperBrain does not invent historical fills or background trades between scans.
+- It can still classify an entry as late-but-still-valid when the cleaner trigger was slightly earlier but current entry quality remains acceptable.
+- When a trade is issued, the narrative clearly says: "SuperBrain is taking this exposure now" and the current scan spot is the recorded entry reference.
+- The same TRADE row is then managed on later scans rather than creating repeated exposures.
+
+Follow-on management wording
+----------------------------
+- HOLD: clearly states the existing exposure and original spot, why the thesis remains intact, whether a new user may still enter now, and what would weaken/exit it.
+- ADD: clearly states that SuperBrain is adding now, the current spot, and the pullback/momentum logic permitting the add.
+- REDUCE: clearly states that SuperBrain is reducing the existing exposure and why conviction has weakened without necessarily invalidating the thesis.
+- EXIT: clearly states that SuperBrain is exiting now and why; no automatic re-entry is assumed.
+- Directional exposures state the invalidation and only permit additions on a qualified pullback with aligned pressure/momentum.
+- Short CE / Short PE management explicitly describes protection, expansion-risk deterioration and sold-strike arrival conditions for HOLD / REDUCE / EXIT.
+- Short strangle management explicitly requires range containment to remain dominant and exits on expansion/protection failure.
+
+ODME / theta intelligence retained
+----------------------------------
+- ODME remains integrated into directional path/hurdles/ETA interpretation as well as option non-arrival logic.
+- SuperBrain automatically checks for directional futures, Short CE, Short PE and Short Strangle opportunities whenever the relevant current inputs are available.
+- Fresh options positioning, walls, safer boundaries, range/expansion state, premium behaviour and current path context remain part of the trade decision.
+
+Validation performed
+--------------------
+- Python syntax compilation passed for app.py, superbrain_bridge.py and superbrain_reasoner.py.
+- BTCUSD-style TV-only narrative test passed: common candle-close display, latest price, no public indicator names, paragraph breaks, recent liquidity event, pending-liquidity threat/magnet language and WATCH state.
+- Liquidity execution tests passed for adverse directional-liquidity gating and option-strike/liquidity protection.
+- Short CE non-arrival and Short Strangle selection tests passed.
+- Existing Short CE HOLD follow-on wording test passed, including fresh-user guidance and REDUCE/EXIT watch conditions.
+
+Next step after deployment
+--------------------------
+Start live testing. Test BTCUSD first, then one ODME-enabled instrument during market hours. No further design change is required before those live checks.

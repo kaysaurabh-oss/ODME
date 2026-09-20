@@ -14,7 +14,7 @@ from odme_engine import analyze_odme, reconstruct_saved_result
 from scan_service import run_odme_scan
 from superbrain_bridge import build_instrument_map, prepare_superbrain_scan, SUPERBRAIN_BRIDGE_VERSION
 
-st.set_page_config(page_title="ODME Angel", layout="wide")
+st.set_page_config(page_title="EDGE", layout="wide")
 
 
 @st.cache_resource(show_spinner=False)
@@ -60,8 +60,8 @@ def init_session() -> None:
 
 def login_page() -> None:
     inject_css()
-    st.title(APP_NAME)
-    st.caption("ODME + TradingView market intelligence terminal")
+    st.title("**EDGE** - **E**xecution & **D**ecision **G**uidance **E**ngine")
+    st.caption("TradingView + options-positioning market intelligence terminal")
 
     render_public_superbrain()
 
@@ -100,8 +100,6 @@ def render_public_superbrain() -> None:
     The instrument list is derived only from TV_TEST_CURRENT. ODME attachment is
     an exact instrument-column match; there is no manual alias registry.
     """
-    st.subheader("Ask SuperBrain")
-    st.caption(f"Core build: {SUPERBRAIN_BRIDGE_VERSION}")
     try:
         store = get_store()
     except Exception as exc:
@@ -155,10 +153,8 @@ def render_public_superbrain() -> None:
     if analysis:
         if analysis.get("freshness_line"):
             st.caption(str(analysis.get("freshness_line")))
-        if analysis.get("option_note"):
-            st.caption(str(analysis.get("option_note")))
-
-        st.markdown("#### SuperBrain view")
+        view_label = str(analysis.get("view_label", "WAIT") or "WAIT").upper()
+        st.markdown(f"#### SuperBrain view — {view_label}")
         narrative = str(analysis.get("narrative", "") or "").strip()
         if narrative:
             st.markdown(narrative)
@@ -703,7 +699,7 @@ def style_chain_table(df: pd.DataFrame, result: Dict[str, Any]):
 def app_header(store) -> None:
     left, right = st.columns([3, 1])
     with left:
-        st.title(APP_NAME)
+        st.title("**EDGE** - **E**xecution & **D**ecision **G**uidance **E**ngine")
         st.caption("Live Angel option-chain read → compact ODME summary saved to Google Sheets.")
     with right:
         if st.button("Logout"):
