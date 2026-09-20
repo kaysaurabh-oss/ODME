@@ -521,3 +521,299 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
             f"{SUPERBRAIN_BRIDGE_VERSION} [{stage}] {type(exc).__name__}: {exc}"
         ) from exc
 
+
+# ============================================================================
+# SB3.7 campaign / expression management overrides
+# ============================================================================
+SUPERBRAIN_BRIDGE_VERSION = "SB3.7_CAMPAIGN_EXPRESSION_MANAGER"
+
+_compact_live_odme_sb36 = _compact_live_odme
+_apply_trade_plan_sb36 = _apply_trade_plan
+
+
+def _load_json_list(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, list):
+        return [dict(x) for x in value if isinstance(x, dict)]
+    try:
+        parsed = json.loads(str(value or ""))
+        return [dict(x) for x in parsed if isinstance(x, dict)] if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
+
+def _compact_live_odme(result: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
+    """SB3.7: retain the exact nearest live option strike for defined-risk expression.
+
+    This does not change ODME or its Sheet schema.  It only carries a tiny live
+    ATM snapshot into the SuperBrain evidence packet when ODME already returned
+    the option-chain key_strikes map.
+    """
+    out = dict(_compact_live_odme_sb36(result, meta) or {})
+    try:
+        spot = float(result.get("spot") or result.get("future_ltp"))
+    except Exception:
+        spot = None
+    keys = result.get("key_strikes", {}) or {}
+    if spot is not None and isinstance(keys, dict) and keys:
+        candidates: List[Dict[str, Any]] = []
+        for raw_key, raw_row in keys.items():
+            row = raw_row if isinstance(raw_row, dict) else {}
+            try:
+                strike = float(row.get("strike", raw_key))
+            except Exception:
+                continue
+            candidates.append({"strike": strike, "row": row})
+        if candidates:
+            nearest = min(candidates, key=lambda x: abs(x["strike"] - spot))
+            row = nearest["row"]
+            out["atm_strike"] = nearest["strike"]
+            for src, dst in (("ce_ltp", "atm_ce_ltp"), ("pe_ltp", "atm_pe_ltp")):
+                try:
+                    value = float(row.get(src, 0) or 0)
+                except Exception:
+                    value = 0.0
+                if value > 0:
+                    out[dst] = value
+    return out
+
+
+def _campaign_leg_label(leg: Dict[str, Any]) -> str:
+    side = str(leg.get("side", "") or "").upper()
+    option = str(leg.get("option", "") or "").upper()
+    kind = str(leg.get("instrument_type", "") or "").upper()
+    strike = leg.get("strike", "")
+    if option in {"CE", "PE"}:
+        try:
+            strike_text = str(int(round(float(strike))))
+        except Exception:
+            strike_text = str(strike or "ATM")
+        return f"{side} {strike_text} {option}".strip()
+    if kind == "FUTURES" or str(leg.get("contract", "") or "").upper() == "FUTURES":
+        return f"{side} FUTURES".strip()
+    return f"{side} {kind}".strip()
+
+
+def _normalise_campaign_legs(trade: Dict[str, Any], now: str) -> List[Dict[str, Any]]:
+    trade_id = str(trade.get("trade_id", "") or "")
+    legs = _load_json_list(trade.get("legs_json"))
+    strategy = str(trade.get("strategy_type", "") or "").upper()
+    direction = str(trade.get("direction", "") or "").upper()
+    if not legs and strategy in {"FUTURES_LONG", "FUTURES_SHORT"}:
+        legs = [{
+            "side": "BUY" if strategy == "FUTURES_LONG" else "SELL",
+            "instrument_type": "FUTURES",
+            "contract": "FUTURES",
+            "role": "PRIMARY",
+            "status": "ACTIVE",
+            "entry_reference": trade.get("entry_reference", ""),
+        }]
+    out: List[Dict[str, Any]] = []
+    for idx, raw in enumerate(legs):
+        leg = dict(raw)
+        if not leg.get("leg_id"):
+            suffix = hashlib.sha1(f"{trade_id}|{idx}|{_campaign_leg_label(leg)}".encode("utf-8")).hexdigest()[:8].upper()
+            leg["leg_id"] = f"LEG-{suffix}"
+        leg.setdefault("status", "ACTIVE")
+        leg.setdefault("role", "PRIMARY" if idx == 0 else "INCOME")
+        if not leg.get("instrument_type"):
+            leg["instrument_type"] = "OPTION" if str(leg.get("option", "") or "").upper() in {"CE", "PE"} else "FUTURES"
+        leg.setdefault("opened_at", str(trade.get("created_at", "") or now))
+        leg.setdefault("entry_reference", trade.get("entry_reference", ""))
+        if direction:
+            leg.setdefault("campaign_direction", direction)
+        out.append(leg)
+    return out
+
+
+def _decorate_new_leg(raw: Dict[str, Any], now: str, entry_reference: Any, role: str = "PRIMARY") -> Dict[str, Any]:
+    leg = dict(raw or {})
+    leg.setdefault("leg_id", f"LEG-{uuid.uuid4().hex[:10].upper()}")
+    leg.setdefault("status", "ACTIVE")
+    leg.setdefault("role", role)
+    if not leg.get("instrument_type"):
+        leg["instrument_type"] = "OPTION" if str(leg.get("option", "") or "").upper() in {"CE", "PE"} else "FUTURES"
+    leg.setdefault("opened_at", now)
+    leg.setdefault("entry_reference", entry_reference)
+    return leg
+
+
+def _campaign_event(event_type: str, now: str, scan_id: str, reason: str, before: List[Dict[str, Any]], after: List[Dict[str, Any]], extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    before_active = [_campaign_leg_label(x) for x in before if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"]
+    after_active = [_campaign_leg_label(x) for x in after if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"]
+    event = {
+        "ts": now,
+        "scan_id": scan_id,
+        "event": event_type,
+        "reason": reason,
+        "before": before_active,
+        "after": after_active,
+        "closed_legs": [x for x in before_active if x not in after_active],
+        "opened_legs": [x for x in after_active if x not in before_active],
+    }
+    if extra:
+        event.update(extra)
+    return event
+
+
+def _apply_trade_plan(store: BaseStore, instrument: str, mode: str, scan_id: str, analysis: Dict[str, Any], open_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """SB3.7 campaign persistence.
+
+    One TRADE row is the campaign header.  Multiple coordinated expressions are
+    kept as legs in legs_json.  metadata_json contains a bounded campaign event
+    ledger.  No broker execution is performed here.
+    """
+    plan = analysis.get("trade_plan", {}) or {}
+    kind = str(plan.get("kind", "") or "").upper()
+    if kind not in {"NEW", "MANAGE"}:
+        return {}
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+    if kind == "NEW":
+        trade_id = str(plan.get("trade_id", "") or f"SB-{uuid.uuid4().hex[:12].upper()}")
+        strategy = str(plan.get("strategy_type", "") or "").upper()
+        raw_legs = [dict(x) for x in (plan.get("legs", []) or []) if isinstance(x, dict)]
+        if not raw_legs and strategy in {"FUTURES_LONG", "FUTURES_SHORT"}:
+            raw_legs = [{"side": "BUY" if strategy == "FUTURES_LONG" else "SELL", "instrument_type": "FUTURES", "contract": "FUTURES"}]
+        legs = [_decorate_new_leg(x, now, plan.get("entry_reference", ""), "PRIMARY" if i == 0 else "INCOME") for i, x in enumerate(raw_legs)]
+        event = _campaign_event("OPEN_CAMPAIGN", now, scan_id, str(plan.get("reason", "") or ""), [], legs, {"expression": strategy})
+        metadata = {
+            "campaign_schema": "SB_CAMPAIGN1",
+            "campaign_thesis": plan.get("reason", ""),
+            "current_expression": strategy,
+            "entry_quality": plan.get("entry_quality", ""),
+            "late": bool(plan.get("late")),
+            "pullback_low": plan.get("pullback_low", ""),
+            "pullback_high": plan.get("pullback_high", ""),
+            "reasoner_version": analysis.get("reasoner_version", ""),
+            "last_management_reason": plan.get("reason", ""),
+            "campaign_events": [event],
+        }
+        trade = {
+            "instrument": instrument,
+            "trade_id": trade_id,
+            "status": "ACTIVE",
+            "strategy_type": strategy,
+            "direction": plan.get("direction", ""),
+            "scan_id": scan_id,
+            "mode": mode,
+            "action": "ENTER",
+            "thesis": plan.get("reason", ""),
+            "entry_reference": plan.get("entry_reference", ""),
+            "target": plan.get("target", ""),
+            "invalidation": plan.get("invalidation", ""),
+            "expected_eta": plan.get("expected_eta", ""),
+            "risk": plan.get("risk", ""),
+            "reward": plan.get("reward", ""),
+            "rr": plan.get("rr", ""),
+            "legs_json": _json_dumps(legs),
+            "market_state_json": _json_dumps({"entry_scan_id": scan_id, "entry_price": plan.get("entry_reference", ""), "entry_quality": plan.get("entry_quality", ""), "posture": analysis.get("posture", "")}),
+            "metadata_json": _json_dumps(metadata),
+            "created_at": now,
+            "updated_at": now,
+        }
+        saved = store.upsert_superbrain_trade(trade)
+    else:
+        trade_id = str(plan.get("trade_id", "") or "")
+        existing = next((dict(x) for x in open_trades if str(x.get("trade_id", "")) == trade_id), {})
+        if not existing:
+            return {}
+        trade = dict(existing)
+        metadata = _load_json_object(trade.get("metadata_json", ""))
+        events = metadata.get("campaign_events") if isinstance(metadata.get("campaign_events"), list) else []
+        before = _normalise_campaign_legs(trade, now)
+        legs = [dict(x) for x in before]
+        operation = str(plan.get("campaign_operation", "") or "").upper()
+        action = str(plan.get("action", "HOLD") or "HOLD").upper()
+        status = str(plan.get("status", "ACTIVE") or "ACTIVE").upper()
+        reason = str(plan.get("reason", "") or "")
+
+        close_ids = {str(x) for x in (plan.get("close_leg_ids", []) or []) if str(x)}
+        close_options = {str(x).upper() for x in (plan.get("close_option_sides", []) or []) if str(x)}
+        if action == "EXIT" and not operation:
+            operation = "EXIT_CAMPAIGN"
+        if operation == "EXIT_CAMPAIGN":
+            close_ids.update(str(x.get("leg_id", "")) for x in legs if str(x.get("status", "ACTIVE")).upper() == "ACTIVE")
+        if operation == "ROTATE" and not close_ids:
+            close_ids.update(str(x.get("leg_id", "")) for x in legs if str(x.get("status", "ACTIVE")).upper() == "ACTIVE" and str(x.get("role", "PRIMARY")).upper() in {"PRIMARY", "EXPRESSION"})
+
+        for leg in legs:
+            active = str(leg.get("status", "ACTIVE")).upper() == "ACTIVE"
+            option = str(leg.get("option", "") or "").upper()
+            if active and (str(leg.get("leg_id", "")) in close_ids or (option and option in close_options)):
+                leg["status"] = "CLOSED"
+                leg["closed_at"] = now
+                leg["close_reason"] = reason
+
+        new_raw = plan.get("new_legs", []) or []
+        role = "ADD" if operation == "ADD_LEG" else "PRIMARY"
+        for raw in new_raw:
+            if isinstance(raw, dict):
+                legs.append(_decorate_new_leg(raw, now, plan.get("entry_reference", analysis.get("price", "")), role))
+
+        next_strategy = str(plan.get("next_strategy_type", "") or plan.get("strategy_type", "") or trade.get("strategy_type", "")).upper()
+        next_direction = str(plan.get("direction", "") or trade.get("direction", "")).upper()
+        if operation in {"ROTATE", "TRANSFORM", "ADD_LEG", "CLOSE_LEG"} and next_strategy:
+            trade["strategy_type"] = next_strategy
+        if next_direction:
+            trade["direction"] = next_direction
+
+        active_after = [x for x in legs if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"]
+        if not active_after and operation == "EXIT_CAMPAIGN":
+            status = str(plan.get("status", "CLOSED") or "CLOSED").upper()
+        elif active_after:
+            status = "ACTIVE"
+
+        event_type = operation or ({"HOLD": "HOLD_CAMPAIGN", "ADD": "ADD_EXPOSURE", "REDUCE": "REDUCE_EXPOSURE", "EXIT": "EXIT_CAMPAIGN"}.get(action, action or "MANAGE"))
+        material_event = event_type not in {"HOLD_CAMPAIGN", "ADOPT"} or metadata.get("campaign_schema") != "SB_CAMPAIGN1"
+        if material_event or event_type == "ADOPT":
+            events.append(_campaign_event(event_type, now, scan_id, reason, before, legs, {
+                "from_expression": str(existing.get("strategy_type", "") or "").upper(),
+                "to_expression": next_strategy,
+            }))
+            events = events[-40:]
+
+        # Bound leg history so long-lived campaigns stay below the existing
+        # per-cell persistence guard. The event ledger preserves the chronology.
+        active_kept = [x for x in legs if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"]
+        closed_kept = [x for x in legs if str(x.get("status", "ACTIVE")).upper() == "CLOSED"][-20:]
+        legs = active_kept + closed_kept
+
+        metadata.update({
+            "campaign_schema": "SB_CAMPAIGN1",
+            "campaign_thesis": metadata.get("campaign_thesis") or existing.get("thesis", ""),
+            "current_expression": next_strategy,
+            "last_management_reason": reason,
+            "last_campaign_operation": event_type,
+            "reasoner_version": analysis.get("reasoner_version", ""),
+            "campaign_events": events,
+        })
+        trade.update({
+            "instrument": instrument,
+            "trade_id": trade_id,
+            "status": status,
+            "scan_id": scan_id,
+            "mode": mode,
+            "action": action,
+            "updated_at": now,
+            "legs_json": _json_dumps(legs),
+            "metadata_json": _json_dumps(metadata),
+        })
+        # Preserve the campaign thesis.  Management reasons live in metadata/event ledger.
+        if not str(trade.get("thesis", "") or "").strip():
+            trade["thesis"] = metadata.get("campaign_thesis", "")
+        if action == "EXIT" or operation == "EXIT_CAMPAIGN":
+            trade["close_reason"] = reason
+        saved = store.upsert_superbrain_trade(trade)
+
+    saved_legs = _load_json_list(saved.get("legs_json", ""))
+    analysis["recorded_exposure"] = {
+        "trade_id": saved.get("trade_id", ""),
+        "status": saved.get("status", ""),
+        "strategy_type": saved.get("strategy_type", ""),
+        "direction": saved.get("direction", ""),
+        "action": saved.get("action", ""),
+        "campaign_operation": plan.get("campaign_operation", ""),
+        "active_legs": [_campaign_leg_label(x) for x in saved_legs if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"],
+    }
+    plan["trade_id"] = saved.get("trade_id", "")
+    return saved

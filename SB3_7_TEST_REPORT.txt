@@ -1,0 +1,15 @@
+SB3.7 targeted validation: PASS
+
+- reasoner compile: PASS
+- bridge compile: PASS
+- LONG_CE fast-expansion expression test: PASS
+- SHORT_PE range/non-arrival expression test: PASS
+- legacy SB3.6 campaign adoption without forced switch: PASS
+- futures deterioration -> short PE rotation: PASS
+- strangle -> directional campaign transformation: PASS
+- short premium -> aligned directional expression migration: PASS
+- persistent event ledger closed_legs/opened_legs: PASS
+- original campaign thesis preservation: PASS
+- existing exposure first / market view second wording: PASS
+
+No app.py, data_store.py, TradingView/Pine, webhook, Sheet schema, ODME engine or Telegram code changed.

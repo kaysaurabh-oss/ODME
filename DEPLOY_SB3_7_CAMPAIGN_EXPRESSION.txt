@@ -1,0 +1,102 @@
+SuperBrain SB3.7 — CAMPAIGN / EXPRESSION MANAGER
+================================================
+
+Replace ONLY these runtime files in the GitHub/Streamlit project root:
+- superbrain_reasoner.py
+- superbrain_bridge.py
+
+Do NOT replace or modify:
+- app.py
+- data_store.py
+- TradingView / Pine
+- Apps Script webhook
+- Google Sheet tabs/schema
+- ODME engine
+- Telegram alert project
+
+Internal build/version:
+SB3.7_CAMPAIGN_EXPRESSION_MANAGER
+
+WHAT CHANGED
+------------
+1. One active campaign per underlying
+- The existing TRADE row is now the campaign header.
+- legs_json can hold multiple coordinated futures/options legs.
+- A short strangle is one campaign with two legs, not two separate trades.
+- A later futures/option leg is not blocked merely because another leg is open.
+
+2. Thesis is separated from expression
+Qualified bullish thesis can be expressed as:
+- FUTURES_LONG
+- LONG_CE
+- SHORT_PE
+
+Qualified bearish thesis can be expressed as:
+- FUTURES_SHORT
+- LONG_PE
+- SHORT_CE
+
+Neutral/range containment can remain SHORT_STRANGLE.
+TradingView/Pine remains market-calculation authority. ODME remains the option/path/non-arrival context source.
+
+3. Expression selection
+- Futures remain the default direct directional vehicle.
+- Protected opposite-side short option is preferred when the directional thesis is intact but the option map is range/non-arrival dominant and ODME explicitly permits that sale.
+- Long CE/PE is allowed only on a fast/clean directional expansion when live ODME provides an actual nearest-ATM contract and option premium context is not explicitly rich/blocked.
+- No ATM strike is invented. If live chain evidence is unavailable, SuperBrain falls back to futures/other already-supported expressions.
+
+4. Expression migration during a live campaign
+- The campaign thesis can remain alive while the vehicle changes.
+- Example: bullish FUTURES_LONG deteriorates without thesis invalidation and bullish non-arrival becomes dominant -> close futures leg and rotate the same campaign into SHORT_PE.
+- Example: protected SHORT_PE campaign develops stronger bullish directional expansion -> SuperBrain can rotate to FUTURES_LONG/LONG_CE, or retain a still-safe short PE and add a directional leg when appropriate.
+- Short strangle can transform into a directional campaign by closing the adverse strangle side, retaining the protected side when appropriate, and adding/using the new directional expression.
+- Thesis invalidation still exits; expression migration is not used to hide a broken thesis.
+
+5. Existing SB3.6 live trade compatibility
+- First SB3.7 scan adopts an existing non-terminal SB3.6 trade into campaign/leg memory.
+- No expression rotation is caused purely by the upgrade/adoption scan.
+- Existing SB3.6 invalidation/exit logic remains authoritative.
+- Existing trade_id is retained.
+
+6. Persistent campaign event ledger
+metadata_json now keeps a bounded campaign event ledger containing:
+- event timestamp / scan_id
+- event type (OPEN_CAMPAIGN / ADOPT / ROTATE / TRANSFORM / ADD_LEG / etc.)
+- prior expression / new expression
+- exact closed legs
+- exact opened legs
+- management reason
+
+Example ledger event:
+closed_legs: [BUY FUTURES]
+opened_legs: [SELL 24500 PE]
+from_expression: FUTURES_LONG
+to_expression: SHORT_PE
+
+The original campaign thesis is preserved. Later management reasons are stored separately in the ledger/metadata instead of silently replacing the original thesis.
+
+7. Explanation wording
+When SuperBrain already has exposure, narrative now starts with the exposure and current management action, e.g.:
+"SuperBrain currently has this exposure: long futures. It is closing the current primary expression and rotating the same campaign into 24,500 PE short."
+
+Only after that does it explain the current market view, liquidity/structure/momentum/ODME context and follow-on conditions.
+
+TELEGRAM / LIVE ALERT IMPACT
+----------------------------
+- No Telegram code is changed.
+- Telegram remains a wake-up WATCH system and does not create/manage trades.
+- Installing SB3.7 does not itself create a Telegram alert.
+- SuperBrain campaign/expression changes are recorded in SuperBrain memory when Ask SuperBrain / the scan runs.
+
+VALIDATION
+----------
+Passed:
+- Python syntax compile for superbrain_reasoner.py and superbrain_bridge.py.
+- Fast bullish expansion + live ATM contract -> LONG_CE selection test.
+- Range/non-arrival bullish context -> SHORT_PE selection test.
+- Existing SB3.6 futures trade -> first-scan ADOPT without forced rotation.
+- Subsequent weakened futures behaviour -> FUTURES_LONG to SHORT_PE campaign rotation.
+- Short strangle -> bullish directional campaign transformation.
+- Aligned short-premium campaign -> directional expression rotation instead of blanket campaign closure.
+- Campaign ledger records exact closed/opened legs and preserves original campaign thesis.
+- Existing-exposure narrative appears before market-view narrative.

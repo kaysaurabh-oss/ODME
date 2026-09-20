@@ -2462,3 +2462,525 @@ def _liquidity_commentary(price: Optional[float], liquidity: Dict[str, Any], exe
         if above is not None and price is not None and above > price:
             out.append(f"Liquidity above around {_fmt(above)} is a useful upside magnet if bullish pressure continues.")
     return out
+
+# ============================================================================
+# SB3.7 campaign / expression manager overrides
+# ============================================================================
+REASONER_VERSION = "SB3.7_CAMPAIGN_EXPRESSION_MANAGER"
+
+_new_entry_plan_sb36 = _new_entry_plan
+_manage_existing_sb36 = _manage_existing
+_narrative_sb36 = _narrative
+_material_signature_sb36 = _material_signature
+_analyze_market_sb36 = analyze_market
+
+
+def _campaign_meta(trade: Dict[str, Any]) -> Dict[str, Any]:
+    return _json_obj(trade.get("metadata_json"))
+
+
+def _active_campaign_legs(trade: Dict[str, Any]) -> List[Dict[str, Any]]:
+    legs = _json_list(trade.get("legs_json"))
+    strategy = _u(trade.get("strategy_type"))
+    if not legs and strategy in {"FUTURES_LONG", "FUTURES_SHORT"}:
+        legs = [{
+            "side": "BUY" if strategy == "FUTURES_LONG" else "SELL",
+            "instrument_type": "FUTURES", "contract": "FUTURES",
+            "role": "PRIMARY", "status": "ACTIVE",
+        }]
+    return [dict(x) for x in legs if _u(x.get("status") or "ACTIVE") != "CLOSED"]
+
+
+def _future_leg(direction: str) -> Dict[str, Any]:
+    return {
+        "side": "BUY" if direction == "BULLISH" else "SELL",
+        "instrument_type": "FUTURES", "contract": "FUTURES",
+    }
+
+
+def _atm_option_leg(evidence: Dict[str, Any], direction: str) -> Dict[str, Any]:
+    odme = evidence.get("odme", {}) or {}
+    strike = _f(odme.get("atm_strike"))
+    option = "CE" if direction == "BULLISH" else "PE"
+    premium = _f(odme.get("atm_ce_ltp" if option == "CE" else "atm_pe_ltp"))
+    if strike is None or premium is None or premium <= 0:
+        return {}
+    leg = {
+        "side": "BUY", "instrument_type": "OPTION", "option": option,
+        "strike": strike, "premium": premium,
+    }
+    expiry = _s(odme.get("expiry"))
+    if expiry:
+        leg["expiry"] = expiry
+    return leg
+
+
+def _premium_buy_class(odme: Dict[str, Any]) -> str:
+    text = " ".join([_s(odme.get("premium_alert")), _s(odme.get("commentary"))]).lower()
+    if any(x in text for x in ["very expensive", "too expensive", "avoid option buy", "avoid buying", "premium rich", "overpriced"]):
+        return "BLOCKED"
+    if any(x in text for x in ["cheap option", "cheap premium", "normal option", "normal premium", "defined-risk option", "premium favorable", "premium favourable"]):
+        return "FAVOURABLE"
+    if any(x in text for x in ["expensive option", "expensive premium", "premium elevated"]):
+        return "EXPENSIVE"
+    return "UNKNOWN"
+
+
+def _directional_expression(base: Dict[str, Any], evidence: Dict[str, Any], direction: str, has_location: bool = False) -> Dict[str, Any]:
+    """Select vehicle after the directional thesis is already established."""
+    fallback = "FUTURES_LONG" if direction == "BULLISH" else "FUTURES_SHORT"
+    result = {
+        "strategy_type": fallback,
+        "legs": [_future_leg(direction)],
+        "expression_style": "DIRECTIONAL",
+        "expression_reason": "direct futures exposure is the cleanest available vehicle for the qualified directional thesis",
+    }
+    if _s(evidence.get("mode")) != "TV + ODME":
+        return result
+    odme = evidence.get("odme", {}) or {}
+    if not odme:
+        return result
+
+    rs = _f(odme.get("range_score")) or 0.0
+    es = _f(odme.get("expansion_score")) or 0.0
+    exec_dir = _u(base.get("exec_of"))
+    aur_state = _u((base.get("aurora", {}) or {}).get("state"))
+    active_momentum = (direction == "BULLISH" and aur_state == "GREEN") or (direction == "BEARISH" and aur_state == "RED")
+    eta = _eta_context(evidence, direction, _f(base.get("price")))
+    path = _u(eta.get("path"))
+    fast_path = any(x in path for x in ["SHARP", "FAST", "CLEAN", "DIRECT"])
+    premium_class = _premium_buy_class(odme)
+
+    # Directional but contained / slower: express the thesis as non-arrival on
+    # the opposite option side, only when ODME explicitly permits that sale.
+    if rs >= es + 5.0:
+        opt = _odme_option_strategy(base, evidence, direction, has_location)
+        side = "PE" if direction == "BULLISH" else "CE"
+        if _u(opt.get("strategy_type")) and _sale_action_ok(odme, side):
+            opt["expression_style"] = "NONARRIVAL"
+            opt["expression_reason"] = (
+                f"the {direction.lower()} thesis is intact but the option map is range/non-arrival dominant, "
+                "so the protected opposite-side short option is preferred to full linear futures delta"
+            )
+            return opt
+
+    # Fast, clean expansion: defined-risk convexity is allowed only with a real
+    # live ATM contract from ODME and no explicit rich-premium warning.
+    long_leg = _atm_option_leg(evidence, direction)
+    if (
+        es >= rs + 8.0
+        and exec_dir == direction
+        and active_momentum
+        and fast_path
+        and long_leg
+        and premium_class in {"FAVOURABLE", "UNKNOWN"}
+    ):
+        return {
+            "strategy_type": "LONG_CE" if direction == "BULLISH" else "LONG_PE",
+            "legs": [long_leg],
+            "expression_style": "CONVEXITY",
+            "expression_reason": (
+                f"the {direction.lower()} thesis is in active expansion on a {path.lower() or 'clean'} path, "
+                "so defined-risk ATM option convexity is preferred to linear futures exposure"
+            ),
+        }
+
+    return result
+
+
+def _new_entry_plan(base: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    plan = dict(_new_entry_plan_sb36(base, evidence) or {})
+    if _u(plan.get("kind")) != "NEW":
+        return plan
+    direction = _u(plan.get("direction"))
+    if direction not in {"BULLISH", "BEARISH"}:
+        return plan
+    expr = _directional_expression(base, evidence, direction, bool((base.get("poi", {}) or {}).get("qualified")))
+    plan["strategy_type"] = expr.get("strategy_type", plan.get("strategy_type"))
+    plan["legs"] = expr.get("legs", plan.get("legs", []))
+    plan["expression_style"] = expr.get("expression_style", "")
+    plan["expression_reason"] = expr.get("expression_reason", "")
+    if expr.get("expression_reason"):
+        plan["reason"] = (_s(plan.get("reason")) + "; " + _s(expr.get("expression_reason"))).strip("; ")
+    return plan
+
+
+def _leg_label(leg: Dict[str, Any]) -> str:
+    side = _u(leg.get("side"))
+    option = _u(leg.get("option"))
+    if option in {"CE", "PE"}:
+        return f"{side.lower()} {_fmt(leg.get('strike'))} {option}"
+    kind = _u(leg.get("instrument_type") or leg.get("contract"))
+    if kind == "FUTURES":
+        return "long futures" if side == "BUY" else "short futures"
+    return (side + " " + kind).strip().lower()
+
+
+def _expression_exposure_text(legs: List[Dict[str, Any]]) -> str:
+    labels = [_leg_label(x) for x in legs if _u(x.get("status") or "ACTIVE") != "CLOSED"]
+    return " + ".join(labels) if labels else "recorded campaign exposure"
+
+
+def _leg_ids(legs: List[Dict[str, Any]], *, option: str = "", primary_only: bool = False) -> List[str]:
+    out: List[str] = []
+    for leg in legs:
+        if option and _u(leg.get("option")) != option:
+            continue
+        if primary_only and _u(leg.get("role") or "PRIMARY") not in {"PRIMARY", "EXPRESSION"}:
+            continue
+        leg_id = _s(leg.get("leg_id"))
+        if leg_id:
+            out.append(leg_id)
+    return out
+
+
+def _has_strategy_leg(legs: List[Dict[str, Any]], strategy: str) -> bool:
+    strategy = _u(strategy)
+    for leg in legs:
+        side = _u(leg.get("side")); option = _u(leg.get("option")); kind = _u(leg.get("instrument_type") or leg.get("contract"))
+        if strategy == "FUTURES_LONG" and side == "BUY" and kind == "FUTURES": return True
+        if strategy == "FUTURES_SHORT" and side == "SELL" and kind == "FUTURES": return True
+        if strategy == "SHORT_PE" and side == "SELL" and option == "PE": return True
+        if strategy == "SHORT_CE" and side == "SELL" and option == "CE": return True
+        if strategy == "LONG_CE" and side == "BUY" and option == "CE": return True
+        if strategy == "LONG_PE" and side == "BUY" and option == "PE": return True
+    return False
+
+
+def _supportive_short_leg_safe(base: Dict[str, Any], evidence: Dict[str, Any], direction: str, legs: List[Dict[str, Any]]) -> bool:
+    """Whether an existing opposite-side short option can remain as a campaign leg."""
+    odme = evidence.get("odme", {}) or {}
+    if _s(evidence.get("mode")) != "TV + ODME" or not odme:
+        return False
+    price = _f(base.get("price"))
+    if price is None:
+        return False
+    option = "PE" if direction == "BULLISH" else "CE"
+    sold = next((x for x in legs if _u(x.get("side")) == "SELL" and _u(x.get("option")) == option), None)
+    if not sold:
+        return False
+    strike = _f(sold.get("strike"))
+    if strike is None:
+        return False
+    if direction == "BULLISH" and price <= strike:
+        return False
+    if direction == "BEARISH" and price >= strike:
+        return False
+    exec_dir = _u(base.get("exec_of")); aur = _u((base.get("aurora", {}) or {}).get("state"))
+    if direction == "BULLISH" and exec_dir == "BEARISH" and aur == "RED":
+        return False
+    if direction == "BEARISH" and exec_dir == "BULLISH" and aur == "GREEN":
+        return False
+    safe = _f(odme.get("safer_sell_pe" if option == "PE" else "safer_sell_ce"))
+    if safe is not None:
+        if option == "PE" and safe > strike:
+            # A higher safer PE remains farther from spot for a bullish campaign only
+            # if it is still below price; otherwise protection has deteriorated.
+            if safe >= price:
+                return False
+        if option == "CE" and safe < strike:
+            if safe <= price:
+                return False
+    return True
+
+
+def _manage_existing(base: Dict[str, Any], evidence: Dict[str, Any], open_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not open_trades:
+        return {}
+    trade = dict(open_trades[0])
+    meta = _campaign_meta(trade)
+    current_legs = _active_campaign_legs(trade)
+    base_plan = dict(_manage_existing_sb36(base, evidence, open_trades) or {})
+    if _u(base_plan.get("kind")) != "MANAGE":
+        return base_plan
+
+    base_plan["current_legs"] = current_legs
+    base_plan["legs"] = current_legs
+    base_plan["campaign_operation"] = base_plan.get("campaign_operation", "")
+
+    # Existing SB3.6 invalidation/opposite-thesis exits remain authoritative.
+    if _u(base_plan.get("action")) == "EXIT":
+        direction = _u(trade.get("direction"))
+        posture = _u(base.get("posture"))
+        strategy = _u(trade.get("strategy_type"))
+        reason = _s(base_plan.get("reason")).lower()
+
+        # After the one-time SB3.7 adoption scan, an aligned directional
+        # expansion does not have to kill a short-premium campaign.  The thesis
+        # can survive while its vehicle changes.
+        same_direction_posture = (direction == "BULLISH" and posture == "LONG_ELIGIBLE") or (direction == "BEARISH" and posture == "SHORT_ELIGIBLE")
+        if (
+            meta.get("campaign_schema") == "SB_CAMPAIGN1"
+            and strategy in {"SHORT_PE", "SHORT_CE"}
+            and same_direction_posture
+            and ("expansion" in reason or "arrival risk" in reason)
+            and "strike" not in reason
+            and _u(base.get("exec_of")) == direction
+            and ((direction == "BULLISH" and _u((base.get("aurora", {}) or {}).get("state")) == "GREEN") or (direction == "BEARISH" and _u((base.get("aurora", {}) or {}).get("state")) == "RED"))
+        ):
+            expr = _directional_expression(base, evidence, direction, bool((base.get("poi", {}) or {}).get("qualified")))
+            candidate = _u(expr.get("strategy_type"))
+            if candidate and candidate != strategy:
+                return {
+                    **base_plan,
+                    "action": "REDUCE", "status": "ACTIVE",
+                    "strategy_type": candidate, "next_strategy_type": candidate,
+                    "campaign_operation": "ROTATE",
+                    "close_leg_ids": _leg_ids(current_legs),
+                    "new_legs": list(expr.get("legs", []) or []),
+                    "reason": f"the {direction.lower()} thesis remains valid while the market has shifted from non-arrival into directional expansion; SuperBrain is closing the short-premium expression and rotating the same campaign into {_strategy_from_trade_plan({'strategy_type': candidate, 'legs': expr.get('legs', [])})}",
+                    "fresh_entry_now": False,
+                }
+
+        # A range campaign can evolve into a qualified directional campaign in
+        # the same underlying instead of being blindly terminated and blocked.
+        if strategy == "SHORT_STRANGLE" and posture in {"LONG_ELIGIBLE", "SHORT_ELIGIBLE"} and "strike" not in reason:
+            new_dir = "BULLISH" if posture == "LONG_ELIGIBLE" else "BEARISH"
+            expr = _directional_expression(base, evidence, new_dir, bool((base.get("poi", {}) or {}).get("qualified")))
+            close_opt = "CE" if new_dir == "BULLISH" else "PE"
+            close_ids = _leg_ids(current_legs, option=close_opt)
+            supportive = "PE" if new_dir == "BULLISH" else "CE"
+            keep_supportive = any(_u(x.get("side")) == "SELL" and _u(x.get("option")) == supportive for x in current_legs)
+            new_legs = [] if _has_strategy_leg(current_legs, _u(expr.get("strategy_type"))) else list(expr.get("legs", []) or [])
+            return {
+                **base_plan,
+                "action": "ADD" if new_legs else "REDUCE",
+                "status": "ACTIVE",
+                "direction": new_dir,
+                "strategy_type": expr.get("strategy_type"),
+                "next_strategy_type": expr.get("strategy_type"),
+                "campaign_operation": "TRANSFORM",
+                "close_leg_ids": close_ids,
+                "new_legs": new_legs,
+                "reason": (
+                    f"the neutral campaign has developed into a qualified {new_dir.lower()} thesis; "
+                    f"SuperBrain is closing the adverse {close_opt} side"
+                    + (f", retaining the protected {supportive} short" if keep_supportive else "")
+                    + (f" and adding {_strategy_from_trade_plan({'strategy_type': expr.get('strategy_type'), 'legs': expr.get('legs', [])})}" if new_legs else "")
+                    + " within the same underlying campaign"
+                ),
+                "fresh_entry_now": False,
+            }
+
+        base_plan["campaign_operation"] = "EXIT_CAMPAIGN"
+        base_plan["close_leg_ids"] = _leg_ids(current_legs)
+        return base_plan
+
+    # First scan after upgrading an old SB3.6 trade only adopts the campaign/leg
+    # model.  No expression rotation is caused by the software migration itself.
+    if meta.get("campaign_schema") != "SB_CAMPAIGN1":
+        base_plan["campaign_operation"] = "ADOPT"
+        base_plan["reason"] = _s(base_plan.get("reason"))
+        return base_plan
+
+    direction = _u(trade.get("direction"))
+    strategy = _u(trade.get("strategy_type"))
+    posture = _u(base.get("posture"))
+
+    # Neutral campaign -> directional campaign even when SB3.6 still returned HOLD.
+    if strategy == "SHORT_STRANGLE" and posture in {"LONG_ELIGIBLE", "SHORT_ELIGIBLE"}:
+        new_dir = "BULLISH" if posture == "LONG_ELIGIBLE" else "BEARISH"
+        expr = _directional_expression(base, evidence, new_dir, bool((base.get("poi", {}) or {}).get("qualified")))
+        close_opt = "CE" if new_dir == "BULLISH" else "PE"
+        close_ids = _leg_ids(current_legs, option=close_opt)
+        new_legs = [] if _has_strategy_leg(current_legs, _u(expr.get("strategy_type"))) else list(expr.get("legs", []) or [])
+        return {
+            **base_plan,
+            "action": "ADD" if new_legs else "REDUCE",
+            "status": "ACTIVE",
+            "direction": new_dir,
+            "strategy_type": expr.get("strategy_type"),
+            "next_strategy_type": expr.get("strategy_type"),
+            "campaign_operation": "TRANSFORM",
+            "close_leg_ids": close_ids,
+            "new_legs": new_legs,
+            "reason": f"range containment has given way to a qualified {new_dir.lower()} campaign, so SuperBrain is removing the adverse strangle side and re-expressing the same underlying campaign directionally",
+            "fresh_entry_now": False,
+        }
+
+    if direction not in {"BULLISH", "BEARISH"}:
+        return base_plan
+
+    expr = _directional_expression(base, evidence, direction, bool((base.get("poi", {}) or {}).get("qualified")))
+    candidate = _u(expr.get("strategy_type"))
+    if not candidate or candidate == strategy:
+        return base_plan
+
+    action = _u(base_plan.get("action"))
+    reason_low = _s(base_plan.get("reason")).lower()
+
+    # Existing short premium can remain as a supportive income leg while a new
+    # directional expression is added, provided its sold strike is still safe.
+    if strategy in {"SHORT_PE", "SHORT_CE"} and candidate in {"FUTURES_LONG", "FUTURES_SHORT", "LONG_CE", "LONG_PE"}:
+        if _supportive_short_leg_safe(base, evidence, direction, current_legs):
+            new_legs = [] if _has_strategy_leg(current_legs, candidate) else list(expr.get("legs", []) or [])
+            if new_legs:
+                return {
+                    **base_plan,
+                    "action": "ADD", "status": "ACTIVE",
+                    "strategy_type": candidate, "next_strategy_type": candidate,
+                    "campaign_operation": "ADD_LEG", "new_legs": new_legs,
+                    "reason": (
+                        f"the {direction.lower()} campaign has shifted from non-arrival toward stronger directional expression; "
+                        f"the existing opposite-side short option remains protected, so SuperBrain is retaining it and adding {_strategy_from_trade_plan({'strategy_type': candidate, 'legs': new_legs})} as a new campaign leg"
+                    ),
+                    "fresh_entry_now": False,
+                }
+        # If the short option is no longer a suitable carry leg, rotate it out.
+        return {
+            **base_plan,
+            "action": "REDUCE", "status": "ACTIVE",
+            "strategy_type": candidate, "next_strategy_type": candidate,
+            "campaign_operation": "ROTATE",
+            "close_leg_ids": _leg_ids(current_legs, primary_only=False),
+            "new_legs": list(expr.get("legs", []) or []),
+            "reason": f"the underlying {direction.lower()} thesis remains valid, but the option non-arrival expression is no longer the right vehicle; SuperBrain is closing it and rotating into {_strategy_from_trade_plan({'strategy_type': candidate, 'legs': expr.get('legs', [])})}",
+            "fresh_entry_now": False,
+        }
+
+    # Long options are regime-sensitive.  If expansion/clean-path conditions no
+    # longer justify convexity, rotate the vehicle while preserving the thesis.
+    if strategy in {"LONG_CE", "LONG_PE"}:
+        return {
+            **base_plan,
+            "action": "REDUCE", "status": "ACTIVE",
+            "strategy_type": candidate, "next_strategy_type": candidate,
+            "campaign_operation": "ROTATE",
+            "close_leg_ids": _leg_ids(current_legs, primary_only=False),
+            "new_legs": list(expr.get("legs", []) or []),
+            "reason": f"the {direction.lower()} thesis remains valid but the fast-expansion/convexity conditions have faded; SuperBrain is closing the long option expression and rotating into {_strategy_from_trade_plan({'strategy_type': candidate, 'legs': expr.get('legs', [])})}",
+            "fresh_entry_now": False,
+        }
+
+    # Futures are not switched merely because another vehicle scores slightly
+    # better.  Rotation is reserved for actual deterioration/failure-to-perform
+    # already recognized by the existing SB3.6 management layer.
+    if strategy in {"FUTURES_LONG", "FUTURES_SHORT"} and action == "REDUCE" and candidate in {"SHORT_PE", "SHORT_CE"}:
+        return {
+            **base_plan,
+            "action": "REDUCE", "status": "ACTIVE",
+            "strategy_type": candidate, "next_strategy_type": candidate,
+            "campaign_operation": "ROTATE",
+            "close_leg_ids": _leg_ids(current_legs, primary_only=False),
+            "new_legs": list(expr.get("legs", []) or []),
+            "reason": (
+                f"the {direction.lower()} campaign is still valid, but the expected directional follow-through has weakened; "
+                f"rather than carrying full futures delta, SuperBrain is closing the futures expression and rotating into {_strategy_from_trade_plan({'strategy_type': candidate, 'legs': expr.get('legs', [])})}"
+            ),
+            "fresh_entry_now": False,
+        }
+
+    return base_plan
+
+
+def _strategy_from_trade_plan(plan: Dict[str, Any]) -> str:
+    st = _u(plan.get("strategy_type")); legs = plan.get("legs", []) or plan.get("new_legs", []) or []
+    if st == "FUTURES_LONG": return "long futures exposure"
+    if st == "FUTURES_SHORT": return "short futures exposure"
+    if st == "SHORT_CE":
+        leg = next((x for x in legs if _u(x.get("option")) == "CE" and _u(x.get("side")) == "SELL"), {})
+        return f"{_fmt(leg.get('strike'))} CE short" if leg else "call short"
+    if st == "SHORT_PE":
+        leg = next((x for x in legs if _u(x.get("option")) == "PE" and _u(x.get("side")) == "SELL"), {})
+        return f"{_fmt(leg.get('strike'))} PE short" if leg else "put short"
+    if st == "LONG_CE":
+        leg = next((x for x in legs if _u(x.get("option")) == "CE" and _u(x.get("side")) == "BUY"), {})
+        return f"{_fmt(leg.get('strike'))} CE long" if leg else "call long"
+    if st == "LONG_PE":
+        leg = next((x for x in legs if _u(x.get("option")) == "PE" and _u(x.get("side")) == "BUY"), {})
+        return f"{_fmt(leg.get('strike'))} PE long" if leg else "put long"
+    if st == "SHORT_STRANGLE":
+        ce = next((x for x in legs if _u(x.get("option")) == "CE" and _u(x.get("side")) == "SELL"), {})
+        pe = next((x for x in legs if _u(x.get("option")) == "PE" and _u(x.get("side")) == "SELL"), {})
+        if ce and pe:
+            return f"{_fmt(ce.get('strike'))} CE / {_fmt(pe.get('strike'))} PE short strangle"
+        return "short strangle"
+    return st.lower().replace("_", " ") or "exposure"
+
+
+def _strategy_text(plan: Dict[str, Any]) -> str:
+    st = _u(plan.get("strategy_type")); legs = plan.get("legs", []) or []
+    if st == "FUTURES_LONG": return "take a long futures exposure"
+    if st == "FUTURES_SHORT": return "take a short futures exposure"
+    if st == "LONG_CE":
+        leg = next((x for x in legs if _u(x.get("option")) == "CE"), {})
+        return f"buy the {_fmt(leg.get('strike'))} CE" if leg else "buy an ATM CE"
+    if st == "LONG_PE":
+        leg = next((x for x in legs if _u(x.get("option")) == "PE"), {})
+        return f"buy the {_fmt(leg.get('strike'))} PE" if leg else "buy an ATM PE"
+    if st == "SHORT_CE" and legs: return f"sell the {_fmt(legs[0].get('strike'))} CE"
+    if st == "SHORT_PE" and legs: return f"sell the {_fmt(legs[0].get('strike'))} PE"
+    if st == "SHORT_STRANGLE" and len(legs) >= 2:
+        ce = next((x for x in legs if _u(x.get("option")) == "CE"), legs[0]); pe = next((x for x in legs if _u(x.get("option")) == "PE"), legs[-1])
+        return f"sell the {_fmt(ce.get('strike'))} CE and {_fmt(pe.get('strike'))} PE as one short strangle"
+    return _strategy_from_trade_plan(plan)
+
+
+def _material_signature(base: Dict[str, Any], plan: Dict[str, Any], progression: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    sig = dict(_material_signature_sb36(base, plan, progression, evidence) or {})
+    sig["campaign_operation"] = _u(plan.get("campaign_operation"))
+    sig["next_strategy"] = _u(plan.get("next_strategy_type"))
+    current = plan.get("current_legs", []) or plan.get("legs", []) or []
+    new_legs = plan.get("new_legs", []) or []
+    sig["campaign_exposure"] = [_leg_label(x) for x in current]
+    sig["campaign_new_legs"] = [_leg_label(x) for x in new_legs]
+    sig["campaign_close_ids"] = sorted([_s(x) for x in (plan.get("close_leg_ids", []) or []) if _s(x)])
+    return sig
+
+
+def _campaign_action_paragraph(plan: Dict[str, Any], price: Optional[float]) -> str:
+    current = plan.get("current_legs", []) or plan.get("legs", []) or []
+    exposure = _expression_exposure_text(current)
+    action = _u(plan.get("action"))
+    operation = _u(plan.get("campaign_operation"))
+    reason = _sentence_case(plan.get("reason"))
+
+    if operation == "TRANSFORM":
+        new_desc = _strategy_from_trade_plan({"strategy_type": plan.get("next_strategy_type") or plan.get("strategy_type"), "legs": plan.get("new_legs", []) or []}) if plan.get("new_legs") else "the remaining campaign legs"
+        return f"**SuperBrain currently has this exposure: {exposure}. It is transforming the campaign now toward {new_desc}.** {reason}."
+    if operation == "ROTATE":
+        new_desc = _strategy_from_trade_plan({"strategy_type": plan.get("next_strategy_type") or plan.get("strategy_type"), "legs": plan.get("new_legs", []) or []})
+        return f"**SuperBrain currently has this exposure: {exposure}. It is closing the current primary expression and rotating the same campaign into {new_desc}.** {reason}."
+    if operation == "ADD_LEG":
+        new_desc = _strategy_from_trade_plan({"strategy_type": plan.get("next_strategy_type") or plan.get("strategy_type"), "legs": plan.get("new_legs", []) or []})
+        return f"**SuperBrain currently has this exposure: {exposure}. It is retaining it and adding {new_desc} as another leg of the same campaign.** {reason}."
+    if operation == "CLOSE_LEG":
+        return f"**SuperBrain currently has this exposure: {exposure}. It is removing the deteriorating leg while keeping the campaign alive.** {reason}."
+    if operation == "ADOPT":
+        return f"**SuperBrain currently has this exposure: {exposure}. It is continuing to manage the same live campaign without changing the expression on this migration scan.** {reason}."
+    if action == "HOLD":
+        return f"**SuperBrain currently has this exposure: {exposure}. It is holding the campaign.** {reason}."
+    if action == "ADD":
+        return f"**SuperBrain currently has this exposure: {exposure}. It is adding exposure now at spot {_fmt(price)}.** {reason}."
+    if action == "REDUCE":
+        return f"**SuperBrain currently has this exposure: {exposure}. It is reducing campaign risk.** {reason}."
+    if action == "EXIT":
+        return f"**SuperBrain currently has this exposure: {exposure}. It is closing the campaign now at spot {_fmt(price)}.** {reason}."
+    return f"**SuperBrain currently has this exposure: {exposure}. Current management action: {action or 'WATCH'}.** {reason}."
+
+
+def _narrative(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    """SB3.7: exposure first for an existing campaign, market view second."""
+    text = _narrative_sb36(base, evidence, plan)
+    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if _u(plan.get("kind")) != "MANAGE":
+        return text
+
+    # Remove the older management-action paragraph and replace it with a
+    # campaign-first statement.  Keep all market/ODME/follow-up explanation.
+    remainder: List[str] = []
+    for p in paras:
+        low = p.lower()
+        if p.startswith("**SuperBrain is holding") or p.startswith("**SuperBrain is adding") or p.startswith("**SuperBrain is reducing") or p.startswith("**SuperBrain is exiting") or p.startswith("**SuperBrain action"):
+            continue
+        if p.startswith("**SuperBrain currently has this exposure"):
+            continue
+        remainder.append(p)
+
+    first = _campaign_action_paragraph(plan, _f(base.get("price")))
+    market_intro = "Market view:"
+    if remainder:
+        remainder[0] = market_intro + " " + remainder[0]
+    else:
+        remainder = [market_intro + " the campaign thesis remains under active scan management."]
+    return "\n\n".join([first] + remainder).strip()
