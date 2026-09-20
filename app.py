@@ -142,37 +142,34 @@ def render_public_superbrain() -> None:
     if not packet or str(packet.get("instrument", "")) != instrument:
         return
 
-    if packet.get("odme_live"):
-        st.success(f"{instrument}: latest market and options-positioning inputs are ready.")
-    else:
-        st.success(f"{instrument}: latest market inputs are ready.")
-        if packet.get("odme_error"):
-            st.warning(f"The options-positioning refresh was not usable, so this scan used market data only: {packet.get('odme_error')}")
+    if packet.get("odme_error"):
+        st.warning(f"The options-positioning refresh was not usable, so this scan used market data only: {packet.get('odme_error')}")
 
     analysis = packet.get("analysis", {}) or {}
     if analysis:
         if analysis.get("freshness_line"):
             st.caption(str(analysis.get("freshness_line")))
-        view_label = str(analysis.get("view_label", "WAIT") or "WAIT").upper()
+        view_label = str(analysis.get("view_label", "WAIT") or "WAIT")
         st.markdown(f"#### SuperBrain view — {view_label}")
         narrative = str(analysis.get("narrative", "") or "").strip()
-        if narrative:
-            st.markdown(narrative)
-        else:
-            st.markdown("Market conditions were read successfully, but no actionable narrative was produced for this scan.")
+        with st.expander("Detailed commentary", expanded=False):
+            if narrative:
+                st.markdown(narrative)
+            else:
+                st.markdown("Market conditions were read successfully, but no actionable narrative was produced for this scan.")
 
-        exposure = analysis.get("recorded_exposure", {}) or {}
-        if exposure:
-            action = str(exposure.get("action", "") or "").upper()
-            trade_id = str(exposure.get("trade_id", "") or "")
-            if action in {"ENTER", "OPEN"}:
-                st.caption(f"SuperBrain exposure recorded: {trade_id}. Future scans will manage this exposure; broker positions are not read.")
-            elif action:
-                st.caption(f"SuperBrain exposure {trade_id} updated: {action}. Broker positions are not read.")
+            exposure = analysis.get("recorded_exposure", {}) or {}
+            if exposure:
+                action = str(exposure.get("action", "") or "").upper()
+                trade_id = str(exposure.get("trade_id", "") or "")
+                if action in {"ENTER", "OPEN"}:
+                    st.caption(f"SuperBrain exposure recorded: {trade_id}. Future scans will manage this exposure; broker positions are not read.")
+                elif action:
+                    st.caption(f"SuperBrain exposure {trade_id} updated: {action}. Broker positions are not read.")
 
-    memory = packet.get("memory", {}) or {}
-    if not memory.get("had_previous_state"):
-        st.caption("SuperBrain memory initialized for this instrument. No broker positions are read.")
+            memory = packet.get("memory", {}) or {}
+            if not memory.get("had_previous_state"):
+                st.caption("SuperBrain memory initialized for this instrument. No broker positions are read.")
 
 
 def _run_expired_cleanup_once(store: Any, show_notice: bool = True) -> None:

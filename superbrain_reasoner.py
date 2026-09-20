@@ -947,10 +947,10 @@ def _view_change_line(challenger: Dict[str, Any], defender: Dict[str, Any], hurd
     if posture == "WAIT":
         supply = next((h for h in hurdles if h.get("side") == "SUPPLY"), None)
         if supply and _zone_valid(challenger) and challenger.get("side") == "SUPPLY":
-            return f"If price pushes through {_fmt(challenger.get('high'))} and then remains accepted above that broader resistance on a later confirmed bar, the current short-location idea should be abandoned rather than repeatedly selling the old zone."
+            return f"If price pushes through {_fmt(challenger.get('high'))} and then remains accepted above that broader resistance on a later confirmed bar, the current short-location idea should be abandoned."
         demand = next((h for h in hurdles if h.get("side") == "DEMAND"), None)
         if demand and _zone_valid(challenger) and challenger.get("side") == "DEMAND":
-            return f"If price pushes through {_fmt(challenger.get('low'))} and then remains accepted below that broader support on a later confirmed bar, the current long-location idea should be abandoned rather than repeatedly buying the old zone."
+            return f"If price pushes through {_fmt(challenger.get('low'))} and then remains accepted below that broader support on a later confirmed bar, the current long-location idea should be abandoned."
     if _zone_valid(defender) and defender.get("condition") == "BREACHED":
         return "The earlier supporting location has failed; do not rely on the old market structure until it is reclaimed or replaced by a new valid structure."
     return ""
@@ -1686,7 +1686,7 @@ def _liquidity_commentary(price: Optional[float], liquidity: Dict[str, Any], exe
     if short_context:
         bits = []
         if has_above:
-            bits.append(f"unfinished liquidity above around {_fmt(above)} is a threat to an early short and should be cleared or reclaimed before a fresh short is taken if it lies inside the trade's risk area")
+            bits.append(f"unfinished liquidity above around {_fmt(above)} is a near-term risk to a short, but it is not an automatic entry veto")
         if has_below:
             bits.append(f"liquidity below around {_fmt(below)} is a natural downside magnet if bearish conditions activate")
         if bits:
@@ -1701,7 +1701,7 @@ def _liquidity_commentary(price: Optional[float], liquidity: Dict[str, Any], exe
     elif long_context:
         bits = []
         if has_below:
-            bits.append(f"unfinished liquidity below around {_fmt(below)} is a threat to an early long and should be cleared or reclaimed before a fresh long is taken if it lies inside the trade's risk area")
+            bits.append(f"unfinished liquidity below around {_fmt(below)} is a near-term risk to a long, but it is not an automatic entry veto")
         if has_above:
             bits.append(f"liquidity above around {_fmt(above)} is a natural upside magnet if bullish conditions activate")
         if bits:
@@ -2060,3 +2060,405 @@ def analyze_market(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], 
     base["view_label"] = _view_label(base, plan)
     base["narrative"] = _narrative(base, evidence, plan)
     return base
+
+# =============================================================================
+# SB3.6 final context polish overrides
+# =============================================================================
+# Adds nuanced liquidity timing, battlefield-advance awareness and compact
+# no-change signaling. Core locked direction/location rules above remain authority.
+
+REASONER_VERSION = "SB3.6_FINAL_CONTEXT_LIQUIDITY_WATCH"
+_new_entry_plan_sb35 = _new_entry_plan
+_manage_existing_sb35 = _manage_existing
+_narrative_sb35 = _narrative
+
+
+def _round_level(v: Any) -> Optional[float]:
+    n = _f(v)
+    return round(n, 4) if n is not None else None
+
+
+def _battlefield_progression(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], base: Dict[str, Any]) -> Dict[str, Any]:
+    current = _source_map(evidence)
+    previous = _prev_source_map(previous_evidence or {})
+    edge = current.get("EDGE", {}) or {}
+    prev_edge = previous.get("EDGE", {}) or {}
+    price = _f(base.get("price"))
+    prev_price = _f(prev_edge.get("close"))
+    macro = _u(base.get("macro"))
+    cur_ch = _zone(edge, "CHALLENGER")
+    old_ch = _zone(prev_edge, "CHALLENGER")
+    cur_def = _zone(edge, "DEFENDER")
+    old_def = _zone(prev_edge, "DEFENDER")
+    edge_bar = _i(edge.get("bar_time")); prev_bar = _i(prev_edge.get("bar_time"))
+    new_bar = edge_bar is not None and prev_bar is not None and edge_bar > prev_bar
+
+    out: Dict[str, Any] = {
+        "state": "UNCHANGED",
+        "direction": macro,
+        "supports_continuation": False,
+        "old_challenger": old_ch,
+        "new_challenger": cur_ch,
+        "old_defender": old_def,
+        "new_defender": cur_def,
+        "opposing_fp_cleared": False,
+        "detail": "",
+    }
+
+    # Same opposing zone accepted through on a later confirmed bar.
+    ch = base.get("challenger", {}) or {}
+    if ch.get("transition") == "ACCEPTED_BEYOND" and macro in {"BULLISH", "BEARISH"}:
+        out.update({
+            "state": "OPPOSING_BARRIER_ACCEPTED",
+            "supports_continuation": True,
+            "detail": "the previous opposing decision area has been accepted through on a later confirmed bar",
+        })
+
+    # Role migration after the prior opposing zone was crossed/cleared. This is
+    # the important 'battlefield advanced' state: the next hurdle has shifted in
+    # the same direction, so distance from the old Defender is not a standalone
+    # reason to reject continuation.
+    if new_bar and _zone_valid(cur_ch) and _zone_valid(old_ch) and not _same_role_lineage(cur_ch, old_ch):
+        old_now = _zone_relation(old_ch, price)
+        old_prev = _zone_relation(old_ch, prev_price)
+        if macro == "BULLISH" and cur_ch.get("side") == "SUPPLY" and old_ch.get("side") == "SUPPLY":
+            shifted = (_f(cur_ch.get("low")) or 0) > (_f(old_ch.get("low")) or 0)
+            cleared = old_now == "DISTAL_SIDE" or old_prev == "DISTAL_SIDE"
+            if shifted and cleared:
+                out.update({
+                    "state": "BATTLEFIELD_ADVANCED",
+                    "supports_continuation": True,
+                    "detail": "the previous resistance has been cleared and the next broader resistance has migrated higher",
+                })
+        elif macro == "BEARISH" and cur_ch.get("side") == "DEMAND" and old_ch.get("side") == "DEMAND":
+            shifted = (_f(cur_ch.get("high")) or float("inf")) < (_f(old_ch.get("high")) or float("inf"))
+            cleared = old_now == "DISTAL_SIDE" or old_prev == "DISTAL_SIDE"
+            if shifted and cleared:
+                out.update({
+                    "state": "BATTLEFIELD_ADVANCED",
+                    "supports_continuation": True,
+                    "detail": "the previous support has been cleared and the next broader support has migrated lower",
+                })
+
+    # A recently run opposing footprint is also useful continuation context. It
+    # does not create direction by itself; it only tells SuperBrain that a nearer
+    # hurdle has been removed when pressure/momentum already agree.
+    if price is not None and macro == "BULLISH":
+        status = _u(edge.get("fp_s_status") or edge.get("fp_s_context_state"))
+        event = _u(edge.get("fp_s_event_type"))
+        hi = _f(edge.get("fp_s_high"))
+        if hi is not None and price > hi and (status == "RUN" or "RUN" in event):
+            out["opposing_fp_cleared"] = True
+            if out["state"] == "UNCHANGED":
+                out.update({"state": "NEARER_HURDLE_CLEARED", "supports_continuation": True,
+                            "detail": "a recent supply pocket has been run and removed as a nearer upside hurdle"})
+    elif price is not None and macro == "BEARISH":
+        status = _u(edge.get("fp_d_status") or edge.get("fp_d_context_state"))
+        event = _u(edge.get("fp_d_event_type"))
+        lo = _f(edge.get("fp_d_low"))
+        if lo is not None and price < lo and (status == "RUN" or "RUN" in event):
+            out["opposing_fp_cleared"] = True
+            if out["state"] == "UNCHANGED":
+                out.update({"state": "NEARER_HURDLE_CLEARED", "supports_continuation": True,
+                            "detail": "a recent demand pocket has been run and removed as a nearer downside hurdle"})
+
+    # Defender failure remains adverse to the old macro. It is context only and
+    # never authorizes an opposite trade without the normal locked conditions.
+    d = base.get("defender", {}) or {}
+    if d.get("condition") == "BREACHED" or d.get("transition") in {"FRESH_CONFIRMED_BREACH", "ACCEPTED_BEYOND"}:
+        out["defender_failed"] = True
+    else:
+        out["defender_failed"] = False
+    return out
+
+
+def _progression_sentence(p: Dict[str, Any]) -> str:
+    state = _u(p.get("state")); direction = _u(p.get("direction"))
+    old = p.get("old_challenger", {}) or {}; new = p.get("new_challenger", {}) or {}
+    if state == "BATTLEFIELD_ADVANCED":
+        if direction == "BULLISH":
+            oldz = f"{_fmt(old.get('low'))}–{_fmt(old.get('high'))}" if _zone_valid(old) else "the prior resistance"
+            newz = f"{_fmt(new.get('low'))}–{_fmt(new.get('high'))}" if _zone_valid(new) else "a higher resistance area"
+            return f"The prior resistance at {oldz} has been cleared and the next broader resistance has shifted higher to {newz}. The location context has advanced with the market, so distance from the older support area is not by itself a reason to reject a continuation long."
+        if direction == "BEARISH":
+            oldz = f"{_fmt(old.get('low'))}–{_fmt(old.get('high'))}" if _zone_valid(old) else "the prior support"
+            newz = f"{_fmt(new.get('low'))}–{_fmt(new.get('high'))}" if _zone_valid(new) else "a lower support area"
+            return f"The prior support at {oldz} has been cleared and the next broader support has shifted lower to {newz}. The location context has advanced with the market, so distance from the older resistance area is not by itself a reason to reject a continuation short."
+    if state == "OPPOSING_BARRIER_ACCEPTED":
+        if direction == "BULLISH":
+            return "The previous resistance has been accepted through on a later confirmed bar. That hurdle is now cleared, which improves continuation context if buying pressure and momentum remain aligned."
+        if direction == "BEARISH":
+            return "The previous support has been accepted through on a later confirmed bar. That hurdle is now cleared, which improves continuation context if selling pressure and momentum remain aligned."
+    if state == "NEARER_HURDLE_CLEARED":
+        return _sentence_case(p.get("detail")) + "."
+    return ""
+
+
+def _liquidity_decision(base: Dict[str, Any], direction: str, levels: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    direction = _u(direction)
+    if direction not in {"BULLISH", "BEARISH"}:
+        return {"has_threat": False, "wait_required": False}
+    liq = base.get("liquidity", {}) or {}; price = _f(base.get("price"))
+    if price is None:
+        return {"has_threat": False, "wait_required": False}
+    levels = levels or _candidate_levels(base, {}, direction)
+    inv = _f(levels.get("invalidation")) if isinstance(levels, dict) else None
+    if direction == "BEARISH":
+        adverse = _f(liq.get("above_level")); count = _i(liq.get("above_count")) or 0
+        favorable = _f(liq.get("below_level")); favorable_count = _i(liq.get("below_count")) or 0
+        inside_risk = adverse is not None and adverse > price and (inv is None or adverse < inv)
+    else:
+        adverse = _f(liq.get("below_level")); count = _i(liq.get("below_count")) or 0
+        favorable = _f(liq.get("above_level")); favorable_count = _i(liq.get("above_count")) or 0
+        inside_risk = adverse is not None and adverse < price and (inv is None or adverse > inv)
+
+    poi = base.get("poi", {}) or {}; exec_dir = _u(base.get("exec_of"))
+    qualified_reversal = bool(poi.get("qualified") and _u(poi.get("intended")) == direction and exec_dir == _opposite(direction))
+    escaped = False
+    if qualified_reversal and price is not None:
+        if direction == "BEARISH" and _f(poi.get("low")) is not None:
+            escaped = price < _f(poi.get("low"))
+        elif direction == "BULLISH" and _f(poi.get("high")) is not None:
+            escaped = price > _f(poi.get("high"))
+    active, early = _momentum_supports(direction, base.get("aurora", {}) or {})
+    aligned_continuation = exec_dir == direction and active
+    meaningful = count >= 2
+    wait_required = bool(inside_risk and meaningful and qualified_reversal and not escaped)
+    return {
+        "has_threat": bool(inside_risk),
+        "adverse_level": adverse,
+        "adverse_count": count,
+        "favorable_level": favorable,
+        "favorable_count": favorable_count,
+        "meaningful": meaningful,
+        "inside_risk": bool(inside_risk),
+        "qualified_reversal": qualified_reversal,
+        "escaped": escaped,
+        "aligned_continuation": aligned_continuation,
+        "momentum_active": active,
+        "momentum_early": early,
+        "wait_required": wait_required,
+    }
+
+
+def _liquidity_action_paragraph(base: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    liq = base.get("liquidity", {}) or {}; price = _f(base.get("price"))
+    direction = _u(plan.get("direction"))
+    if direction not in {"BULLISH", "BEARISH"}:
+        direction = _u(base.get("exec_of")) if _u(base.get("exec_of")) in {"BULLISH", "BEARISH"} else ""
+    levels = plan if plan else _candidate_levels(base, {}, direction) if direction else {}
+    dec = _liquidity_decision(base, direction, levels) if direction else {"has_threat": False}
+    parts: List[str] = []
+
+    event = _u(liq.get("event")); lvl = _f(liq.get("level"))
+    if event and lvl is not None:
+        if event.startswith("BUY_") and event.endswith("_RUN"):
+            parts.append(f"Recent upside liquidity around {_fmt(lvl)} was run and price held above it.")
+        elif event.startswith("BUY_") and event.endswith("_SWEEP"):
+            parts.append(f"Recent upside liquidity around {_fmt(lvl)} was swept and reclaimed below, which is constructive for a short if the rest of the setup agrees.")
+        elif event.startswith("SELL_") and event.endswith("_RUN"):
+            parts.append(f"Recent downside liquidity around {_fmt(lvl)} was run and price held below it.")
+        elif event.startswith("SELL_") and event.endswith("_SWEEP"):
+            parts.append(f"Recent downside liquidity around {_fmt(lvl)} was swept and reclaimed above, which is constructive for a long if the rest of the setup agrees.")
+
+    if direction == "BEARISH":
+        adv = dec.get("adverse_level"); fav = dec.get("favorable_level")
+        if dec.get("wait_required"):
+            parts.append(f"Unfinished upside liquidity around {_fmt(adv)} is a material threat to this early reversal short, so SuperBrain is waiting for that pool to be swept/reclaimed or for price to escape the supply reaction more decisively before entering.")
+        elif dec.get("has_threat"):
+            if dec.get("aligned_continuation"):
+                parts.append(f"Unfinished upside liquidity around {_fmt(adv)} is still a short-term threat, but selling pressure and active bearish momentum are already aligned; SuperBrain does not require that pool to clear before taking the continuation short.")
+            else:
+                parts.append(f"Unfinished upside liquidity around {_fmt(adv)} remains the main near-term risk to a short. It is not an automatic veto, but with timing not fully aligned SuperBrain gives it meaningful weight before entry.")
+        elif adv is not None and price is not None and adv > price:
+            parts.append(f"Liquidity above around {_fmt(adv)} remains unfinished, but SuperBrain does not consider it a material threat to the current short thesis at this location.")
+        if fav is not None and price is not None and fav < price:
+            parts.append(f"Liquidity below around {_fmt(fav)} is a useful downside magnet if bearish pressure continues.")
+    elif direction == "BULLISH":
+        adv = dec.get("adverse_level"); fav = dec.get("favorable_level")
+        if dec.get("wait_required"):
+            parts.append(f"Unfinished downside liquidity around {_fmt(adv)} is a material threat to this early reversal long, so SuperBrain is waiting for that pool to be swept/reclaimed or for price to escape the demand reaction more decisively before entering.")
+        elif dec.get("has_threat"):
+            if dec.get("aligned_continuation"):
+                parts.append(f"Unfinished downside liquidity around {_fmt(adv)} is still a short-term threat, but buying pressure and active bullish momentum are already aligned; SuperBrain does not require that pool to clear before taking the continuation long.")
+            else:
+                parts.append(f"Unfinished downside liquidity around {_fmt(adv)} remains the main near-term risk to a long. It is not an automatic veto, but with timing not fully aligned SuperBrain gives it meaningful weight before entry.")
+        elif adv is not None and price is not None and adv < price:
+            parts.append(f"Liquidity below around {_fmt(adv)} remains unfinished, but SuperBrain does not consider it a material threat to the current long thesis at this location.")
+        if fav is not None and price is not None and fav > price:
+            parts.append(f"Liquidity above around {_fmt(fav)} is a useful upside magnet if bullish pressure continues.")
+    else:
+        above = _f(liq.get("above_level")); below = _f(liq.get("below_level"))
+        if above is not None and price is not None and above > price:
+            parts.append(f"Liquidity remains above around {_fmt(above)}.")
+        if below is not None and price is not None and below < price:
+            parts.append(f"Liquidity remains below around {_fmt(below)}.")
+    return " ".join(parts).strip()
+
+
+def _view_change_line(challenger: Dict[str, Any], defender: Dict[str, Any], hurdles: List[Dict[str, Any]], posture: str) -> str:
+    if posture == "WAIT":
+        supply = next((h for h in hurdles if h.get("side") == "SUPPLY"), None)
+        if supply and _zone_valid(challenger) and challenger.get("side") == "SUPPLY":
+            return f"If price pushes through {_fmt(challenger.get('high'))} and then remains accepted above that broader resistance on a later confirmed bar, the current short-location idea should be abandoned."
+        demand = next((h for h in hurdles if h.get("side") == "DEMAND"), None)
+        if demand and _zone_valid(challenger) and challenger.get("side") == "DEMAND":
+            return f"If price pushes through {_fmt(challenger.get('low'))} and then remains accepted below that broader support on a later confirmed bar, the current long-location idea should be abandoned."
+    if _zone_valid(defender) and defender.get("condition") == "BREACHED":
+        return "The earlier supporting location has failed; do not rely on the old market structure until it is reclaimed or replaced by a new valid structure."
+    return ""
+
+
+def _new_entry_plan(base: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    # Start with SB3.4 trade selection, not SB3.5's universal liquidity veto.
+    plan = dict(_new_entry_plan_sb34(base, evidence) or {})
+    if _u(plan.get("kind")) != "NEW":
+        return plan
+    direction = _u(plan.get("direction")); strategy = _u(plan.get("strategy_type"))
+    if strategy.startswith("FUTURES") and direction in {"BULLISH", "BEARISH"}:
+        dec = _liquidity_decision(base, direction, plan)
+        plan["liquidity_context"] = dec
+        if dec.get("wait_required"):
+            return {
+                "kind": "NONE", "action": "WAIT", "direction": direction,
+                "pullback_low": plan.get("pullback_low"), "pullback_high": plan.get("pullback_high"),
+                "reason": "a meaningful adverse liquidity pool remains unresolved during an early reversal attempt",
+                "liquidity_context": dec,
+            }
+    if strategy in {"SHORT_CE", "SHORT_PE"}:
+        threat = _option_liquidity_threat(base, plan)
+        if threat:
+            return {"kind": "NONE", "action": "WAIT", "direction": direction,
+                    "reason": "the proposed non-arrival strike is exposed to unresolved liquidity reaching that strike",
+                    "liquidity_context": threat}
+    return plan
+
+
+def _manage_existing(base: Dict[str, Any], evidence: Dict[str, Any], open_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    plan = dict(_manage_existing_sb34(base, evidence, open_trades) or {})
+    if _u(plan.get("kind")) != "MANAGE":
+        return plan
+    direction = _u(plan.get("direction")); action = _u(plan.get("action")); strategy = _u(plan.get("strategy_type"))
+    if direction in {"BULLISH", "BEARISH"} and strategy.startswith("FUTURES"):
+        levels = _candidate_levels(base, evidence, direction)
+        dec = _liquidity_decision(base, direction, levels)
+        plan["liquidity_context"] = dec
+        if dec.get("wait_required") and action == "ADD":
+            plan.update({"action": "HOLD", "fresh_entry_now": False,
+                         "reason": "the existing thesis remains intact, but a meaningful adverse liquidity pool is unresolved during the attempted add"})
+        elif dec.get("wait_required") and action == "HOLD" and plan.get("fresh_entry_now"):
+            plan["fresh_entry_now"] = False
+            plan["reason"] = _s(plan.get("reason")) + "; a fresh user should wait because the adverse liquidity risk is still material at this reversal location"
+    return plan
+
+
+def _material_signature(base: Dict[str, Any], plan: Dict[str, Any], progression: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    def zsig(z: Dict[str, Any]) -> Dict[str, Any]:
+        z = z or {}
+        return {"side": _u(z.get("side")), "low": _round_level(z.get("low")), "high": _round_level(z.get("high")),
+                "condition": _u(z.get("condition")), "transition": _u(z.get("transition"))}
+    poi = base.get("poi", {}) or {}; liq = base.get("liquidity", {}) or {}; aur = base.get("aurora", {}) or {}; fork = base.get("fork", {}) or {}
+    odme = evidence.get("odme", {}) or {}
+    rs = _f(odme.get("range_score")); es = _f(odme.get("expansion_score"))
+    vol = "EXPANSION" if rs is not None and es is not None and es > rs else "RANGE" if rs is not None and es is not None and rs > es else "BALANCED"
+    hurdles = []
+    for h in (base.get("hurdles", []) or [])[:4]:
+        hurdles.append({"side": _u(h.get("side")), "low": _round_level(h.get("low")), "high": _round_level(h.get("high")), "zone_id": _s(h.get("zone_id"))})
+    return {
+        "posture": _u(base.get("posture")), "exec": _u(base.get("exec_of")), "macro": _u(base.get("macro")),
+        "momentum_state": _u(aur.get("state")), "momentum_transition": _u(aur.get("transition")),
+        "defender": zsig(base.get("defender", {}) or {}), "challenger": zsig(base.get("challenger", {}) or {}),
+        "progression": _u(progression.get("state")),
+        "poi": {"qualified": bool(poi.get("qualified")), "side": _u(poi.get("side")), "low": _round_level(poi.get("low")), "high": _round_level(poi.get("high")), "parent": _u(poi.get("parent"))},
+        "fork": {"position": _u(fork.get("position")), "reclaimed": bool(fork.get("reclaimed_2sd"))},
+        "liquidity": {"event": _u(liq.get("event")), "confirm_time": _i(liq.get("confirm_time")), "above": _round_level(liq.get("above_level")), "above_count": _i(liq.get("above_count")), "below": _round_level(liq.get("below_level")), "below_count": _i(liq.get("below_count"))},
+        "hurdles": hurdles,
+        "odme": {"tilt": _u(odme.get("odme_tilt")), "ce_wall": _round_level(odme.get("active_ce_wall") or odme.get("ce_wall")), "pe_wall": _round_level(odme.get("active_pe_wall") or odme.get("pe_wall")), "safe_ce": _round_level(odme.get("safer_sell_ce")), "safe_pe": _round_level(odme.get("safer_sell_pe")), "vol": vol, "ce_sellable": _sale_action_ok(odme, "CE") if odme else False, "pe_sellable": _sale_action_ok(odme, "PE") if odme else False, "premium_alert": _s(odme.get("premium_alert"))[:180]},
+        "plan": {"kind": _u(plan.get("kind")), "action": _u(plan.get("action")), "direction": _u(plan.get("direction")), "strategy": _u(plan.get("strategy_type")), "target": _round_level(plan.get("target")), "invalidation": _round_level(plan.get("invalidation"))},
+    }
+
+
+def _narrative(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    # Start from the polished SB3.5 paragraph structure, then replace generic
+    # liquidity wording with a plan-aware verdict and add battlefield progression.
+    text = _narrative_sb35(base, evidence, plan)
+    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+    filtered: List[str] = []
+    for p in paras:
+        low = p.lower()
+        if "liquidity" in low and ("unfinished" in low or "recent upside" in low or "recent downside" in low or "natural" in low or "magnet" in low):
+            continue
+        if (base.get("battlefield_progression", {}) or {}).get("supports_continuation") and "that makes chasing the move less attractive" in low:
+            # This generic late-location sentence is superseded by the explicit
+            # battlefield-advance interpretation below.
+            continue
+        filtered.append(p)
+
+    prog = _progression_sentence(base.get("battlefield_progression", {}) or {})
+    liq = _liquidity_action_paragraph(base, plan)
+    insert_at = 1 if filtered else 0
+    if prog:
+        filtered.insert(insert_at, prog); insert_at += 1
+    if liq:
+        filtered.insert(insert_at, liq)
+    return "\n\n".join(filtered).strip()
+
+
+def analyze_market(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], open_trades: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    base = _analyze_market_sb32(evidence, previous_evidence, open_trades=open_trades)
+    progression = _battlefield_progression(evidence, previous_evidence, base)
+    base["battlefield_progression"] = progression
+    trades = open_trades or []
+    plan = _manage_existing(base, evidence, trades) if trades else _new_entry_plan(base, evidence)
+    if not plan:
+        plan = {"kind": "NONE", "action": "WAIT"}
+    if _u(plan.get("kind")) == "MANAGE":
+        tid = _s(plan.get("trade_id"))
+        t = next((dict(x) for x in trades if _s(x.get("trade_id")) == tid), dict(trades[0]) if trades else {})
+        plan.setdefault("entry_reference", _f(t.get("entry_reference")))
+        plan.setdefault("target", _f(t.get("target")))
+        plan.setdefault("invalidation", _f(t.get("invalidation")))
+        plan.setdefault("legs", _json_list(t.get("legs_json")))
+
+    base["reasoner_version"] = REASONER_VERSION
+    base["trade_plan"] = plan
+    core_view = _view_label(base, plan)
+    sig = _material_signature(base, plan, progression, evidence)
+    prev_analysis = previous_evidence.get("analysis", {}) if isinstance(previous_evidence, dict) and isinstance(previous_evidence.get("analysis"), dict) else {}
+    prev_sig = prev_analysis.get("material_signature") if isinstance(prev_analysis, dict) else None
+    no_change = bool(prev_sig and prev_sig == sig)
+    base["material_signature"] = sig
+    base["no_material_change"] = no_change
+    base["core_view_label"] = core_view
+    base["view_label"] = "WATCH (no change from last scan)" if no_change else core_view
+    base["narrative"] = _narrative(base, evidence, plan)
+    return base
+
+# Keep the underlying STATE/thesis wording consistent with the visible liquidity
+# treatment as well; the final narrative adds the plan-specific judgment.
+def _liquidity_commentary(price: Optional[float], liquidity: Dict[str, Any], exec_dir: str, posture: str) -> List[str]:
+    out: List[str] = []
+    event = _u(liquidity.get("event")); lvl = _f(liquidity.get("level"))
+    if event and lvl is not None:
+        if event.startswith("BUY_") and event.endswith("_RUN"):
+            out.append(f"Recent upside liquidity around {_fmt(lvl)} was run and price held above it.")
+        elif event.startswith("BUY_") and event.endswith("_SWEEP"):
+            out.append(f"Recent upside liquidity around {_fmt(lvl)} was swept and reclaimed below.")
+        elif event.startswith("SELL_") and event.endswith("_RUN"):
+            out.append(f"Recent downside liquidity around {_fmt(lvl)} was run and price held below it.")
+        elif event.startswith("SELL_") and event.endswith("_SWEEP"):
+            out.append(f"Recent downside liquidity around {_fmt(lvl)} was swept and reclaimed above.")
+    above = _f(liquidity.get("above_level")); below = _f(liquidity.get("below_level"))
+    short_context = posture == "SHORT_ELIGIBLE" or _u(exec_dir) == "BEARISH"
+    long_context = posture == "LONG_ELIGIBLE" or _u(exec_dir) == "BULLISH"
+    if short_context:
+        if above is not None and price is not None and above > price:
+            out.append(f"Unfinished liquidity above around {_fmt(above)} is a near-term risk to a short, but it is not an automatic entry veto.")
+        if below is not None and price is not None and below < price:
+            out.append(f"Liquidity below around {_fmt(below)} is a useful downside magnet if bearish pressure continues.")
+    elif long_context:
+        if below is not None and price is not None and below < price:
+            out.append(f"Unfinished liquidity below around {_fmt(below)} is a near-term risk to a long, but it is not an automatic entry veto.")
+        if above is not None and price is not None and above > price:
+            out.append(f"Liquidity above around {_fmt(above)} is a useful upside magnet if bullish pressure continues.")
+    return out

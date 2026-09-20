@@ -13,7 +13,7 @@ from data_store import BaseStore
 from scan_service import run_odme_scan
 from superbrain_reasoner import analyze_market, REASONER_VERSION
 
-SUPERBRAIN_BRIDGE_VERSION = "SB3.5_FINAL_POLISH_LIVE_TEST"
+SUPERBRAIN_BRIDGE_VERSION = "SB3.6_FINAL_CONTEXT_LIQUIDITY_WATCH"
 
 
 def _norm(value: Any) -> str:
