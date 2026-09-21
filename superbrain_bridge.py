@@ -28,6 +28,122 @@ def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
 
 
+def _compact_path_for_memory(path: Any) -> Dict[str, Any]:
+    """Bounded Non-Arrival route summary that survives Sheet cell guards.
+
+    Detailed route evidence remains in the live scan.  This sidecar keeps only
+    the fields needed to recover the actionable ETA/safe-through decision when
+    market_state_json is too large for a single Google Sheets cell.
+    """
+    if not isinstance(path, dict):
+        return {}
+    keys = (
+        "available", "fastest_hours", "expected_hours",
+        "fastest_arrival", "expected_arrival", "safe_through",
+        "protected_through_expiry", "expiry", "hurdle_count",
+        "structural_friction", "oi_friction", "path_multiplier",
+    )
+    out = {k: path.get(k) for k in keys if path.get(k) not in (None, "", [], {})}
+
+    hurdles: List[Dict[str, Any]] = []
+    for row in (path.get("hurdles") or [])[:6]:
+        if not isinstance(row, dict):
+            continue
+        slim_keys = (
+            "side", "level", "low", "high", "tf", "source",
+            "status", "strength", "strength_score", "weight", "distance",
+        )
+        slim = {k: row.get(k) for k in slim_keys if row.get(k) not in (None, "", [], {})}
+        if slim:
+            hurdles.append(slim)
+    if hurdles:
+        out["hurdles"] = hurdles
+
+    clusters: List[Dict[str, Any]] = []
+    for row in (path.get("oi_clusters") or [])[:4]:
+        if not isinstance(row, dict):
+            continue
+        slim_keys = ("strike", "oi", "combined_oi", "distance", "weight", "option")
+        slim = {k: row.get(k) for k in slim_keys if row.get(k) not in (None, "", [], {})}
+        if slim:
+            clusters.append(slim)
+    if clusters:
+        out["oi_clusters"] = clusters
+    return out
+
+
+def _compact_na_candidate_for_memory(candidate: Any, evidence: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(candidate, dict) or not candidate.get("strike"):
+        return {}
+    odme = evidence.get("odme", {}) or {}
+    option = _norm(candidate.get("option"))
+    safer = odme.get("safer_sell_pe") if option == "PE" else odme.get("safer_sell_ce") if option == "CE" else ""
+    strike = candidate.get("strike")
+    boundary_eligible = None
+    try:
+        strike_f = float(strike)
+        safer_f = float(safer)
+        boundary_eligible = strike_f <= safer_f if option == "PE" else strike_f >= safer_f if option == "CE" else None
+    except Exception:
+        pass
+
+    keys = (
+        "option", "strike", "premium", "ltp", "bid", "ask", "mark",
+        "lot_size", "estimated_iv", "delta", "gamma", "theta_day", "vega",
+        "reward", "stress_risk", "rr", "stress_spot", "stress_time",
+        "stress_iv", "score", "oi", "setup_class", "planned_holding_window",
+        "safe_through_trade_window",
+    )
+    out = {k: candidate.get(k) for k in keys if candidate.get(k) not in (None, "", [], {})}
+    if safer not in (None, ""):
+        out["odme_safer_boundary"] = safer
+    if boundary_eligible is not None:
+        out["boundary_eligible"] = bool(boundary_eligible)
+    path = _compact_path_for_memory(candidate.get("path", {}) or {})
+    if path:
+        out["path"] = path
+    return out
+
+
+def _compact_nonarrival_for_memory(analysis: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact actionable NA sidecar written inside existing metadata_json.
+
+    No extra Sheet call, tab, column, webhook payload, or lock is introduced.
+    """
+    na = analysis.get("nonarrival_assessment", {}) or {}
+    plan = analysis.get("trade_plan", {}) or {}
+    odme = evidence.get("odme", {}) or {}
+    if not na and not odme:
+        return {}
+
+    out: Dict[str, Any] = {
+        "schema": "SBNA1_COMPACT",
+        "decision": na.get("decision", ""),
+        "compact_line": na.get("compact_line") or na.get("text") or analysis.get("compact_nonarrival", ""),
+        "strategy_type": plan.get("strategy_type", ""),
+        "setup_class": na.get("setup_class") or plan.get("nonarrival_class") or plan.get("setup_class") or "",
+        "spot": odme.get("spot", ""),
+        "expiry": odme.get("expiry", ""),
+        "safer_sell_pe": odme.get("safer_sell_pe", ""),
+        "safer_sell_ce": odme.get("safer_sell_ce", ""),
+        "planned_holding_window": na.get("planned_holding_window") or plan.get("planned_holding_window") or "",
+        "generated_at": evidence.get("scanned_at", ""),
+    }
+    for name in ("candidate", "pe", "ce"):
+        compact = _compact_na_candidate_for_memory(na.get(name), evidence)
+        if compact:
+            out[name] = compact
+
+    # Future reasoner versions may keep the selected candidate only in the trade
+    # plan. Preserve it without changing the current reasoner's calculations.
+    if "candidate" not in out:
+        compact = _compact_na_candidate_for_memory(plan.get("nonarrival_snapshot"), evidence)
+        if compact:
+            out["candidate"] = compact
+
+    return {k: v for k, v in out.items() if v not in (None, "", [], {})}
+
+
 def _safe_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     if df is None or df.empty:
         return []
@@ -418,6 +534,8 @@ def _persist_scan_memory(
             "bridge_version": SUPERBRAIN_BRIDGE_VERSION,
             "reasoner_version": REASONER_VERSION,
             "tv_source_count": len(tv_compact),
+            "nonarrival_schema": "SBNA1_COMPACT",
+            "nonarrival": _compact_nonarrival_for_memory(analysis, evidence),
         }),
         "updated_at": now,
     }
@@ -822,7 +940,7 @@ def _apply_trade_plan(store: BaseStore, instrument: str, mode: str, scan_id: str
 # ============================================================================
 # SB3.8 relevance / path / non-arrival intelligence overrides
 # ============================================================================
-SUPERBRAIN_BRIDGE_VERSION = "SB4.0_LOCKED_STREAMLIT"
+SUPERBRAIN_BRIDGE_VERSION = "SB4.2_NA_COMPACT_PERSISTENCE"
 
 _compact_live_odme_sb37 = _compact_live_odme
 _apply_trade_plan_sb37 = _apply_trade_plan
