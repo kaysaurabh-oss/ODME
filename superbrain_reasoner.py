@@ -4287,3 +4287,237 @@ def analyze_market(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], 
     base["waiting_for"] = [_relevant_setup_text(base, evidence)] if _u(plan.get("kind")) not in {"NEW", "MANAGE"} else []
     base["narrative"] = _narrative(base, evidence, plan)
     return base
+
+
+# =============================================================================
+# SB4.0 LOCKED STREAMLIT PRESENTATION OVERRIDES
+# =============================================================================
+# The calculation engine above remains authoritative.  SB4.0 only locks the
+# operational presentation requested for Streamlit and replaces legacy
+# TAKE/PASS wording with Consider/Avoid/Wait.
+REASONER_VERSION = "SB4.0_LOCKED_STREAMLIT"
+
+
+def _sb40_expiry_label(evidence: Dict[str, Any]) -> str:
+    expiry = _expiry_datetime(evidence)
+    return expiry.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%d %b") if expiry else "?"
+
+
+def _sb40_path_dates(path: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, str]:
+    path = path or {}
+    return {
+        "stressed": _format_date_iso(path.get("fastest_arrival"), evidence) if path.get("fastest_arrival") else "?",
+        "expected": _format_date_iso(path.get("expected_arrival"), evidence) if path.get("expected_arrival") else "?",
+        "safe": _format_date_iso(path.get("safe_through"), evidence) if path.get("safe_through") else "?",
+    }
+
+
+def _sb40_candidate_line(candidate: Dict[str, Any], evidence: Dict[str, Any], decision: str) -> str:
+    candidate = candidate or {}
+    path = candidate.get("path", {}) or {}
+    d = _sb40_path_dates(path, evidence)
+    strike = _fmt(candidate.get("strike"))
+    side = _u(candidate.get("option"))
+    reward = _fmt_money(candidate.get("reward"))
+    risk = _fmt_money(candidate.get("stress_risk"))
+    expiry = _sb40_expiry_label(evidence)
+    return (
+        f"{decision} {strike} {side}, {expiry} expiry | Safe through {d['safe']} | "
+        f"Expected arrival {d['expected']} | Reward {reward} | Stress risk {risk}"
+    )
+
+
+def _sb40_strangle_line(pe: Dict[str, Any], ce: Dict[str, Any], evidence: Dict[str, Any], reward: Any, risk: Any, decision: str) -> str:
+    pe_d = _sb40_path_dates((pe or {}).get("path", {}) or {}, evidence)
+    ce_d = _sb40_path_dates((ce or {}).get("path", {}) or {}, evidence)
+    # weaker side controls protection; safe-through is the earlier date.
+    pe_safe_iso = _s(((pe or {}).get("path", {}) or {}).get("safe_through"))
+    ce_safe_iso = _s(((ce or {}).get("path", {}) or {}).get("safe_through"))
+    safe_iso = min([x for x in (pe_safe_iso, ce_safe_iso) if x], default="")
+    safe = _format_date_iso(safe_iso, evidence) if safe_iso else "?"
+    expiry = _sb40_expiry_label(evidence)
+    return (
+        f"{decision} {_fmt((ce or {}).get('strike'))} CE / {_fmt((pe or {}).get('strike'))} PE, {expiry} expiry | "
+        f"Safe through {safe} | Expected arrival CE {ce_d['expected']} / PE {pe_d['expected']} | "
+        f"Reward {_fmt_money(reward)} | Stress risk {_fmt_money(risk)}"
+    )
+
+
+def _sb40_nonarrival_assessment(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, Any]) -> Dict[str, Any]:
+    if _s(evidence.get("mode")) != "TV + ODME":
+        text = "Wait | fresh live option-chain assessment is unavailable"
+        return {"decision": "WAIT", "text": text, "compact_line": text}
+
+    st = _u(plan.get("strategy_type"))
+    kind = _u(plan.get("kind"))
+
+    # Selected non-arrival expression.
+    if kind == "NEW" and st in {"SHORT_PE", "SHORT_CE", "SHORT_STRANGLE"}:
+        if st == "SHORT_STRANGLE":
+            pe = _best_side_candidate(base, evidence, "PE")
+            ce = _best_side_candidate(base, evidence, "CE")
+            if pe and ce:
+                text = _sb40_strangle_line(pe, ce, evidence, plan.get("reward"), plan.get("risk"), "Consider")
+                return {"decision": "CONSIDER", "text": text, "compact_line": text, "pe": pe, "ce": ce}
+        chosen = plan.get("nonarrival_snapshot", {}) or {}
+        if chosen and chosen.get("strike"):
+            text = _sb40_candidate_line(chosen, evidence, "Consider")
+            return {"decision": "CONSIDER", "text": text, "compact_line": text, "candidate": chosen}
+
+    odme = evidence.get("odme", {}) or {}
+    pe_sale_ok = _sale_action_ok(odme, "PE")
+    ce_sale_ok = _sale_action_ok(odme, "CE")
+    pe_best = _best_side_candidate(base, evidence, "PE") if pe_sale_ok else None
+    ce_best = _best_side_candidate(base, evidence, "CE") if ce_sale_ok else None
+
+    # A protected candidate exists but another expression/campaign has priority.
+    if pe_best or ce_best:
+        candidates = [x for x in (pe_best, ce_best) if x]
+        best = max(candidates, key=lambda x: float(x.get("score", 0) or 0))
+        decision = "Wait" if kind in {"NEW", "MANAGE"} else "Consider"
+        text = _sb40_candidate_line(best, evidence, decision)
+        if decision == "Wait":
+            text += " | existing/selected exposure has priority"
+        return {"decision": decision.upper(), "text": text, "compact_line": text, "candidate": best}
+
+    # No fully protected candidate.  Show the most informative evaluated strike
+    # if one exists so the user still sees path/reward/risk rather than a generic PASS.
+    raw_candidates: List[Dict[str, Any]] = []
+    if pe_sale_ok:
+        x = _sb39_first_evaluated_candidate(base, evidence, "PE")
+        if x:
+            raw_candidates.append(x)
+    if ce_sale_ok:
+        x = _sb39_first_evaluated_candidate(base, evidence, "CE")
+        if x:
+            raw_candidates.append(x)
+    if raw_candidates:
+        best_raw = max(raw_candidates, key=lambda x: float(x.get("score", 0) or 0))
+        text = _sb40_candidate_line(best_raw, evidence, "Avoid")
+        text += " | protection/reward filters are not satisfied"
+        return {"decision": "AVOID", "text": text, "compact_line": text, "candidate": best_raw}
+
+    reasons: List[str] = []
+    if not pe_sale_ok:
+        reasons.append("put selling not approved by current option positioning")
+    if not ce_sale_ok:
+        reasons.append("call selling not approved by current option positioning")
+    reason = "; ".join(reasons) if reasons else "no listed strike currently meets protection/reward requirements"
+    text = f"Wait | {reason}"
+    return {"decision": "WAIT", "text": text, "compact_line": text}
+
+
+def _sb40_directional_state(base: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    kind = _u(plan.get("kind"))
+    direction = _u(plan.get("direction"))
+    if kind in {"NEW", "MANAGE"}:
+        if direction == "BULLISH":
+            return "LONG"
+        if direction == "BEARISH":
+            return "SHORT"
+    return "WATCH"
+
+
+def _sb40_exposure_line(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    kind = _u(plan.get("kind"))
+    action = _u(plan.get("action"))
+    st = _u(plan.get("strategy_type"))
+    if kind == "MANAGE":
+        current = plan.get("current_legs", []) or plan.get("legs", []) or []
+        exposure = _expression_exposure_text(current)
+        if action == "REDUCE" and _u(plan.get("campaign_operation")) == "ROTATE":
+            new_desc = _strategy_from_trade_plan({
+                "strategy_type": plan.get("next_strategy_type") or plan.get("strategy_type"),
+                "legs": plan.get("new_legs", []) or [],
+            })
+            return f"Exposure: {exposure}. Management: REDUCE / CHANGE EXPRESSION to {new_desc}."
+        return f"Exposure: {exposure}. Management: {action or 'HOLD'}."
+    if kind == "NEW" and st not in {"SHORT_PE", "SHORT_CE", "SHORT_STRANGLE"}:
+        return f"Exposure: {_strategy_text(plan)}. Management: ENTER."
+    if kind == "NEW" and st in {"SHORT_PE", "SHORT_CE", "SHORT_STRANGLE"}:
+        return "No directional exposure. Non-arrival opportunity is shown below."
+
+    wait = _relevant_setup_text(base, evidence)
+    if wait:
+        return f"No exposure. {wait}"
+    focus = _current_focus(base, evidence)
+    if focus == "BULLISH":
+        return "No exposure. Waiting for long-side confirmation."
+    if focus == "BEARISH":
+        return "No exposure. Waiting for short-side confirmation."
+    return "No exposure. Waiting for a clean directional release."
+
+
+def _sb40_compact_commentary(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    # 2–5 short sentences, direct on screen.  Full reasoning remains in the
+    # evidence and can be explored interactively through Ask AI / ChatGPT.
+    sentences: List[str] = []
+
+    battlefield = _sb39_battlefield_sentence(base, evidence).strip()
+    if battlefield:
+        sentences.append(_sentence_case(battlefield) + ("" if battlefield.endswith(".") else "."))
+
+    action = _sb39_action_zone_sentence(base).strip()
+    momentum = _sb39_momentum_sentence(base).strip()
+    if action and momentum:
+        sentences.append(_sentence_case(action) + "; " + momentum[:1].lower() + momentum[1:] + ("" if momentum.endswith(".") else "."))
+    elif action:
+        sentences.append(_sentence_case(action) + ("" if action.endswith(".") else "."))
+    elif momentum:
+        sentences.append(_sentence_case(momentum) + ("" if momentum.endswith(".") else "."))
+
+    kind = _u(plan.get("kind"))
+    if kind == "MANAGE":
+        health = _u(plan.get("behavior_health"))
+        reason = _sentence_case(plan.get("reason"))
+        if health or reason:
+            label = health or "ON_PLAN"
+            sentences.append(f"Expected vs actual: {label}. {reason}." if reason else f"Expected vs actual: {label}.")
+    elif kind == "NEW":
+        reason = _sentence_case(plan.get("reason"))
+        if reason:
+            sentences.append(reason + ("" if reason.endswith(".") else "."))
+    else:
+        wait = _relevant_setup_text(base, evidence)
+        if wait:
+            sentences.append(_sentence_case(wait) + ("" if wait.endswith(".") else "."))
+
+    # Options gets one brief sentence only when live ODME exists.
+    if _s(evidence.get("mode")) == "TV + ODME":
+        opt = _sb39_options_sentence(evidence).strip()
+        if opt:
+            sentences.append(_sentence_case(opt) + ("" if opt.endswith(".") else "."))
+
+    # De-duplicate and hard-cap to preserve the locked concise display.
+    out: List[str] = []
+    seen = set()
+    for s in sentences:
+        clean = " ".join(str(s).split())
+        key = clean.lower()
+        if clean and key not in seen:
+            out.append(clean)
+            seen.add(key)
+        if len(out) >= 4:
+            break
+    return " ".join(out)
+
+
+def analyze_market(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], open_trades: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    # Keep SB3.7/SB3.9 deterministic market calculations and campaign engine.
+    base = _analyze_market_sb37(evidence, previous_evidence, open_trades=open_trades)
+    plan = base.get("trade_plan", {}) or {}
+    base["reasoner_version"] = REASONER_VERSION
+    base["trade_plan"] = plan
+    base["relevance_focus"] = _u(plan.get("relevance_focus") or _current_focus(base, evidence))
+    base["waiting_for"] = [_relevant_setup_text(base, evidence)] if _u(plan.get("kind")) not in {"NEW", "MANAGE"} else []
+
+    na = _sb40_nonarrival_assessment(base, evidence, plan)
+    base["nonarrival_assessment"] = na
+    base["compact_state"] = _sb40_directional_state(base, plan)
+    base["compact_exposure"] = _sb40_exposure_line(base, evidence, plan)
+    base["compact_nonarrival"] = na.get("compact_line", na.get("text", ""))
+    base["compact_commentary"] = _sb40_compact_commentary(base, evidence, plan)
+    # Narrative is also concise so no other UI accidentally exposes the old
+    # long report / TAKE-PASS wording.
+    base["narrative"] = base["compact_commentary"]
+    return base

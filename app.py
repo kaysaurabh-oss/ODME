@@ -14,7 +14,7 @@ from odme_engine import analyze_odme, reconstruct_saved_result
 from scan_service import run_odme_scan
 from superbrain_bridge import build_instrument_map, prepare_superbrain_scan, SUPERBRAIN_BRIDGE_VERSION
 
-st.set_page_config(page_title="EDGE", layout="wide")
+st.set_page_config(page_title="ODME Angel", layout="wide")
 
 
 @st.cache_resource(show_spinner=False)
@@ -60,8 +60,8 @@ def init_session() -> None:
 
 def login_page() -> None:
     inject_css()
-    st.title("**EDGE** - **E**xecution & **D**ecision **G**uidance **E**ngine")
-    st.caption("TradingView + options-positioning market intelligence terminal")
+    st.title(APP_NAME)
+    st.caption("ODME + TradingView market intelligence terminal")
 
     render_public_superbrain()
 
@@ -95,22 +95,21 @@ def login_page() -> None:
 
 
 def render_public_superbrain() -> None:
-    """Public, no-login SuperBrain entry point.
+    """Public, no-login SuperBrain terminal in the locked concise format."""
+    st.subheader("Ask SuperBrain")
+    st.caption(f"Core build: {SUPERBRAIN_BRIDGE_VERSION}")
 
-    The instrument list is derived only from TV_TEST_CURRENT. ODME attachment is
-    an exact instrument-column match; there is no manual alias registry.
-    """
     try:
         store = get_store()
     except Exception as exc:
         st.error(f"Could not load SuperBrain instruments: {exc}")
         return
+
     try:
         _run_expired_cleanup_once(store, show_notice=False)
     except Exception:
-        # Cleanup must never block public market access. The authenticated UI
-        # will surface cleanup errors if they persist.
         pass
+
     try:
         mapping = build_instrument_map(store)
     except Exception as exc:
@@ -124,10 +123,11 @@ def render_public_superbrain() -> None:
     instruments = mapping["instrument"].astype(str).tolist()
     instrument = st.selectbox("Instrument", instruments, key="public_superbrain_instrument")
     row = mapping[mapping["instrument"].eq(instrument)].iloc[0].to_dict()
+
     if row.get("odme_scan_enabled"):
-        st.caption(f"{instrument}: market + options positioning available ({row.get('selected_expiry')}).")
+        st.caption(f"{instrument}: TradingView + ODME enabled ({row.get('selected_expiry')}).")
     else:
-        st.caption(f"{instrument}: market view available; no options-positioning layer is configured for this instrument in the terminal.")
+        st.caption(f"{instrument}: TradingView mode; ODME is used when this exact instrument is enabled for scanning.")
 
     if st.button("Ask SuperBrain", type="primary", use_container_width=True, key="ask_superbrain_public"):
         with st.spinner("Refreshing market inputs..."):
@@ -142,35 +142,60 @@ def render_public_superbrain() -> None:
     if not packet or str(packet.get("instrument", "")) != instrument:
         return
 
-    if packet.get("odme_error"):
-        st.warning(f"The options-positioning refresh was not usable, so this scan used market data only: {packet.get('odme_error')}")
-
     analysis = packet.get("analysis", {}) or {}
-    if analysis:
-        if analysis.get("freshness_line"):
-            st.caption(str(analysis.get("freshness_line")))
-        view_label = str(analysis.get("view_label", "WAIT") or "WAIT")
-        st.markdown(f"#### SuperBrain view — {view_label}")
-        narrative = str(analysis.get("narrative", "") or "").strip()
-        with st.expander("Detailed commentary", expanded=False):
-            if narrative:
-                st.markdown(narrative)
-            else:
-                st.markdown("Market conditions were read successfully, but no actionable narrative was produced for this scan.")
+    if not analysis:
+        st.warning("SuperBrain returned no analysis for this scan.")
+        return
 
-            exposure = analysis.get("recorded_exposure", {}) or {}
-            if exposure:
-                action = str(exposure.get("action", "") or "").upper()
-                trade_id = str(exposure.get("trade_id", "") or "")
-                if action in {"ENTER", "OPEN"}:
-                    st.caption(f"SuperBrain exposure recorded: {trade_id}. Future scans will manage this exposure; broker positions are not read.")
-                elif action:
-                    st.caption(f"SuperBrain exposure {trade_id} updated: {action}. Broker positions are not read.")
+    # Small freshness/source line only; the operational view remains concise.
+    sources = ", ".join(packet.get("tv_sources", [])) or "TradingView"
+    if packet.get("odme_live"):
+        expiry = str(packet.get("mapping", {}).get("selected_expiry", "") or "")
+        st.caption(f"Live scan: {sources} + ODME {expiry}")
+    else:
+        st.caption(f"Live scan: {sources} (TV-only)")
+        if packet.get("odme_error"):
+            st.caption(f"ODME unavailable for this scan: {packet.get('odme_error')}")
 
-            memory = packet.get("memory", {}) or {}
-            if not memory.get("had_previous_state"):
-                st.caption("SuperBrain memory initialized for this instrument. No broker positions are read.")
+    state = str(analysis.get("compact_state", "WATCH") or "WATCH").upper()
+    st.markdown("### SuperBrain View")
+    if state == "LONG":
+        st.success(f"LONG — {instrument}")
+    elif state == "SHORT":
+        st.error(f"SHORT — {instrument}")
+    else:
+        st.warning(f"WATCH — {instrument}")
 
+    exposure = str(analysis.get("compact_exposure", "") or "").strip()
+    if exposure:
+        st.markdown(exposure)
+
+    nonarrival = str(analysis.get("compact_nonarrival", "") or "").strip()
+    if not nonarrival:
+        na = analysis.get("nonarrival_assessment", {}) or {}
+        nonarrival = str(na.get("compact_line") or na.get("text") or "").strip()
+    if nonarrival:
+        st.markdown(f"**Non-arrival:** {nonarrival}")
+
+    st.markdown("#### Detailed Commentary")
+    commentary = str(analysis.get("compact_commentary", "") or analysis.get("narrative", "") or "").strip()
+    if commentary:
+        st.write(commentary)
+    else:
+        st.caption("No additional commentary for this scan.")
+
+    # Ask AI deliberately does not call an API.  It opens ChatGPT for the rich,
+    # interactive analysis against SUPERBRAIN_RULES + live ODME/TV data.
+    if hasattr(st, "link_button"):
+        st.link_button("Ask AI", "https://chatgpt.com/", use_container_width=True)
+    else:
+        st.markdown(
+            '<a href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer" '
+            'style="display:block;text-align:center;padding:.55rem 1rem;border:1px solid rgba(128,128,128,.35);'
+            'border-radius:.5rem;text-decoration:none;font-weight:700;">Ask AI</a>',
+            unsafe_allow_html=True,
+        )
+    st.caption(f"In ChatGPT ask: SB {instrument} — or SB ALL for all enabled instruments.")
 
 def _run_expired_cleanup_once(store: Any, show_notice: bool = True) -> None:
     """Automatically remove finished-expiry ODME snapshots once per India date."""
@@ -696,7 +721,7 @@ def style_chain_table(df: pd.DataFrame, result: Dict[str, Any]):
 def app_header(store) -> None:
     left, right = st.columns([3, 1])
     with left:
-        st.title("**EDGE** - **E**xecution & **D**ecision **G**uidance **E**ngine")
+        st.title(APP_NAME)
         st.caption("Live Angel option-chain read → compact ODME summary saved to Google Sheets.")
     with right:
         if st.button("Logout"):

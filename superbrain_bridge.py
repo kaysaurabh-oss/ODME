@@ -822,7 +822,7 @@ def _apply_trade_plan(store: BaseStore, instrument: str, mode: str, scan_id: str
 # ============================================================================
 # SB3.8 relevance / path / non-arrival intelligence overrides
 # ============================================================================
-SUPERBRAIN_BRIDGE_VERSION = "SB3.9_MARKET_VIEW_EXPECTED_BEHAVIOR"
+SUPERBRAIN_BRIDGE_VERSION = "SB4.0_LOCKED_STREAMLIT"
 
 _compact_live_odme_sb37 = _compact_live_odme
 _apply_trade_plan_sb37 = _apply_trade_plan
