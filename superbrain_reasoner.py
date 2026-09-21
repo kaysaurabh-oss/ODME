@@ -3939,3 +3939,351 @@ def analyze_market(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], 
     base["waiting_for"] = [_relevant_setup_text(base, evidence)] if _u(plan.get("kind")) not in {"NEW", "MANAGE"} else []
     base["narrative"] = _narrative(base, evidence, plan)
     return base
+
+# =============================================================================
+# SB3.9 market-view commentary / explicit non-arrival conclusion overrides
+# =============================================================================
+REASONER_VERSION = "SB3.9_MARKET_VIEW_EXPECTED_BEHAVIOR"
+
+
+def _sb39_zone_text(low: Any, high: Any) -> str:
+    return f"{_fmt(low)}–{_fmt(high)}"
+
+
+def _sb39_battlefield_sentence(base: Dict[str, Any], evidence: Dict[str, Any]) -> str:
+    price = _f(base.get("price"))
+    macro = _u(base.get("macro"))
+    defender = base.get("defender", {}) or {}
+    challenger = base.get("challenger", {}) or {}
+    edge = _source_map(evidence).get("EDGE", {}) or {}
+    raw = edge.get("raw_json") if isinstance(edge.get("raw_json"), dict) else {}
+    pct = _f(raw.get("battlefield_range_position_pct"))
+    divider = _f(raw.get("battlefield_divider"))
+
+    loc = ""
+    if pct is not None:
+        if pct <= 20:
+            loc = "near the lower end of the battlefield"
+        elif pct >= 80:
+            loc = "near the upper end of the battlefield"
+        elif pct < 45:
+            loc = "in the lower half of the battlefield"
+        elif pct > 55:
+            loc = "in the upper half of the battlefield"
+        else:
+            loc = "near the middle of the battlefield"
+    elif _u(base.get("battlefield_half")) == "DEFENDER_HALF":
+        loc = "on the defended side of the battlefield"
+    elif _u(base.get("battlefield_half")) == "CHALLENGER_HALF":
+        loc = "on the opposing side of the battlefield"
+    else:
+        loc = "inside the active battlefield"
+
+    context: List[str] = []
+    if _zone_valid(defender):
+        noun = "demand" if _u(defender.get("side")) == "DEMAND" else "supply"
+        context.append(f"major {noun} is {_sb39_zone_text(defender.get('low'), defender.get('high'))}")
+    if _zone_valid(challenger):
+        noun = "supply" if _u(challenger.get("side")) == "SUPPLY" else "demand"
+        context.append(f"opposing {noun} is {_sb39_zone_text(challenger.get('low'), challenger.get('high'))}")
+    suffix = "; " + ", while ".join(context) if context else ""
+    macro_text = "bullish" if macro == "BULLISH" else "bearish" if macro == "BEARISH" else "balanced"
+    div_text = f" around a {_fmt(divider)} battlefield divider" if divider is not None and not context else ""
+    return f"Price {_fmt(price)} is {loc} in a {macro_text} strategic map{suffix}{div_text}."
+
+
+def _sb39_action_zone_sentence(base: Dict[str, Any]) -> str:
+    price = _f(base.get("price"))
+    hurdles = [h for h in (base.get("hurdles", []) or []) if isinstance(h, dict)]
+    if not hurdles:
+        poi = base.get("poi", {}) or {}
+        if poi and _f(poi.get("low")) is not None and _f(poi.get("high")) is not None:
+            side = "demand" if _u(poi.get("side")) == "DEMAND" else "supply"
+            return f"The nearest actionable {side} area is {_sb39_zone_text(poi.get('low'), poi.get('high'))}; it is {_s(poi.get('status')).replace('_', ' ').lower() or 'active'}."
+        return "No nearby qualified action zone is close enough to control the immediate decision."
+
+    # Mention at most the two nearest useful zones, preserving relevance without
+    # turning the commentary into an inventory of every historical hurdle.
+    ranked = sorted(hurdles, key=lambda h: (_f(h.get("distance")) if _f(h.get("distance")) is not None else 1e99))[:2]
+    parts: List[str] = []
+    for h in ranked:
+        side = "demand" if _u(h.get("side")) == "DEMAND" else "supply"
+        status = _s(h.get("status")).replace("_", " ").lower()
+        strength = _s(h.get("strength")).lower()
+        
+        status = {"touched reduced": "previously tested", "active fresh": "fresh", "active": "active"}.get(status, status)
+        descriptor = " ".join(x for x in (strength, status) if x).strip()
+        z = _sb39_zone_text(h.get("low"), h.get("high"))
+        if price is not None and _f(h.get("low")) is not None and _f(h.get("high")) is not None:
+            interacting = _f(h.get("low")) <= price <= _f(h.get("high"))
+        else:
+            interacting = False
+        if interacting:
+            parts.append(f"price is interacting with {descriptor + ' ' if descriptor else ''}{side} at {z}")
+        else:
+            parts.append(f"{descriptor + ' ' if descriptor else ''}{side} at {z} is the next relevant action zone")
+    return "; ".join(parts).capitalize() + "."
+
+
+def _sb39_momentum_sentence(base: Dict[str, Any]) -> str:
+    aur = base.get("aurora", {}) or {}
+    return _momentum_sentence(_u(aur.get("transition")), _u(aur.get("state")), _u(base.get("exec_of")))
+
+
+def _sb39_structure_sentence(base: Dict[str, Any], evidence: Dict[str, Any]) -> str:
+    fork = base.get("fork", {}) or {}
+    structure = _source_map(evidence).get("STRUCTURE", {}) or {}
+    trend = _u(structure.get("structure_trend"))
+    if not fork.get("valid") and not trend:
+        return "The current structural channel is not providing a usable directional read."
+    t = "upward" if trend == "UP" else "downward" if trend == "DOWN" else "mixed"
+    pos = _u(fork.get("position"))
+    pos_map = {
+        "ABOVE_UPPER_2SD": "price is stretched above the upper extreme",
+        "UPPER_1SD_TO_2SD": "price is in the upper extension area",
+        "MEDIAN_TO_UPPER_1SD": "price is above the channel median",
+        "LOWER_1SD_TO_MEDIAN": "price is below the channel median",
+        "LOWER_2SD_TO_1SD": "price is in the lower extension area",
+        "BELOW_LOWER_2SD": "price is stretched below the lower extreme",
+    }
+    detail = pos_map.get(pos, "price is inside the active structural channel")
+    if fork.get("reclaimed_2sd"):
+        side = "lower" if _u(fork.get("reclaim_side")) == "LOWER" else "upper"
+        detail += f" after reclaiming the {side} extreme"
+    return f"The broader swing structure is {t}; {detail}."
+
+
+def _sb39_liquidity_sentence(base: Dict[str, Any]) -> str:
+    liq = base.get("liquidity", {}) or {}
+    above, below = _f(liq.get("above_level")), _f(liq.get("below_level"))
+    event, level, meaning = _u(liq.get("event")), _f(liq.get("level")), _s(liq.get("meaning"))
+    parts: List[str] = []
+    if above is not None:
+        parts.append(f"upside liquidity sits near {_fmt(above)}")
+    if below is not None:
+        parts.append(f"downside liquidity sits near {_fmt(below)}")
+    if event and level is not None and meaning:
+        parts.append(f"the latest confirmed event at {_fmt(level)} shows {meaning}")
+    if not parts:
+        return "Liquidity is not materially changing the immediate path on this scan."
+    return "; ".join(parts).capitalize() + "."
+
+
+def _sb39_extract_option_note(odme: Dict[str, Any]) -> str:
+    text = _s(odme.get("commentary"))
+    if not text:
+        return ""
+    # ODME commentary is structured in labelled sentences.  Pull only the one
+    # genuinely decision-useful warning/support sentence instead of replaying it.
+    chunks = [x.strip() for x in re.split(r"(?=\b(?:Important|CE Action|PE Action|Final Action):)", text) if x.strip()]
+    important = next((x for x in chunks if x.lower().startswith("important:")), "")
+    if important:
+        return important.split("Important:", 1)[-1].strip().rstrip(".")
+    return ""
+
+
+def _sb39_options_sentence(evidence: Dict[str, Any]) -> str:
+    if _s(evidence.get("mode")) != "TV + ODME":
+        return "Fresh options positioning is unavailable on this scan, so no option-based conclusion is being used."
+    odme = evidence.get("odme", {}) or {}
+    if not odme:
+        return "Fresh options positioning is unavailable on this scan, so no option-based conclusion is being used."
+    poc = _f(odme.get("option_poc"))
+    ce = _f(odme.get("active_ce_wall") or odme.get("ce_wall"))
+    pe = _f(odme.get("active_pe_wall") or odme.get("pe_wall"))
+    safe_ce = _f(odme.get("safer_sell_ce"))
+    safe_pe = _f(odme.get("safer_sell_pe"))
+    tilt = _s(odme.get("odme_tilt")) or "mixed"
+    range_score = _f(odme.get("range_score"))
+    expansion_score = _f(odme.get("expansion_score"))
+    bits: List[str] = []
+    if poc is not None:
+        bits.append(f"POC {_fmt(poc)}")
+    if ce is not None:
+        bits.append(f"call wall {_fmt(ce)}")
+    if pe is not None:
+        bits.append(f"put wall {_fmt(pe)}")
+    sentence = f"Options are {tilt.lower()}" + (" with " + ", ".join(bits) if bits else "") + "."
+    if range_score is not None and expansion_score is not None:
+        if expansion_score >= range_score + 15:
+            sentence += " Positioning is leaning more toward expansion than clean containment."
+        elif range_score >= expansion_score + 15:
+            sentence += " Positioning is more compatible with containment/theta than expansion."
+        else:
+            sentence += " Range and expansion evidence remain mixed."
+    safe: List[str] = []
+    if safe_ce is not None:
+        safe.append(f"safer call-sale boundary {_fmt(safe_ce)}")
+    if safe_pe is not None:
+        safe.append(f"safer put-sale boundary {_fmt(safe_pe)}")
+    if safe:
+        sentence += " " + ", ".join(safe).capitalize() + "."
+    note = _sb39_extract_option_note(odme)
+    if note:
+        sentence += " " + _sentence_case(note) + "."
+    return sentence
+
+
+def _sb39_candidate_failure_reason(candidate: Optional[Dict[str, Any]], side: str) -> str:
+    if not candidate:
+        return f"no usable listed {side} candidate is available beyond the safer boundary"
+    path = candidate.get("path", {}) or {}
+    if not candidate.get("valid"):
+        return f"the {side} path cannot be modelled reliably from the current data"
+    if not path.get("protected_through_expiry"):
+        return f"the {side} strike is not protected through expiry on the composite path"
+    if abs(float(candidate.get("delta", 0) or 0)) > 0.30:
+        return f"the {side} strike carries too much directional delta for a non-arrival sale"
+    reward = float(candidate.get("reward", 0) or 0)
+    stress = float(candidate.get("stress_risk", 0) or 0)
+    if reward <= 0:
+        return f"the {side} strike does not offer usable executable premium"
+    if stress > 0 and reward / stress < 0.25:
+        return f"the {side} premium is too small relative to estimated stress risk"
+    return f"the {side} candidate does not pass the current sale filters"
+
+
+def _sb39_first_evaluated_candidate(base: Dict[str, Any], evidence: Dict[str, Any], option: str) -> Optional[Dict[str, Any]]:
+    odme = evidence.get("odme", {}) or {}
+    if not odme or _s(evidence.get("mode")) != "TV + ODME":
+        return None
+    if not _sale_action_ok(odme, option):
+        return None
+    rows = _candidate_rows_for_side(base, evidence, option)
+    if not rows:
+        return None
+    return _evaluate_short_option(base, evidence, option, rows[0])
+
+
+def _sb39_nonarrival_assessment(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, Any]) -> Dict[str, Any]:
+    if _s(evidence.get("mode")) != "TV + ODME":
+        return {"decision": "WAIT", "text": "Non-arrival cannot be concluded because a fresh live option-chain assessment is unavailable."}
+
+    st = _u(plan.get("strategy_type"))
+    if _u(plan.get("kind")) == "NEW" and st in {"SHORT_PE", "SHORT_CE", "SHORT_STRANGLE"}:
+        legs = plan.get("legs", []) or []
+        if st == "SHORT_STRANGLE":
+            ce = next((x for x in legs if _u(x.get("option")) == "CE"), {})
+            pe = next((x for x in legs if _u(x.get("option")) == "PE"), {})
+            desc = f"sell {_fmt(ce.get('strike'))} CE and {_fmt(pe.get('strike'))} PE"
+        else:
+            leg = legs[0] if legs else {}
+            desc = f"sell {_fmt(leg.get('strike'))} {_u(leg.get('option'))}"
+        path = plan.get("path_snapshot", {}) or {}
+        safe = _format_date_iso(path.get("safe_through"), evidence)
+        expiry = _expiry_datetime(evidence)
+        exp = expiry.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%d %b") if expiry else "?"
+        return {
+            "decision": "TAKE",
+            "text": f"TAKE — {desc}. The selected strike protection remains intact through {safe} against {exp} expiry; expected premium reward {_fmt_money(plan.get('reward'))} versus estimated stress risk {_fmt_money(plan.get('risk'))}. {_sentence_case(plan.get('reason'))}.",
+        }
+
+    odme = evidence.get("odme", {}) or {}
+    pe_sale_ok = _sale_action_ok(odme, "PE")
+    ce_sale_ok = _sale_action_ok(odme, "CE")
+    pe_best = _best_side_candidate(base, evidence, "PE") if pe_sale_ok else None
+    ce_best = _best_side_candidate(base, evidence, "CE") if ce_sale_ok else None
+    # If a good candidate exists but another directional expression was selected,
+    # state that it was evaluated and deliberately not used as the primary trade.
+    if pe_best or ce_best:
+        candidates = [x for x in (pe_best, ce_best) if x]
+        best = max(candidates, key=lambda x: float(x.get("score", 0) or 0))
+        side = _u(best.get("option"))
+        safe = _format_date_iso((best.get("path", {}) or {}).get("safe_through"), evidence)
+        selected = _strategy_text(plan) if _u(plan.get("kind")) == "NEW" else "the existing campaign expression" if _u(plan.get("kind")) == "MANAGE" else "the current market decision"
+        txt = (
+            f"PASS as additional fresh exposure — {_fmt(best.get('strike'))} {side} is individually protected through {safe}, "
+            f"but {selected} is preferred on this scan. Premium reward {_fmt_money(best.get('reward'))} versus estimated stress risk {_fmt_money(best.get('stress_risk'))}."
+        )
+        return {"decision": "PASS", "text": txt}
+
+    pe_raw = _sb39_first_evaluated_candidate(base, evidence, "PE") if pe_sale_ok else None
+    ce_raw = _sb39_first_evaluated_candidate(base, evidence, "CE") if ce_sale_ok else None
+    reasons: List[str] = []
+    if pe_sale_ok:
+        reasons.append(_sb39_candidate_failure_reason(pe_raw, "PE"))
+    else:
+        reasons.append("put selling is not approved by the current option positioning")
+    if ce_sale_ok:
+        reasons.append(_sb39_candidate_failure_reason(ce_raw, "CE"))
+    else:
+        reasons.append("call selling is not approved by the current option positioning")
+    return {"decision": "PASS", "text": "PASS — no naked non-arrival entry now because " + "; ".join(reasons) + "."}
+
+
+def _sb39_behavior_sentence(plan: Dict[str, Any]) -> str:
+    health = _u(plan.get("behavior_health"))
+    expected = _s(plan.get("expected_behavior"))
+    reason = _s(plan.get("reason"))
+    if not health and not expected:
+        return ""
+    label = health or "ON_PLAN"
+    if expected and reason:
+        return f"Expected vs actual: {label}. Expected: {expected}. Actual: {_sentence_case(reason)}."
+    if expected:
+        return f"Expected vs actual: {label}. Expected: {expected}."
+    return f"Expected vs actual: {label}. {_sentence_case(reason)}."
+
+
+def _sb39_decision_sentence(base: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    kind, action, st = _u(plan.get("kind")), _u(plan.get("action")), _u(plan.get("strategy_type"))
+    price = _f(base.get("price"))
+    if kind == "NEW":
+        if st in {"SHORT_PE", "SHORT_CE", "SHORT_STRANGLE"}:
+            return "Decision: TAKE the non-arrival exposure described above."
+        return f"Decision: TAKE {_strategy_text(plan)} at spot {_fmt(price)}. {_sentence_case(plan.get('reason'))}."
+    if kind == "MANAGE":
+        current = plan.get("current_legs", []) or plan.get("legs", []) or []
+        exposure = _expression_exposure_text(current)
+        if action == "HOLD":
+            return f"Decision: HOLD {exposure}."
+        if action == "ADD":
+            return f"Decision: ADD to {exposure}."
+        if action == "REDUCE" and _u(plan.get("campaign_operation")) == "ROTATE":
+            new_desc = _strategy_from_trade_plan({"strategy_type": plan.get("next_strategy_type") or plan.get("strategy_type"), "legs": plan.get("new_legs", []) or []})
+            return f"Decision: REDUCE {exposure} and CHANGE EXPRESSION into {new_desc}."
+        if action == "REDUCE":
+            return f"Decision: REDUCE {exposure}."
+        if action == "EXIT":
+            return f"Decision: EXIT {exposure} now."
+        return f"Decision: MANAGE {exposure}."
+    focus = _u(plan.get("relevance_focus") or base.get("relevance_focus"))
+    if focus not in {"BULLISH", "BEARISH", "NEUTRAL"}:
+        focus = _current_focus(base, {})
+    if focus == "BULLISH":
+        return "Decision: WAIT for long-side confirmation; location is constructive but behaviour has not released the trade."
+    if focus == "BEARISH":
+        return "Decision: WAIT for short-side confirmation; location is constructive but behaviour has not released the trade."
+    return "Decision: NO DIRECTIONAL EXPOSURE; neither side has released a clean trade."
+
+
+def _narrative(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    # Every scan follows the same human reading order.  Relevance controls depth,
+    # not whether SuperBrain explains the market.
+    sections = [
+        f"**Battlefield:** {_sb39_battlefield_sentence(base, evidence)}",
+        f"**Action zones:** {_sb39_action_zone_sentence(base)}",
+        f"**Momentum:** {_sb39_momentum_sentence(base)}",
+        f"**Structure:** {_sb39_structure_sentence(base, evidence)}",
+        f"**Liquidity:** {_sb39_liquidity_sentence(base)}",
+        f"**Options:** {_sb39_options_sentence(evidence)}",
+    ]
+    na = _sb39_nonarrival_assessment(base, evidence, plan)
+    sections.append(f"**Non-arrival:** {na.get('text', '')}")
+    behavior = _sb39_behavior_sentence(plan) if _u(plan.get("kind")) == "MANAGE" else ""
+    if behavior:
+        sections.append(f"**Trade behaviour:** {behavior}")
+    sections.append(f"**Decision:** {_sb39_decision_sentence(base, plan).replace('Decision: ', '', 1)}")
+    return "\n\n".join(sections)
+
+
+def analyze_market(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], open_trades: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    base = _analyze_market_sb37(evidence, previous_evidence, open_trades=open_trades)
+    plan = base.get("trade_plan", {}) or {}
+    base["reasoner_version"] = REASONER_VERSION
+    base["trade_plan"] = plan
+    base["relevance_focus"] = _u(plan.get("relevance_focus") or _current_focus(base, evidence))
+    base["nonarrival_assessment"] = _sb39_nonarrival_assessment(base, evidence, plan)
+    base["waiting_for"] = [_relevant_setup_text(base, evidence)] if _u(plan.get("kind")) not in {"NEW", "MANAGE"} else []
+    base["narrative"] = _narrative(base, evidence, plan)
+    return base
