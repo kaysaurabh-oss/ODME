@@ -2984,3 +2984,958 @@ def _narrative(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, A
     else:
         remainder = [market_intro + " the campaign thesis remains under active scan management."]
     return "\n\n".join([first] + remainder).strip()
+
+
+# ============================================================================
+# SB3.8 relevance / composite path / non-arrival intelligence overrides
+# ============================================================================
+import math
+import re
+
+REASONER_VERSION = "SB3.8_RELEVANCE_PATH_INTELLIGENCE"
+
+_new_entry_plan_sb37 = _new_entry_plan
+_manage_existing_sb37 = _manage_existing
+_narrative_sb37 = _narrative
+_material_signature_sb37 = _material_signature
+_analyze_market_sb37 = analyze_market
+
+
+def _expiry_datetime(evidence: Dict[str, Any]) -> Optional[datetime]:
+    odme = evidence.get("odme", {}) or {}
+    raw = _s(odme.get("expiry"))
+    if not raw:
+        return None
+    token = re.sub(r"[^0-9A-Za-z]", "", raw).upper()
+    d = None
+    for fmt in ("%d%b%Y", "%d%m%Y", "%Y%m%d"):
+        try:
+            d = datetime.strptime(token, fmt).date()
+            break
+        except Exception:
+            continue
+    if d is None:
+        return None
+    exch = _u(odme.get("exchange"))
+    tz = ZoneInfo("Asia/Kolkata")
+    hh, mm = (23, 30) if exch == "MCX" else (15, 30)
+    return datetime(d.year, d.month, d.day, hh, mm, tzinfo=tz).astimezone(timezone.utc)
+
+
+def _scan_datetime(evidence: Dict[str, Any]) -> datetime:
+    raw = _s(evidence.get("scanned_at"))
+    if raw:
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            pass
+    return datetime.now(timezone.utc)
+
+
+def _tf_minutes(value: Any) -> float:
+    s = _u(value)
+    if not s:
+        return 60.0
+    if s in {"D", "1D"}:
+        return 1440.0
+    if s in {"W", "1W"}:
+        return 10080.0
+    try:
+        x = float(s)
+        return x if x > 0 else 60.0
+    except Exception:
+        return 60.0
+
+
+def _chain_rows(evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
+    odme = evidence.get("odme", {}) or {}
+    rows = odme.get("chain_window", []) or []
+    out: List[Dict[str, Any]] = []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        strike = _f(raw.get("strike"))
+        if strike is None:
+            continue
+        rec = dict(raw)
+        rec["strike"] = strike
+        out.append(rec)
+    return sorted(out, key=lambda x: x["strike"])
+
+
+def _bs_norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _bs_norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def _bs_price(spot: float, strike: float, t: float, rate: float, vol: float, option: str) -> float:
+    if spot <= 0 or strike <= 0:
+        return 0.0
+    t = max(float(t), 1e-9)
+    vol = max(float(vol), 1e-6)
+    d1 = (math.log(spot / strike) + (rate + 0.5 * vol * vol) * t) / (vol * math.sqrt(t))
+    d2 = d1 - vol * math.sqrt(t)
+    if _u(option) == "CE":
+        return max(0.0, spot * _bs_norm_cdf(d1) - strike * math.exp(-rate * t) * _bs_norm_cdf(d2))
+    return max(0.0, strike * math.exp(-rate * t) * _bs_norm_cdf(-d2) - spot * _bs_norm_cdf(-d1))
+
+
+def _implied_vol(spot: float, strike: float, t: float, rate: float, premium: float, option: str) -> Optional[float]:
+    if min(spot, strike, premium) <= 0 or t <= 0:
+        return None
+    intrinsic = max(spot - strike, 0.0) if _u(option) == "CE" else max(strike - spot, 0.0)
+    if premium <= intrinsic + 1e-8:
+        return 0.05
+    lo, hi = 0.01, 5.0
+    if _bs_price(spot, strike, t, rate, hi, option) < premium:
+        return None
+    for _ in range(70):
+        mid = (lo + hi) * 0.5
+        px = _bs_price(spot, strike, t, rate, mid, option)
+        if px > premium:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) * 0.5
+
+
+def _option_greeks(spot: float, strike: float, t: float, rate: float, vol: float, option: str) -> Dict[str, float]:
+    if min(spot, strike, t, vol) <= 0:
+        return {"delta": 0.0, "gamma": 0.0, "theta_day": 0.0, "vega": 0.0}
+    root_t = math.sqrt(t)
+    d1 = (math.log(spot / strike) + (rate + 0.5 * vol * vol) * t) / (vol * root_t)
+    d2 = d1 - vol * root_t
+    pdf = _bs_norm_pdf(d1)
+    gamma = pdf / (spot * vol * root_t)
+    vega = spot * pdf * root_t / 100.0
+    if _u(option) == "CE":
+        delta = _bs_norm_cdf(d1)
+        theta = -(spot * pdf * vol) / (2 * root_t) - rate * strike * math.exp(-rate * t) * _bs_norm_cdf(d2)
+    else:
+        delta = _bs_norm_cdf(d1) - 1.0
+        theta = -(spot * pdf * vol) / (2 * root_t) + rate * strike * math.exp(-rate * t) * _bs_norm_cdf(-d2)
+    return {"delta": delta, "gamma": gamma, "theta_day": theta / 365.0, "vega": vega}
+
+
+def _current_focus(base: Dict[str, Any], evidence: Dict[str, Any]) -> str:
+    posture = _u(base.get("posture"))
+    if posture == "LONG_ELIGIBLE":
+        return "BULLISH"
+    if posture == "SHORT_ELIGIBLE":
+        return "BEARISH"
+
+    bull = 0.0
+    bear = 0.0
+    macro = _u(base.get("macro"))
+    if macro == "BULLISH": bull += 2.0
+    if macro == "BEARISH": bear += 2.0
+    exec_dir = _u(base.get("exec_of"))
+    if exec_dir == "BULLISH": bull += 1.5
+    if exec_dir == "BEARISH": bear += 1.5
+    aur = _u((base.get("aurora", {}) or {}).get("state"))
+    if aur in {"GREEN", "YELLOW"}: bull += 1.0
+    if aur in {"RED", "PINK"}: bear += 1.0
+    struct = _u((_source_map(evidence).get("STRUCTURE", {}) or {}).get("structure_trend"))
+    if struct == "UP": bull += 1.0
+    if struct == "DOWN": bear += 1.0
+
+    price = _f(base.get("price"))
+    for h in base.get("hurdles", []) or []:
+        if not isinstance(h, dict):
+            continue
+        dist = _f(h.get("distance"))
+        side = _u(h.get("side"))
+        if dist is None or price is None:
+            continue
+        rel = dist / max(abs(price), 1.0)
+        if rel <= 0.03:
+            if side == "DEMAND": bull += 1.5
+            if side == "SUPPLY": bear += 1.5
+
+    liq = base.get("liquidity", {}) or {}
+    read = _u(liq.get("directional_read"))
+    if read == "BULLISH": bull += 0.75
+    if read == "BEARISH": bear += 0.75
+    if abs(bull - bear) < 1.5:
+        return "NEUTRAL"
+    return "BULLISH" if bull > bear else "BEARISH"
+
+
+def _between(price: float, strike: float, low: Optional[float], high: Optional[float]) -> bool:
+    if low is None or high is None:
+        return False
+    lo, hi = min(low, high), max(low, high)
+    if strike < price:
+        return strike < hi and lo < price and hi <= price + 1e-9
+    return price < lo and hi > price
+
+
+def _route_hurdles(base: Dict[str, Any], evidence: Dict[str, Any], strike: float) -> List[Dict[str, Any]]:
+    price = _f(base.get("price"))
+    if price is None or strike == price:
+        return []
+    down = strike < price
+    edge = _source_map(evidence).get("EDGE", {}) or {}
+    raw = edge.get("raw_json") if isinstance(edge.get("raw_json"), dict) else {}
+    out: List[Dict[str, Any]] = []
+
+    book = ((raw or {}).get("fp_hurdle_book") or {}).get("hurdles", []) if isinstance(raw, dict) else []
+    for h in book or []:
+        if not isinstance(h, dict):
+            continue
+        side = _u(h.get("side"))
+        if (down and side != "DEMAND") or ((not down) and side != "SUPPLY"):
+            continue
+        lo, hi = _f(h.get("low")), _f(h.get("high"))
+        if _between(price, strike, lo, hi):
+            out.append({
+                "side": side, "low": lo, "high": hi, "tf": _s(h.get("parent") or ""),
+                "strength": _s(h.get("strength")), "strength_score": _f(h.get("strength_score")),
+                "hold": _f(h.get("hold")), "status": _u(h.get("status") or h.get("context")),
+                "source": "zone",
+            })
+
+    router = (raw or {}).get("edge_router_map", []) if isinstance(raw, dict) else []
+    for tfrow in router or []:
+        if not isinstance(tfrow, dict):
+            continue
+        tf = _s(tfrow.get("tf"))
+        names = ("d1", "d2") if down else ("s1", "s2")
+        for name in names:
+            z = tfrow.get(name) or {}
+            if not isinstance(z, dict):
+                continue
+            lo, hi = _f(z.get("low")), _f(z.get("high"))
+            if _between(price, strike, lo, hi):
+                out.append({"side": "DEMAND" if down else "SUPPLY", "low": lo, "high": hi, "tf": tf, "status": "ACTIVE", "source": "route"})
+
+    for z in (base.get("defender", {}) or {}, base.get("challenger", {}) or {}):
+        side = _u(z.get("side"))
+        if (down and side == "DEMAND") or ((not down) and side == "SUPPLY"):
+            lo, hi = _f(z.get("low")), _f(z.get("high"))
+            if _between(price, strike, lo, hi):
+                out.append({"side": side, "low": lo, "high": hi, "tf": _s(z.get("tf")), "status": _u(z.get("state") or "ACTIVE"), "source": "strategic"})
+
+    unique: Dict[str, Dict[str, Any]] = {}
+    for h in out:
+        lo, hi = _f(h.get("low")), _f(h.get("high"))
+        key = f"{h.get('side')}|{round(lo or 0,4)}|{round(hi or 0,4)}"
+        existing = unique.get(key)
+        if existing is None or (h.get("source") == "strategic" and existing.get("source") != "strategic"):
+            unique[key] = h
+    return list(unique.values())
+
+
+def _hurdle_weight(h: Dict[str, Any]) -> float:
+    status = _u(h.get("status"))
+    if any(x in status for x in ("RUN", "BROKEN", "INVALID", "CROSSED")):
+        return 0.0
+    tf = _u(h.get("tf"))
+    tfw = {"W": 1.0, "D": 0.9, "240": 0.75, "125": 0.65, "75": 0.6, "60": 0.55, "15": 0.35}.get(tf, 0.45)
+    statusw = 1.0 if "ACTIVE_FRESH" in status or status == "ACTIVE" else 0.65 if "TOUCHED" in status else 0.8
+    strength = _f(h.get("strength_score"))
+    if strength is not None:
+        strengthw = min(1.15, max(0.6, strength / 75.0))
+    else:
+        strengthw = 1.0 if "STRONG" in _u(h.get("strength")) else 0.8
+    hold = _f(h.get("hold"))
+    holdw = min(1.15, max(0.75, (hold or 60.0) / 72.0))
+    return tfw * statusw * strengthw * holdw
+
+
+def _oi_route_friction(evidence: Dict[str, Any], price: float, strike: float, option: str) -> Tuple[float, List[Dict[str, Any]]]:
+    """Estimate option-positioning friction on the route to a sold strike.
+
+    This is deliberately not a probability model.  Relevant-side OI is the
+    primary friction, while combined OI / POC / active wall add smaller route
+    penalties when they sit between current price and the candidate strike.
+    """
+    odme = evidence.get("odme", {}) or {}
+    rows = [r for r in _chain_rows(evidence) if min(price, strike) < r["strike"] < max(price, strike)]
+    if not rows:
+        return 0.0, []
+    field = "pe_oi" if _u(option) == "PE" else "ce_oi"
+    mx_side = max((_f(r.get(field)) or 0.0) for r in rows) or 0.0
+    mx_combined = max((_f(r.get("combined_oi")) or 0.0) for r in rows) or 0.0
+    ranked = sorted(
+        rows,
+        key=lambda r: ((_f(r.get(field)) or 0.0) / max(mx_side, 1.0)) * 0.7 + ((_f(r.get("combined_oi")) or 0.0) / max(mx_combined, 1.0)) * 0.3,
+        reverse=True,
+    )
+    strong: List[Dict[str, Any]] = []
+    score = 0.0
+    for r in ranked[:8]:
+        side_oi = _f(r.get(field)) or 0.0
+        combined = _f(r.get("combined_oi")) or 0.0
+        rel_side = side_oi / mx_side if mx_side else 0.0
+        rel_combined = combined / mx_combined if mx_combined else 0.0
+        strength = 0.7 * rel_side + 0.3 * rel_combined
+        if strength < 0.42:
+            continue
+        strong.append({"strike": r["strike"], "oi": side_oi, "combined_oi": combined, "relative": strength})
+        score += 0.065 * strength
+
+    # The current option POC and active relevant wall are additional friction
+    # only when they genuinely lie on the route.  They never act as hard walls.
+    route_lo, route_hi = min(price, strike), max(price, strike)
+    poc = _f(odme.get("option_poc") or odme.get("poc"))
+    wall = _f(odme.get("active_pe_wall") or odme.get("pe_wall")) if _u(option) == "PE" else _f(odme.get("active_ce_wall") or odme.get("ce_wall"))
+    if poc is not None and route_lo < poc < route_hi:
+        score += 0.07
+    if wall is not None and route_lo < wall < route_hi:
+        score += 0.09
+
+    return min(0.45, score), strong[:5]
+
+def _fast_arrival_hours(base: Dict[str, Any], evidence: Dict[str, Any], strike: float, option: str) -> Optional[float]:
+    price = _f(base.get("price"))
+    if price is None or strike <= 0:
+        return None
+    src = _source_map(evidence)
+    aur = src.get("AURORA", {}) or {}
+    tfh = _tf_minutes(aur.get("tf")) / 60.0
+    down = _u(option) == "PE"
+    prefix = "eta_down" if down else "eta_up"
+    candidates: List[float] = []
+    speed = _f(aur.get(f"{prefix}_speed_price_per_bar"))
+    dist = abs(price - strike)
+    if speed is not None and speed > 0:
+        candidates.append((dist / speed) * tfh)
+    eta_level = _f(aur.get(f"{prefix}_level"))
+    rem = _f(aur.get(f"{prefix}_locked_remaining_bars"))
+    if eta_level is not None and rem is not None and rem > 0:
+        level_dist = abs(price - eta_level)
+        if level_dist > 0:
+            candidates.append(max(0.25, rem * dist / level_dist) * tfh)
+    model_bars = _f(aur.get(f"{prefix}_model_bars"))
+    model_dist = _f(aur.get(f"{prefix}_model_distance"))
+    if model_bars is not None and model_bars > 0 and model_dist is not None and model_dist > 0:
+        candidates.append(max(0.25, model_bars * dist / model_dist) * tfh)
+    vals = [x for x in candidates if math.isfinite(x) and x > 0]
+    return min(vals) if vals else None
+
+
+def _composite_path(base: Dict[str, Any], evidence: Dict[str, Any], strike: float, option: str) -> Dict[str, Any]:
+    price = _f(base.get("price"))
+    now = _scan_datetime(evidence)
+    expiry = _expiry_datetime(evidence)
+    fastest = _fast_arrival_hours(base, evidence, strike, option)
+    if price is None or fastest is None:
+        return {"available": False, "reason": "arrival speed is not available from the current market path"}
+
+    hurdles = _route_hurdles(base, evidence, strike)
+    structural = min(0.85, sum(_hurdle_weight(x) for x in hurdles) * 0.10)
+    oi_friction, oi_clusters = _oi_route_friction(evidence, price, strike, option)
+
+    down = _u(option) == "PE"
+    path_dir = "BEARISH" if down else "BULLISH"
+    aligned = 0.0
+    exec_dir = _u(base.get("exec_of"))
+    aur_state = _u((base.get("aurora", {}) or {}).get("state"))
+    if exec_dir == path_dir:
+        aligned += 0.10
+    if (path_dir == "BULLISH" and aur_state == "GREEN") or (path_dir == "BEARISH" and aur_state == "RED"):
+        aligned += 0.12
+    opposite = 0.0
+    if exec_dir == _opposite(path_dir):
+        opposite += 0.14
+    if (path_dir == "BULLISH" and aur_state == "RED") or (path_dir == "BEARISH" and aur_state == "GREEN"):
+        opposite += 0.18
+
+    struct = _u((_source_map(evidence).get("STRUCTURE", {}) or {}).get("structure_trend"))
+    if (down and struct == "UP") or ((not down) and struct == "DOWN"):
+        opposite += 0.10
+    if (down and struct == "DOWN") or ((not down) and struct == "UP"):
+        aligned += 0.06
+
+    liq = base.get("liquidity", {}) or {}
+    magnet = _f(liq.get("below_level" if down else "above_level"))
+    if magnet is not None and min(price, strike) < magnet < max(price, strike):
+        aligned += 0.08
+
+    multiplier = max(1.0, 1.0 + structural + oi_friction + opposite - aligned)
+    expected = fastest * multiplier
+    fastest_dt = now + timedelta(hours=fastest)
+    expected_dt = now + timedelta(hours=expected)
+    buffer_hours = min(24.0, max(6.0, expected * 0.12))
+    safe_dt = expected_dt - timedelta(hours=buffer_hours)
+    protected = bool(expiry and safe_dt >= expiry)
+    if expiry and safe_dt > expiry:
+        display_safe = expiry
+    else:
+        display_safe = safe_dt
+    return {
+        "available": True,
+        "fastest_hours": fastest,
+        "expected_hours": expected,
+        "fastest_arrival": fastest_dt.isoformat(),
+        "expected_arrival": expected_dt.isoformat(),
+        "safe_through": display_safe.isoformat(),
+        "protected_through_expiry": protected,
+        "expiry": expiry.isoformat() if expiry else "",
+        "hurdle_count": len(hurdles),
+        "structural_friction": round(structural, 4),
+        "oi_friction": round(oi_friction, 4),
+        "oi_clusters": oi_clusters[:4],
+        "hurdles": hurdles[:8],
+        "path_multiplier": round(multiplier, 3),
+    }
+
+
+def _format_date_iso(iso_value: Any, evidence: Dict[str, Any]) -> str:
+    raw = _s(iso_value)
+    if not raw:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        tz = ZoneInfo("Asia/Kolkata") if _u((evidence.get("odme", {}) or {}).get("exchange")) in {"NFO", "MCX"} else ZoneInfo("Asia/Singapore")
+        return dt.astimezone(tz).strftime("%d %b")
+    except Exception:
+        return raw
+
+
+def _candidate_rows_for_side(base: Dict[str, Any], evidence: Dict[str, Any], option: str) -> List[Dict[str, Any]]:
+    odme = evidence.get("odme", {}) or {}
+    price = _f(base.get("price"))
+    if price is None:
+        return []
+    safe = _f(odme.get("safer_sell_pe" if _u(option) == "PE" else "safer_sell_ce"))
+    if safe is None:
+        return []
+    rows = _chain_rows(evidence)
+    if _u(option) == "PE":
+        rows = [r for r in rows if r["strike"] <= safe and r["strike"] < price and (_f(r.get("pe_ltp")) or 0) > 0]
+        rows.sort(key=lambda r: r["strike"], reverse=True)
+    else:
+        rows = [r for r in rows if r["strike"] >= safe and r["strike"] > price and (_f(r.get("ce_ltp")) or 0) > 0]
+        rows.sort(key=lambda r: r["strike"])
+    return rows[:4]
+
+
+def _evaluate_short_option(base: Dict[str, Any], evidence: Dict[str, Any], option: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    option = _u(option)
+    price = _f(base.get("price")) or 0.0
+    strike = _f(row.get("strike")) or 0.0
+    ltp = _f(row.get("pe_ltp" if option == "PE" else "ce_ltp")) or 0.0
+    bid = _f(row.get("pe_bid" if option == "PE" else "ce_bid")) or 0.0
+    ask = _f(row.get("pe_ask" if option == "PE" else "ce_ask")) or 0.0
+    # For a naked sale, use executable bid as the reward estimate when present.
+    # IV uses a fair mark (mid when sane, otherwise LTP) so greeks are not based
+    # on an optimistic sale price.
+    entry_premium = bid if bid > 0 else ltp
+    mark = (bid + ask) * 0.5 if bid > 0 and ask >= bid else ltp
+    if mark <= 0:
+        mark = entry_premium
+    expiry = _expiry_datetime(evidence)
+    now = _scan_datetime(evidence)
+    if min(price, strike, entry_premium, mark) <= 0 or not expiry or expiry <= now:
+        return {"valid": False}
+    t = max((expiry - now).total_seconds() / (365.0 * 24.0 * 3600.0), 1e-6)
+    rate = 0.06
+    iv = _implied_vol(price, strike, t, rate, mark, option)
+    if iv is None:
+        return {"valid": False}
+    greeks = _option_greeks(price, strike, t, rate, iv, option)
+    path = _composite_path(base, evidence, strike, option)
+    lot = max(1, int(_f((evidence.get("odme", {}) or {}).get("lot_size")) or 1))
+    reward = entry_premium * lot
+
+    atr = _f((_source_map(evidence).get("AURORA", {}) or {}).get("eta_current_atr")) or 0.0
+    step = _f((evidence.get("odme", {}) or {}).get("strike_step")) or 0.0
+    overshoot = max(2.0 * step, 0.25 * atr, abs(price - strike) * 0.12)
+    stress_spot = strike - overshoot if option == "PE" else strike + overshoot
+    fastest_iso = _s(path.get("fastest_arrival"))
+    try:
+        stress_dt = datetime.fromisoformat(fastest_iso) if fastest_iso else expiry - timedelta(hours=6)
+        if stress_dt.tzinfo is None:
+            stress_dt = stress_dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        stress_dt = expiry - timedelta(hours=6)
+    stress_dt = min(max(stress_dt, now + timedelta(minutes=30)), expiry - timedelta(minutes=5))
+    remaining_t = max((expiry - stress_dt).total_seconds() / (365.0 * 24.0 * 3600.0), 1e-6)
+    stress_iv = min(5.0, iv * 1.20)
+    stress_px = _bs_price(max(stress_spot, 1e-6), strike, remaining_t, rate, stress_iv, option)
+    stress_risk = max(0.0, (stress_px - entry_premium) * lot)
+    rr = reward / stress_risk if stress_risk > 0 else 99.0
+
+    score = 0.0
+    if path.get("protected_through_expiry"):
+        score += 5.0
+    score += min(2.0, (_f(path.get("structural_friction")) or 0.0) * 3.0)
+    score += min(1.5, (_f(path.get("oi_friction")) or 0.0) * 3.0)
+    score += min(2.0, rr / 2.0)
+    score -= min(2.0, abs(greeks["delta"]) * 4.0)
+    score -= min(1.5, abs(greeks["gamma"]) * price * price * 0.01)
+
+    return {
+        "valid": bool(path.get("available")),
+        "option": option,
+        "strike": strike,
+        "premium": entry_premium,
+        "ltp": ltp,
+        "bid": bid,
+        "ask": ask,
+        "mark": mark,
+        "lot_size": lot,
+        "estimated_iv": iv,
+        # Position-signed greeks for the naked short.  Raw long-option greeks are
+        # retained separately for auditability.
+        "delta": -greeks["delta"],
+        "gamma": -greeks["gamma"],
+        "theta_day": -greeks["theta_day"],
+        "vega": -greeks["vega"],
+        "option_delta": greeks["delta"],
+        "option_gamma": greeks["gamma"],
+        "option_theta_day": greeks["theta_day"],
+        "option_vega": greeks["vega"],
+        "reward": reward,
+        "stress_risk": stress_risk,
+        "rr": rr,
+        "stress_spot": stress_spot,
+        "stress_time": stress_dt.isoformat(),
+        "stress_iv": stress_iv,
+        "path": path,
+        "score": score,
+        "oi": _f(row.get("pe_oi" if option == "PE" else "ce_oi")) or 0.0,
+    }
+
+
+def _option_mark_at(candidate: Dict[str, Any], spot: float, when: datetime, expiry: datetime, option: str, iv_mult: float = 1.20) -> float:
+    iv = float(candidate.get("estimated_iv", 0) or 0)
+    strike = float(candidate.get("strike", 0) or 0)
+    if iv <= 0 or strike <= 0:
+        return 0.0
+    t = max((expiry - when).total_seconds() / (365.0 * 24.0 * 3600.0), 1e-6)
+    return _bs_price(max(spot, 1e-6), strike, t, 0.06, min(5.0, iv * iv_mult), option)
+
+
+def _strangle_stress_risk(pe: Dict[str, Any], ce: Dict[str, Any], expiry: datetime) -> float:
+    """Joint two-leg mark-to-market stress, not theoretical maximum loss."""
+    scenarios = []
+    for stressed, other, side in ((pe, ce, "PE"), (ce, pe, "CE")):
+        try:
+            when = datetime.fromisoformat(_s(stressed.get("stress_time")))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+        except Exception:
+            when = expiry - timedelta(minutes=5)
+        spot = float(stressed.get("stress_spot", 0) or 0)
+        if spot <= 0:
+            continue
+        total = 0.0
+        for cand, opt in ((pe, "PE"), (ce, "CE")):
+            px = _option_mark_at(cand, spot, when, expiry, opt, 1.20)
+            entry = float(cand.get("premium", 0) or 0)
+            lot = int(cand.get("lot_size", 1) or 1)
+            total += (px - entry) * lot
+        scenarios.append(max(0.0, total))
+    return max(scenarios) if scenarios else max(float(pe.get("stress_risk", 0) or 0), float(ce.get("stress_risk", 0) or 0))
+
+def _best_side_candidate(base: Dict[str, Any], evidence: Dict[str, Any], option: str) -> Optional[Dict[str, Any]]:
+    odme = evidence.get("odme", {}) or {}
+    if not odme or _s(evidence.get("mode")) != "TV + ODME":
+        return None
+    if not _sale_action_ok(odme, option):
+        return None
+    # Candidate rows are already ordered nearest-first outside the ODME safer
+    # boundary. Prefer the nearest protected listed strike; go farther only when
+    # the nearer strike does not remain protected through expiry.
+    for row in _candidate_rows_for_side(base, evidence, option):
+        candidate = _evaluate_short_option(base, evidence, option, row)
+        if not (candidate.get("valid") and candidate.get("path", {}).get("protected_through_expiry")):
+            continue
+        # Naked premium is allowed only when the live strike is genuinely OTM
+        # enough for its estimated tail sensitivity and stress mark-to-market.
+        if abs(float(candidate.get("delta", 0) or 0)) > 0.30:
+            continue
+        reward = float(candidate.get("reward", 0) or 0)
+        stress = float(candidate.get("stress_risk", 0) or 0)
+        if reward <= 0 or (stress > 0 and reward / stress < 0.25):
+            continue
+        return candidate
+    return None
+
+
+def _nonarrival_final_plan(base: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    if _s(evidence.get("mode")) != "TV + ODME":
+        return {}
+    odme = evidence.get("odme", {}) or {}
+    expiry = _expiry_datetime(evidence)
+    if not odme or not expiry:
+        return {}
+    focus = _current_focus(base, evidence)
+    range_score = _f(odme.get("range_score")) or 0.0
+    expansion_score = _f(odme.get("expansion_score")) or 0.0
+    pe = _best_side_candidate(base, evidence, "PE")
+    ce = _best_side_candidate(base, evidence, "CE")
+
+    chosen: Optional[Dict[str, Any]] = None
+    strategy = ""
+    legs: List[Dict[str, Any]] = []
+    direction = "NEUTRAL"
+
+    if focus == "BULLISH" and pe:
+        chosen = pe; strategy = "SHORT_PE"; direction = "BULLISH"
+    elif focus == "BEARISH" and ce:
+        chosen = ce; strategy = "SHORT_CE"; direction = "BEARISH"
+    elif focus == "NEUTRAL" and pe and ce and range_score >= expansion_score + 5.0:
+        # Both tails independently have to remain protected through expiry.
+        strategy = "SHORT_STRANGLE"
+        direction = "NEUTRAL"
+        reward = pe["reward"] + ce["reward"]
+        risk = _strangle_stress_risk(pe, ce, expiry)
+        chosen = {
+            "reward": reward,
+            "stress_risk": risk,
+            "rr": reward / risk if risk > 0 else 99.0,
+            "path": {
+                "safe_through": min(pe["path"].get("safe_through", ""), ce["path"].get("safe_through", "")),
+                "protected_through_expiry": True,
+                "hurdle_count": int(pe["path"].get("hurdle_count", 0)) + int(ce["path"].get("hurdle_count", 0)),
+            },
+        }
+        legs = [
+            {"side": "SELL", "instrument_type": "OPTION", "option": "CE", "strike": ce["strike"], "premium": ce["premium"], "expiry": _s(odme.get("expiry")), "estimated_iv": ce["estimated_iv"], "delta": ce["delta"], "gamma": ce["gamma"], "theta_day": ce["theta_day"], "vega": ce["vega"], "lot_size": ce["lot_size"], "ltp": ce.get("ltp"), "bid": ce.get("bid"), "ask": ce.get("ask"), "mark": ce.get("mark")},
+            {"side": "SELL", "instrument_type": "OPTION", "option": "PE", "strike": pe["strike"], "premium": pe["premium"], "expiry": _s(odme.get("expiry")), "estimated_iv": pe["estimated_iv"], "delta": pe["delta"], "gamma": pe["gamma"], "theta_day": pe["theta_day"], "vega": pe["vega"], "lot_size": pe["lot_size"], "ltp": pe.get("ltp"), "bid": pe.get("bid"), "ask": pe.get("ask"), "mark": pe.get("mark")},
+        ]
+    elif focus == "NEUTRAL":
+        # A balanced chart does not force a two-sided trade; one exceptionally
+        # protected side can still be used if the other tail is not good enough.
+        singles = [x for x in (pe, ce) if x]
+        if singles:
+            best = max(singles, key=lambda x: x.get("score", 0))
+            chosen = best
+            strategy = "SHORT_PE" if best["option"] == "PE" else "SHORT_CE"
+            direction = "BULLISH" if best["option"] == "PE" else "BEARISH"
+
+    if not chosen or not strategy:
+        return {}
+    if not legs:
+        legs = [{
+            "side": "SELL", "instrument_type": "OPTION", "option": chosen["option"],
+            "strike": chosen["strike"], "premium": chosen["premium"], "expiry": _s(odme.get("expiry")),
+            "estimated_iv": chosen["estimated_iv"], "delta": chosen["delta"], "gamma": chosen["gamma"],
+            "theta_day": chosen["theta_day"], "vega": chosen["vega"], "lot_size": chosen["lot_size"],
+            "ltp": chosen.get("ltp"), "bid": chosen.get("bid"), "ask": chosen.get("ask"), "mark": chosen.get("mark"),
+        }]
+
+    path = chosen.get("path", {}) or {}
+    expiry_label = expiry.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%d %b")
+    safe_label = _format_date_iso(path.get("safe_through"), evidence)
+    reward = float(chosen.get("reward", 0) or 0)
+    risk = float(chosen.get("stress_risk", 0) or 0)
+    rr = reward / risk if risk > 0 else 99.0
+    reason = _nonarrival_reason(base, evidence, strategy, chosen, safe_label, expiry_label)
+    invalidation = None
+    if strategy == "SHORT_PE": invalidation = legs[0].get("strike")
+    elif strategy == "SHORT_CE": invalidation = legs[0].get("strike")
+
+    return {
+        "kind": "NEW", "action": "ENTER", "status": "ACTIVE",
+        "direction": direction, "strategy_type": strategy, "legs": legs,
+        "entry_reference": _f(base.get("price")), "target": None, "invalidation": invalidation,
+        "expected_eta": f"protected through {safe_label}; expiry {expiry_label}",
+        "risk": round(risk, 2), "reward": round(reward, 2), "rr": round(rr, 2),
+        "reason": reason, "fresh_entry_now": True,
+        "expression_style": "NONARRIVAL", "relevance_focus": focus,
+        "path_snapshot": path, "nonarrival_snapshot": chosen,
+        "expected_behavior": "sold strike remains outside the composite arrival path while premium decays and the route barriers remain intact",
+        "behavior_health": "ON_PLAN", "behavior_bad_streak": 0,
+    }
+
+
+def _nonarrival_reason(base: Dict[str, Any], evidence: Dict[str, Any], strategy: str, chosen: Dict[str, Any], safe_label: str, expiry_label: str) -> str:
+    path = chosen.get("path", {}) or {}
+    hurdles = int(path.get("hurdle_count", 0) or 0)
+    clusters = len(path.get("oi_clusters", []) or [])
+    side = "downside" if strategy == "SHORT_PE" else "upside" if strategy == "SHORT_CE" else "both tails"
+    parts: List[str] = []
+    if hurdles:
+        parts.append(f"{hurdles} active price barriers slow the {side} route")
+    if clusters:
+        parts.append("intermediate option positioning adds path friction")
+    if not parts:
+        parts.append(f"the {side} path remains slow enough for the selected expiry")
+    return "; ".join(parts)
+
+def _new_entry_plan(base: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    old = dict(_new_entry_plan_sb37(base, evidence) or {})
+    old_st = _u(old.get("strategy_type"))
+    # Keep qualified directional entries unchanged.  Replace only legacy/simple
+    # premium-selling decisions, or fill a no-trade state with the richer scan.
+    if _u(old.get("kind")) == "NEW" and old_st not in {"SHORT_PE", "SHORT_CE", "SHORT_STRANGLE"}:
+        old["relevance_focus"] = _current_focus(base, evidence)
+        old.setdefault("expected_behavior", "price should make directional progress without repeatedly surrendering the entry-side structure")
+        old.setdefault("behavior_health", "ON_PLAN")
+        old.setdefault("behavior_bad_streak", 0)
+        return old
+    richer = _nonarrival_final_plan(base, evidence)
+    if richer:
+        return richer
+    old["relevance_focus"] = _current_focus(base, evidence)
+    return old
+
+
+def _behavior_health(base: Dict[str, Any], evidence: Dict[str, Any], trade: Dict[str, Any]) -> Dict[str, Any]:
+    direction = _u(trade.get("direction"))
+    if direction not in {"BULLISH", "BEARISH"}:
+        return {"health": "ON_PLAN", "bad_streak": 0, "score": 0, "reason": "campaign is not directional"}
+    meta = _campaign_meta(trade)
+    prev_streak = int(_f(meta.get("behavior_bad_streak")) or 0)
+    price = _f(base.get("price"))
+    entry = _f(trade.get("entry_reference"))
+    atr = _f((_source_map(evidence).get("AURORA", {}) or {}).get("eta_current_atr")) or 0.0
+    adverse = 0
+    reasons: List[str] = []
+    opposite = _opposite(direction)
+    if _u(base.get("exec_of")) == opposite:
+        adverse += 1; reasons.append("short-term pressure is working against the trade")
+    aur = _u((base.get("aurora", {}) or {}).get("state"))
+    if (direction == "BULLISH" and aur == "RED") or (direction == "BEARISH" and aur == "GREEN"):
+        adverse += 1; reasons.append("momentum is active against the trade")
+    liq_read = _u((base.get("liquidity", {}) or {}).get("directional_read"))
+    if liq_read == opposite:
+        adverse += 1; reasons.append("recent liquidity behaviour is adverse")
+    if price is not None and entry is not None and atr > 0:
+        signed = price - entry if direction == "BULLISH" else entry - price
+        if signed < -0.5 * atr:
+            adverse += 1; reasons.append("price has moved materially against the entry without enough favorable progress")
+        elif signed > 0.5 * atr:
+            adverse = max(0, adverse - 1)
+    prog = base.get("battlefield_progression", {}) or {}
+    if bool(prog.get("defender_failed")):
+        adverse += 2; reasons.append("the protecting structure has failed")
+
+    if adverse >= 4:
+        health = "THESIS_DAMAGED"
+    elif adverse >= 2:
+        health = "FAILURE_TO_PERFORM"
+    elif adverse == 1:
+        health = "SLOW_BUT_VALID"
+    else:
+        health = "ON_PLAN"
+    bad_streak = prev_streak + 1 if health in {"FAILURE_TO_PERFORM", "THESIS_DAMAGED"} else 0
+    return {"health": health, "bad_streak": bad_streak, "score": adverse, "reason": "; ".join(reasons[:3])}
+
+
+def _manage_existing(base: Dict[str, Any], evidence: Dict[str, Any], open_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    old = dict(_manage_existing_sb37(base, evidence, open_trades) or {})
+    if not open_trades:
+        return old
+    tid = _s(old.get("trade_id"))
+    trade = next((dict(x) for x in open_trades if _s(x.get("trade_id")) == tid), dict(open_trades[0]))
+    health = _behavior_health(base, evidence, trade)
+    old["behavior_health"] = health["health"]
+    old["behavior_bad_streak"] = health["bad_streak"]
+    old["expected_behavior"] = _campaign_meta(trade).get("expected_behavior") or "the campaign should continue converting its thesis into price progress without persistent adverse pressure"
+    old["relevance_focus"] = _current_focus(base, evidence)
+
+    # Hard invalidation/opposite-thesis exits from the existing manager remain
+    # immediate and authoritative.
+    if _u(old.get("action")) == "EXIT":
+        return old
+
+    strategy = _u(trade.get("strategy_type"))
+    direction = _u(trade.get("direction"))
+    current_legs = _active_campaign_legs(trade)
+
+    # Existing naked short options are re-evaluated on the same path model as a
+    # fresh trade.  One bad scan is a warning; persistent path deterioration is
+    # required before SuperBrain removes the exposure early.
+    if strategy in {"SHORT_PE", "SHORT_CE"}:
+        opt = "PE" if strategy == "SHORT_PE" else "CE"
+        sold = next((x for x in current_legs if _u(x.get("side")) == "SELL" and _u(x.get("option")) == opt), {})
+        strike = _f(sold.get("strike"))
+        if strike is not None:
+            path = _composite_path(base, evidence, strike, opt)
+            old["path_snapshot"] = path
+            protected = bool(path.get("protected_through_expiry"))
+            meta = _campaign_meta(trade); prev = int(_f((meta.get("nonarrival_snapshot", {}) or {}).get("nonarrival_bad_streak") if isinstance(meta.get("nonarrival_snapshot", {}), dict) else 0) or 0)
+            bad = 0 if protected else prev + 1
+            old["nonarrival_snapshot"] = {"path": path, "nonarrival_bad_streak": bad}
+            if not protected and bad >= 2:
+                old.update({
+                    "action": "EXIT", "status": "CLOSED", "campaign_operation": "EXIT_CAMPAIGN",
+                    "close_leg_ids": _leg_ids(current_legs),
+                    "reason": "the sold strike is no longer protected through expiry on two consecutive scans, so the non-arrival thesis has failed",
+                    "fresh_entry_now": False,
+                })
+                return old
+
+    # Pre-emptive management for directional expressions: do not wait for the
+    # hard invalidation when several independent observations show persistent
+    # failure-to-perform.  First reduce/rotate; full early exit needs stronger
+    # multi-scan damage.
+    if strategy in {"FUTURES_LONG", "FUTURES_SHORT", "LONG_CE", "LONG_PE"}:
+        if health["health"] == "THESIS_DAMAGED" and health["bad_streak"] >= 3:
+            old.update({
+                "action": "EXIT", "status": "CLOSED", "campaign_operation": "EXIT_CAMPAIGN",
+                "close_leg_ids": _leg_ids(current_legs),
+                "reason": "the trade has failed to produce the expected progress across repeated scans while adverse pressure and momentum have persisted",
+                "fresh_entry_now": False,
+            })
+            return old
+        if health["health"] in {"FAILURE_TO_PERFORM", "THESIS_DAMAGED"} and health["bad_streak"] >= 2 and _u(old.get("action")) == "HOLD":
+            # When the thesis remains directionally relevant, a protected naked
+            # opposite-side option can replace full delta; otherwise simply reduce.
+            expr = _directional_expression(base, evidence, direction, bool((base.get("poi", {}) or {}).get("qualified"))) if direction in {"BULLISH", "BEARISH"} else {}
+            candidate = _u(expr.get("strategy_type"))
+            if strategy in {"FUTURES_LONG", "FUTURES_SHORT"} and candidate in {"SHORT_PE", "SHORT_CE"}:
+                old.update({
+                    "action": "REDUCE", "status": "ACTIVE", "campaign_operation": "ROTATE",
+                    "strategy_type": candidate, "next_strategy_type": candidate,
+                    "close_leg_ids": _leg_ids(current_legs), "new_legs": list(expr.get("legs", []) or []),
+                    "reason": "directional follow-through has failed across repeated scans, while the underlying thesis still supports a lower-delta non-arrival expression",
+                    "fresh_entry_now": False,
+                })
+            else:
+                old.update({
+                    "action": "REDUCE", "status": "ACTIVE",
+                    "reason": "the trade is not converting its thesis into price progress across repeated scans; exposure is being reduced before hard invalidation",
+                    "fresh_entry_now": False,
+                })
+            return old
+    return old
+
+
+def _nearest_relevant_zone(base: Dict[str, Any], side: str) -> Optional[Tuple[float, float]]:
+    candidates: List[Tuple[float, float, float]] = []
+    for h in base.get("hurdles", []) or []:
+        if not isinstance(h, dict) or _u(h.get("side")) != _u(side):
+            continue
+        lo, hi = _f(h.get("low")), _f(h.get("high"))
+        if lo is None or hi is None:
+            continue
+        dist = _f(h.get("distance"))
+        candidates.append((dist if dist is not None else 1e99, lo, hi))
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1], candidates[0][2]
+    # Strategic boundary is a fallback only when no nearer qualified zone exists.
+    key = "defender" if _u(side) == "DEMAND" else "challenger"
+    z = base.get(key, {}) or {}
+    if _u(z.get("side")) == _u(side):
+        lo, hi = _f(z.get("low")), _f(z.get("high"))
+        if lo is not None and hi is not None:
+            return lo, hi
+    return None
+
+
+def _relevant_setup_text(base: Dict[str, Any], evidence: Dict[str, Any]) -> str:
+    focus = _current_focus(base, evidence)
+    if focus == "BULLISH":
+        zone = _nearest_relevant_zone(base, "DEMAND")
+        return f"Watching the long side from {_fmt(zone[0])}–{_fmt(zone[1])}; confirmation is not ready." if zone else "Watching the long side; confirmation is not ready."
+    if focus == "BEARISH":
+        zone = _nearest_relevant_zone(base, "SUPPLY")
+        return f"Watching the short side from {_fmt(zone[0])}–{_fmt(zone[1])}; confirmation is not ready." if zone else "Watching the short side; confirmation is not ready."
+    return "No directional setup is ready."
+
+
+def _natural_market_sentence(base: Dict[str, Any], evidence: Dict[str, Any]) -> str:
+    focus = _current_focus(base, evidence)
+    price = _f(base.get("price"))
+    if focus == "BULLISH":
+        zone = _nearest_relevant_zone(base, "DEMAND")
+        return f"Price {_fmt(price)} is holding active support at {_fmt(zone[0])}–{_fmt(zone[1])}." if zone else f"Price {_fmt(price)} is holding the stronger support side."
+    if focus == "BEARISH":
+        zone = _nearest_relevant_zone(base, "SUPPLY")
+        return f"Price {_fmt(price)} is pressing active resistance at {_fmt(zone[0])}–{_fmt(zone[1])}." if zone else f"Price {_fmt(price)} is pressing the stronger resistance side."
+    return f"Price {_fmt(price)} remains balanced between active support and resistance."
+
+def _fmt_money(v: Any) -> str:
+    x = _f(v)
+    if x is None:
+        return "?"
+    return f"₹{x:,.0f}" if abs(x) >= 100 else f"₹{x:,.2f}"
+
+
+def _narrative(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    kind = _u(plan.get("kind")); action = _u(plan.get("action")); st = _u(plan.get("strategy_type"))
+    price = _f(base.get("price"))
+
+    if kind == "NEW":
+        if st in {"SHORT_PE", "SHORT_CE", "SHORT_STRANGLE"}:
+            legs = plan.get("legs", []) or []
+            if st == "SHORT_PE":
+                leg = legs[0] if legs else {}; desc = f"{_fmt(leg.get('strike'))} PE short at about {_fmt(leg.get('premium'))}"
+            elif st == "SHORT_CE":
+                leg = legs[0] if legs else {}; desc = f"{_fmt(leg.get('strike'))} CE short at about {_fmt(leg.get('premium'))}"
+            else:
+                ce = next((x for x in legs if _u(x.get("option")) == "CE"), {}); pe = next((x for x in legs if _u(x.get("option")) == "PE"), {})
+                desc = f"{_fmt(ce.get('strike'))} CE / {_fmt(pe.get('strike'))} PE short strangle"
+            path = plan.get("path_snapshot", {}) or {}
+            safe = _format_date_iso(path.get("safe_through"), evidence)
+            expiry = _expiry_datetime(evidence)
+            expiry_text = expiry.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%d %b") if expiry else "?"
+            protection = "The sold strikes are" if st == "SHORT_STRANGLE" else "The sold strike is"
+            return (
+                f"**SuperBrain is taking {desc} now.** {protection} protected through {safe} against {expiry_text} expiry. "
+                f"Expected premium reward {_fmt_money(plan.get('reward'))}; estimated stress risk {_fmt_money(plan.get('risk'))}. "
+                f"{_sentence_case(plan.get('reason'))}."
+            )
+        return (
+            f"**SuperBrain is taking {_strategy_text(plan)} now at spot {_fmt(price)}.** "
+            f"{_sentence_case(plan.get('reason'))}. Target {_fmt(plan.get('target'))}; hard invalidation {_fmt(plan.get('invalidation'))}."
+        )
+
+    if kind == "MANAGE":
+        current = plan.get("current_legs", []) or plan.get("legs", []) or []
+        exposure = _expression_exposure_text(current)
+        reason = _sentence_case(plan.get("reason"))
+        if action == "HOLD":
+            return f"**Holding {exposure}.** {reason}."
+        if action == "ADD":
+            return f"**Adding to {exposure}.** {reason}."
+        if action == "REDUCE":
+            if _u(plan.get("campaign_operation")) == "ROTATE":
+                new_desc = _strategy_from_trade_plan({"strategy_type": plan.get("next_strategy_type") or plan.get("strategy_type"), "legs": plan.get("new_legs", []) or []})
+                return f"**Reducing {exposure} and rotating into {new_desc}.** {reason}."
+            return f"**Reducing {exposure}.** {reason}."
+        if action == "EXIT":
+            return f"**Closing {exposure} now at spot {_fmt(price)}.** {reason}."
+        return f"**Managing {exposure}.** {reason}."
+
+    focus = _current_focus(base, evidence)
+    if focus == "BULLISH":
+        zone = _nearest_relevant_zone(base, "DEMAND")
+        if zone:
+            return f"**No exposure now.** Price {_fmt(price)} is holding support at {_fmt(zone[0])}–{_fmt(zone[1])}; long confirmation is not ready."
+        return f"**No exposure now.** Price {_fmt(price)} is holding the stronger support side; long confirmation is not ready."
+    if focus == "BEARISH":
+        zone = _nearest_relevant_zone(base, "SUPPLY")
+        if zone:
+            return f"**No exposure now.** Price {_fmt(price)} is pressing resistance at {_fmt(zone[0])}–{_fmt(zone[1])}; short confirmation is not ready."
+        return f"**No exposure now.** Price {_fmt(price)} is pressing the stronger resistance side; short confirmation is not ready."
+    return f"**No exposure now.** Price {_fmt(price)} remains balanced; no setup is ready."
+
+
+def _material_signature(base: Dict[str, Any], plan: Dict[str, Any], progression: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    sig = dict(_material_signature_sb37(base, plan, progression, evidence) or {})
+    sig["relevance_focus"] = _u(plan.get("relevance_focus") or _current_focus(base, evidence))
+    sig["behavior_health"] = _u(plan.get("behavior_health"))
+    ns = plan.get("nonarrival_snapshot", {}) or {}
+    if ns:
+        sig["nonarrival"] = {
+            "strike": _f(ns.get("strike")), "option": _u(ns.get("option")),
+            "safe_through": _s((ns.get("path", {}) or {}).get("safe_through")),
+            "reward": round(_f(ns.get("reward")) or 0.0, 2),
+            "risk": round(_f(ns.get("stress_risk")) or 0.0, 2),
+        }
+    return sig
+
+
+def analyze_market(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], open_trades: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    base = _analyze_market_sb37(evidence, previous_evidence, open_trades=open_trades)
+    plan = base.get("trade_plan", {}) or {}
+    base["reasoner_version"] = REASONER_VERSION
+    base["trade_plan"] = plan
+    base["relevance_focus"] = _u(plan.get("relevance_focus") or _current_focus(base, evidence))
+    # Visible commentary is deliberately relevance-filtered and natural.  The
+    # full two-sided evidence stays internal for decision-making.
+    base["waiting_for"] = [_relevant_setup_text(base, evidence)] if _u(plan.get("kind")) not in {"NEW", "MANAGE"} else []
+    base["narrative"] = _narrative(base, evidence, plan)
+    return base

@@ -817,3 +817,237 @@ def _apply_trade_plan(store: BaseStore, instrument: str, mode: str, scan_id: str
     }
     plan["trade_id"] = saved.get("trade_id", "")
     return saved
+
+
+# ============================================================================
+# SB3.8 relevance / path / non-arrival intelligence overrides
+# ============================================================================
+SUPERBRAIN_BRIDGE_VERSION = "SB3.8_RELEVANCE_PATH_INTELLIGENCE"
+
+_compact_live_odme_sb37 = _compact_live_odme
+_apply_trade_plan_sb37 = _apply_trade_plan
+
+
+def _positive_float(value: Any) -> float:
+    try:
+        x = float(value)
+        return x if x > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _derive_lot_size_from_master(angel: Any, master: Any, instrument: str, expiry: str) -> int:
+    """Read the existing Angel master only; never change ODME or fetch another feed."""
+    try:
+        rows = angel.get_option_rows(master, instrument)
+        if rows is None or rows.empty:
+            return 1
+        work = rows.copy()
+        if "expiry" in work.columns:
+            matched = work[work["expiry"].astype(str).str.upper().str.strip().eq(str(expiry).upper().strip())]
+            if not matched.empty:
+                work = matched
+        lot_col = next((c for c in ("lotsize", "lot_size", "lotSize") if c in work.columns), None)
+        if not lot_col:
+            return 1
+        vals = pd.to_numeric(work[lot_col], errors="coerce").dropna()
+        vals = vals[vals > 0]
+        if vals.empty:
+            return 1
+        # Angel master should be constant by expiry; mode is robust to duplicate rows.
+        mode = vals.mode()
+        return max(1, int(round(float(mode.iloc[0] if not mode.empty else vals.iloc[0]))))
+    except Exception:
+        return 1
+
+
+def _select_chain_window(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Carry only decision-relevant chain rows into SuperBrain.
+
+    ODME itself and its compact Sheet schema are untouched.  The live SuperBrain
+    scan receives a bounded corridor: nearest strikes, safe-boundary candidates,
+    and the strongest OI obstacles between price and those boundaries.
+    """
+    table = result.get("strike_table")
+    if table is None or not hasattr(table, "empty") or table.empty or "strike" not in table.columns:
+        return []
+    work = table.copy()
+    for col in ("strike", "ce_ltp", "pe_ltp", "ce_oi", "pe_oi", "combined_oi", "ce_bid", "ce_ask", "pe_bid", "pe_ask", "ce_volume", "pe_volume"):
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
+    spot = _positive_float(result.get("spot") or result.get("future_ltp"))
+    if not spot:
+        return []
+    safe_ce = _positive_float(result.get("safer_sell_ce"))
+    safe_pe = _positive_float(result.get("safer_sell_pe"))
+    work = work[work["strike"] > 0].copy()
+    if work.empty:
+        return []
+
+    chosen = set()
+    nearest = work.assign(_d=(work["strike"] - spot).abs()).sort_values("_d").head(6)
+    chosen.update(nearest.index.tolist())
+
+    if safe_pe:
+        outside = work[work["strike"] <= safe_pe].sort_values("strike", ascending=False).head(4)
+        chosen.update(outside.index.tolist())
+        route = work[(work["strike"] >= safe_pe) & (work["strike"] <= spot)].sort_values("combined_oi", ascending=False).head(8)
+        chosen.update(route.index.tolist())
+    if safe_ce:
+        outside = work[work["strike"] >= safe_ce].sort_values("strike", ascending=True).head(4)
+        chosen.update(outside.index.tolist())
+        route = work[(work["strike"] >= spot) & (work["strike"] <= safe_ce)].sort_values("combined_oi", ascending=False).head(8)
+        chosen.update(route.index.tolist())
+
+    chosen.update(work.sort_values("combined_oi", ascending=False).head(4).index.tolist())
+    selected = work.loc[sorted(chosen)].sort_values("strike").head(32)
+    fields = [
+        "strike", "ce_ltp", "pe_ltp", "ce_oi", "pe_oi", "combined_oi",
+        "ce_bid", "ce_ask", "pe_bid", "pe_ask", "ce_volume", "pe_volume",
+    ]
+    out: List[Dict[str, Any]] = []
+    for _, row in selected.iterrows():
+        rec: Dict[str, Any] = {}
+        for field in fields:
+            if field in row.index:
+                try:
+                    val = float(row.get(field, 0) or 0)
+                except Exception:
+                    val = 0.0
+                if val:
+                    rec[field] = val
+        if rec.get("strike"):
+            out.append(rec)
+    return out
+
+
+def _compact_live_odme(result: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(_compact_live_odme_sb37(result, meta) or {})
+    chain = _select_chain_window(result)
+    if chain:
+        out["chain_window"] = chain
+        strikes = sorted({float(x.get("strike", 0) or 0) for x in chain if _positive_float(x.get("strike"))})
+        diffs = [b - a for a, b in zip(strikes, strikes[1:]) if b > a]
+        if diffs:
+            out["strike_step"] = min(diffs)
+    lot = int(_positive_float(meta.get("lot_size")) or _positive_float(result.get("lot_size")) or 1)
+    out["lot_size"] = max(1, lot)
+    for name in ("hvn", "lvn"):
+        rows = result.get(name)
+        if isinstance(rows, list) and rows:
+            out[name] = rows[:5]
+    return out
+
+
+def _apply_trade_plan(store: BaseStore, instrument: str, mode: str, scan_id: str, analysis: Dict[str, Any], open_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    saved = _apply_trade_plan_sb37(store, instrument, mode, scan_id, analysis, open_trades)
+    if not saved:
+        return saved
+    plan = analysis.get("trade_plan", {}) or {}
+    extra_keys = (
+        "expected_behavior", "behavior_health", "behavior_bad_streak",
+        "path_snapshot", "nonarrival_snapshot", "relevance_focus",
+    )
+    if not any(plan.get(k) not in (None, "", {}, []) for k in extra_keys):
+        return saved
+    meta = _load_json_object(saved.get("metadata_json", ""))
+    for key in extra_keys:
+        value = plan.get(key)
+        if value not in (None, "", {}, []):
+            meta[key] = value
+    meta["reasoner_version"] = analysis.get("reasoner_version", "")
+    saved = dict(saved)
+    saved["metadata_json"] = _json_dumps(meta)
+    saved["updated_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return store.upsert_superbrain_trade(saved)
+
+
+def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]:
+    """SB3.8 orchestration; external feeds/writes remain exactly as before.
+
+    The only added work is to expose Angel master lot size to the in-memory
+    SuperBrain evaluation after the unchanged ODME scan has completed.
+    """
+    instrument = _norm(instrument)
+    stage = "START"
+    try:
+        stage = "BUILD_INSTRUMENT_MAP"
+        mapping = build_instrument_map(store)
+        matched = mapping[mapping["instrument"].eq(instrument)] if not mapping.empty else pd.DataFrame()
+        if matched.empty:
+            raise ValueError(f"{instrument} is not present in TV_TEST_CURRENT.")
+        map_row = matched.iloc[0].to_dict()
+
+        stage = "LOAD_OPEN_SUPERBRAIN_TRADES"
+        open_trades = _open_trade_records(store, instrument)
+
+        stage = "LOAD_TV_CURRENT"
+        tv_rows = store.load_tv_current(instrument)
+        odme_outcome: Dict[str, Any] = {}
+        odme_error = ""
+        odme_live = False
+
+        if bool(map_row.get("odme_scan_enabled")):
+            stage = "OPTIONAL_ODME_REFRESH"
+            expiry = str(map_row.get("selected_expiry", "") or "").strip()
+            try:
+                angel = AngelConnector(load_angel_credentials())
+                angel.login_automatic()
+                master = angel.load_instrument_master()
+                odme_outcome = run_odme_scan(
+                    store,
+                    angel,
+                    master,
+                    instrument,
+                    expiry,
+                    save_only_if_changed=True,
+                )
+                if isinstance(odme_outcome, dict):
+                    meta = dict(odme_outcome.get("meta", {}) or {})
+                    meta["lot_size"] = _derive_lot_size_from_master(angel, master, instrument, expiry)
+                    odme_outcome["meta"] = meta
+                odme_live = True
+            except Exception as exc:
+                odme_error = f"{type(exc).__name__}: {exc}"
+
+        stage = "LOAD_MATCHED_ODME_HISTORY"
+        latest_odme = store.load_latest_odme_for_instrument(instrument)
+        sources = []
+        if tv_rows is not None and not tv_rows.empty and "source" in tv_rows.columns:
+            sources = sorted({str(x).strip() for x in tv_rows["source"] if str(x).strip()})
+
+        mode = "TV + ODME" if odme_live else "TV only"
+        stage = "WRITE_SUPERBRAIN_MEMORY"
+        memory = _persist_scan_memory(
+            store=store,
+            instrument=instrument,
+            mode=mode,
+            mapping=map_row,
+            tv_rows=tv_rows,
+            latest_odme=latest_odme,
+            live_odme_result=(odme_outcome.get("result", {}) if odme_outcome else {}),
+            live_odme_meta=(odme_outcome.get("meta", {}) if odme_outcome else {}),
+            odme_live=odme_live,
+            odme_error=odme_error,
+            open_trades=open_trades,
+        )
+
+        return {
+            "instrument": instrument,
+            "mode": mode,
+            "tv_rows": tv_rows,
+            "tv_sources": sources,
+            "mapping": map_row,
+            "odme_live": odme_live,
+            "odme_outcome": odme_outcome,
+            "latest_odme": latest_odme,
+            "odme_error": odme_error,
+            "open_trades": open_trades,
+            "memory": memory,
+            "analysis": memory.get("analysis", {}),
+            "superbrain_build": SUPERBRAIN_BRIDGE_VERSION,
+        }
+    except Exception as exc:
+        raise RuntimeError(
+            f"{SUPERBRAIN_BRIDGE_VERSION} [{stage}] {type(exc).__name__}: {exc}"
+        ) from exc
