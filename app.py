@@ -184,18 +184,28 @@ def render_public_superbrain() -> None:
     else:
         st.caption("No additional commentary for this scan.")
 
-    # Ask AI deliberately does not call an API.  It opens ChatGPT for the rich,
+    # Ask AI deliberately does not call an API. It opens ChatGPT for rich,
     # interactive analysis against SUPERBRAIN_RULES + live ODME/TV data.
-    if hasattr(st, "link_button"):
-        st.link_button("Ask AI", "https://chatgpt.com/", use_container_width=True)
-    else:
-        st.markdown(
-            '<a href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer" '
-            'style="display:block;text-align:center;padding:.55rem 1rem;border:1px solid rgba(128,128,128,.35);'
-            'border-radius:.5rem;text-decoration:none;font-weight:700;">Ask AI</a>',
-            unsafe_allow_html=True,
-        )
-    st.caption(f"In ChatGPT ask: SB {instrument} — or SB ALL for all enabled instruments.")
+    ai_prompt = (
+        f"Read `SUPERBRAIN_RULES` first, then all relevant live data in my "
+        f"`ODME_Angel_Memory` Sheet and give me full SuperBrain analysis for {instrument}."
+    )
+    st.markdown("**Copy this prompt into ChatGPT:**")
+    try:
+        # Streamlit code blocks expose a built-in one-click copy control.
+        st.code(ai_prompt, language=None, wrap_lines=True)
+    except TypeError:
+        # Compatibility fallback for older Streamlit builds.
+        st.code(ai_prompt, language=None)
+
+    st.markdown(
+        '<a href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer" '
+        'style="display:block;width:100%;box-sizing:border-box;text-align:center;'
+        'padding:.68rem 1rem;background:#16a34a;color:#ffffff !important;'
+        'border:1px solid #15803d;border-radius:.5rem;text-decoration:none;'
+        'font-weight:700;line-height:1.2;">Ask AI</a>',
+        unsafe_allow_html=True,
+    )
 
 def _run_expired_cleanup_once(store: Any, show_notice: bool = True) -> None:
     """Automatically remove finished-expiry ODME snapshots once per India date."""
