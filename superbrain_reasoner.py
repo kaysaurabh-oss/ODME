@@ -4295,7 +4295,7 @@ def analyze_market(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], 
 # The calculation engine above remains authoritative.  SB4.0 only locks the
 # operational presentation requested for Streamlit and replaces legacy
 # TAKE/PASS wording with Consider/Avoid/Wait.
-REASONER_VERSION = "SB4.0_LOCKED_STREAMLIT"
+REASONER_VERSION = "SB4.3_ETA_PATH_DIAGNOSTICS"
 
 
 def _sb40_expiry_label(evidence: Dict[str, Any]) -> str:
@@ -4341,6 +4341,45 @@ def _sb40_strangle_line(pe: Dict[str, Any], ce: Dict[str, Any], evidence: Dict[s
         f"Safe through {safe} | Expected arrival CE {ce_d['expected']} / PE {pe_d['expected']} | "
         f"Reward {_fmt_money(reward)} | Stress risk {_fmt_money(risk)}"
     )
+
+
+def _sb40_route_diagnostic_candidate(base: Dict[str, Any], evidence: Dict[str, Any], option: str) -> Optional[Dict[str, Any]]:
+    """Evaluate the nearest ODME-eligible listed strike for route diagnostics.
+
+    This deliberately does NOT bypass any trade-authorisation gate.  It exists so
+    stressed/composite arrival and safe-through remain observable even when ODME
+    currently says WAIT/Avoid on that side.  The normal _best_side_candidate()
+    function remains the authority for an actionable candidate.
+    """
+    rows = _candidate_rows_for_side(base, evidence, option)
+    if not rows:
+        return None
+    row = rows[0]
+    full = _evaluate_short_option(base, evidence, option, row)
+    if full and full.get("strike"):
+        return full
+
+    # ETA/path does not depend on IV. Preserve route intelligence even if Greeks
+    # cannot be solved from the current option quote.
+    price = _f(base.get("price"))
+    strike = _f(row.get("strike"))
+    if price is None or strike is None:
+        return None
+    path = _composite_path(base, evidence, strike, option)
+    ltp = _f(row.get("pe_ltp" if _u(option) == "PE" else "ce_ltp")) or 0.0
+    bid = _f(row.get("pe_bid" if _u(option) == "PE" else "ce_bid")) or 0.0
+    return {
+        "valid": bool(path.get("available")),
+        "option": _u(option),
+        "strike": strike,
+        "premium": bid if bid > 0 else ltp,
+        "ltp": ltp,
+        "bid": bid,
+        "ask": _f(row.get("pe_ask" if _u(option) == "PE" else "ce_ask")) or 0.0,
+        "oi": _f(row.get("pe_oi" if _u(option) == "PE" else "ce_oi")) or 0.0,
+        "path": path,
+        "route_diagnostic_only": True,
+    }
 
 
 def _sb40_nonarrival_assessment(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -4397,14 +4436,40 @@ def _sb40_nonarrival_assessment(base: Dict[str, Any], evidence: Dict[str, Any], 
         text += " | protection/reward filters are not satisfied"
         return {"decision": "AVOID", "text": text, "compact_line": text, "candidate": best_raw}
 
+    # Even when ODME blocks a sale, preserve route/ETA diagnostics for the nearest
+    # eligible safer-boundary strike.  This does not authorise the trade; it only
+    # prevents WAIT decisions from losing the deterministic path calculation.
+    pe_diag = _sb40_route_diagnostic_candidate(base, evidence, "PE")
+    ce_diag = _sb40_route_diagnostic_candidate(base, evidence, "CE")
+
     reasons: List[str] = []
     if not pe_sale_ok:
         reasons.append("put selling not approved by current option positioning")
     if not ce_sale_ok:
         reasons.append("call selling not approved by current option positioning")
     reason = "; ".join(reasons) if reasons else "no listed strike currently meets protection/reward requirements"
-    text = f"Wait | {reason}"
-    return {"decision": "WAIT", "text": text, "compact_line": text}
+
+    parts: List[str] = []
+    for cand in (pe_diag, ce_diag):
+        if not cand or not cand.get("strike"):
+            continue
+        path = cand.get("path", {}) or {}
+        if not path.get("available"):
+            continue
+        d = _sb40_path_dates(path, evidence)
+        side = _u(cand.get("option"))
+        parts.append(
+            f"{_fmt(cand.get('strike'))} {side}: stressed {d['stressed']}, expected {d['expected']}, safe through {d['safe']}, "
+            f"expiry protected {'Yes' if path.get('protected_through_expiry') else 'No'}"
+        )
+    route_text = " | " + " ; ".join(parts) if parts else ""
+    text = f"Wait | {reason}{route_text}"
+    out = {"decision": "WAIT", "text": text, "compact_line": text}
+    if pe_diag:
+        out["pe"] = pe_diag
+    if ce_diag:
+        out["ce"] = ce_diag
+    return out
 
 
 def _sb40_directional_state(base: Dict[str, Any], plan: Dict[str, Any]) -> str:

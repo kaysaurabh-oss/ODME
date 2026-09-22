@@ -940,7 +940,7 @@ def _apply_trade_plan(store: BaseStore, instrument: str, mode: str, scan_id: str
 # ============================================================================
 # SB3.8 relevance / path / non-arrival intelligence overrides
 # ============================================================================
-SUPERBRAIN_BRIDGE_VERSION = "SB4.2_NA_COMPACT_PERSISTENCE"
+SUPERBRAIN_BRIDGE_VERSION = "SB4.3_ETA_PATH_DIAGNOSTICS"
 
 _compact_live_odme_sb37 = _compact_live_odme
 _apply_trade_plan_sb37 = _apply_trade_plan
@@ -1039,8 +1039,41 @@ def _select_chain_window(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _odme_commentary_section(text: Any, heading: str) -> str:
+    raw = str(text or "")
+    if not raw:
+        return ""
+    target = heading.strip().lower() + ":"
+    lines = raw.splitlines()
+    capture: List[str] = []
+    active = False
+    known = {
+        "odme verdict:", "what changed:", "positioning:", "walls:",
+        "ce action:", "pe action:", "important:", "final action:", "risk note:"
+    }
+    for line in lines:
+        stripped = line.strip()
+        low = stripped.lower()
+        if low.startswith(target):
+            active = True
+            capture.append(stripped.split(":", 1)[1].strip())
+            continue
+        if active and any(low.startswith(k) for k in known):
+            break
+        if active and stripped:
+            capture.append(stripped)
+    return " ".join(x for x in capture if x).strip()
+
+
 def _compact_live_odme(result: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(_compact_live_odme_sb37(result, meta) or {})
+    commentary = result.get("commentary", "") or out.get("commentary", "")
+    if commentary:
+        out.setdefault("ce_action", _odme_commentary_section(commentary, "CE Action"))
+        out.setdefault("pe_action", _odme_commentary_section(commentary, "PE Action"))
+        out.setdefault("final_action", _odme_commentary_section(commentary, "Final Action"))
+        # setdefault keeps any explicit structured ODME fields authoritative.
+        out = {k: v for k, v in out.items() if v not in (None, "")}
     chain = _select_chain_window(result)
     if chain:
         out["chain_window"] = chain
