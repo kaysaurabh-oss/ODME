@@ -91,8 +91,11 @@ def _compact_na_candidate_for_memory(candidate: Any, evidence: Dict[str, Any]) -
         "option", "strike", "premium", "ltp", "bid", "ask", "mark",
         "lot_size", "estimated_iv", "delta", "gamma", "theta_day", "vega",
         "reward", "stress_risk", "rr", "stress_spot", "stress_time",
-        "stress_iv", "score", "oi", "setup_class", "planned_holding_window",
-        "safe_through_trade_window",
+        "stress_iv", "score", "tactical_score", "oi", "volume", "setup_class",
+        "setup_freshness", "tactical_theta", "planned_holding_hours",
+        "planned_holding_window", "safe_through_trade_window",
+        "window_protection_ratio", "theta_capture_est", "inside_safer_reference",
+        "odme_side_sale_preferred",
     )
     out = {k: candidate.get(k) for k in keys if candidate.get(k) not in (None, "", [], {})}
     if safer not in (None, ""):

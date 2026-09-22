@@ -4586,3 +4586,306 @@ def analyze_market(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], 
     # long report / TAKE-PASS wording.
     base["narrative"] = base["compact_commentary"]
     return base
+
+# =============================================================================
+# SB4.4 TACTICAL THETA INTELLIGENCE OVERRIDES
+# =============================================================================
+# Purpose:
+# - Preserve conventional safer-boundary Non-Arrival logic for Class A/B.
+# - Add a separate short-horizon Class C diagnostic for early
+#   expansion -> containment / IV-crush opportunities.
+# - Class C may evaluate nearer OTM listed strikes. ODME safer boundaries remain
+#   risk references, not mandatory strike filters, for this branch only.
+# - This layer surfaces candidates for analyst judgement; it does not alter
+#   TradingView calculations or ODME's own wall/safer-boundary calculations.
+REASONER_VERSION = "SB4.4_TACTICAL_THETA_INTELLIGENCE"
+
+
+def _sb44_planned_hold_hours(evidence: Dict[str, Any]) -> float:
+    """Dynamic short tactical window; intentionally not an expiry-hold proxy."""
+    expiry = _expiry_datetime(evidence)
+    now = _scan_datetime(evidence)
+    if not expiry or expiry <= now:
+        return 1.0
+    hours_left = max(0.25, (expiry - now).total_seconds() / 3600.0)
+    # Quick-harvest default: roughly 6% of remaining life, bounded 45m-3h.
+    return round(min(3.0, max(0.75, hours_left * 0.06)), 2)
+
+
+def _sb44_setup_freshness(base: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
+    odme = evidence.get("odme", {}) or {}
+    aur = base.get("aurora", {}) or {}
+    transition = _u(aur.get("transition"))
+    state = _u(aur.get("state"))
+    phase = _u(aur.get("phase"))
+    range_score = _f(odme.get("range_score")) or 0.0
+    expansion_score = _f(odme.get("expansion_score")) or 0.0
+
+    weakening = transition in {"BULLISH_MOMENTUM_WEAKENING", "BEARISH_MOMENTUM_WEAKENING"}
+    fresh_balance = transition == "MOMENTUM_BALANCED"
+    active_accel = state in {"GREEN", "RED"} and transition not in {
+        "BULLISH_MOMENTUM_WEAKENING", "BEARISH_MOMENTUM_WEAKENING", "MOMENTUM_BALANCED"
+    }
+
+    if weakening:
+        freshness = "EARLY"
+    elif fresh_balance:
+        freshness = "DEVELOPING"
+    elif state == "WHITE" or phase == "BALANCE":
+        freshness = "MATURE" if range_score >= 80 else "DEVELOPING"
+    elif range_score >= 65 and not active_accel:
+        freshness = "DEVELOPING"
+    else:
+        freshness = "NONE"
+
+    prior_expansion_evidence = expansion_score >= 50 or weakening or fresh_balance
+    active = freshness in {"EARLY", "DEVELOPING"} and prior_expansion_evidence and not active_accel
+    return {
+        "active": active,
+        "freshness": freshness,
+        "transition": transition,
+        "range_score": range_score,
+        "expansion_score": expansion_score,
+        "prior_expansion_evidence": prior_expansion_evidence,
+    }
+
+
+def _sb44_tactical_rows(base: Dict[str, Any], evidence: Dict[str, Any], option: str) -> List[Dict[str, Any]]:
+    price = _f(base.get("price"))
+    if price is None:
+        return []
+    option = _u(option)
+    rows = _chain_rows(evidence)
+    if option == "PE":
+        rows = [r for r in rows if r["strike"] < price and (_f(r.get("pe_ltp")) or 0) > 0]
+        rows.sort(key=lambda r: r["strike"], reverse=True)
+    else:
+        rows = [r for r in rows if r["strike"] > price and (_f(r.get("ce_ltp")) or 0) > 0]
+        rows.sort(key=lambda r: r["strike"])
+    # Focus on the monetisable intermediate ladder. Conventional safer-boundary
+    # diagnostics continue to be handled by the existing Class A/B functions.
+    return rows[:14]
+
+
+def _sb44_clean_acceleration_toward_side(base: Dict[str, Any], option: str) -> bool:
+    option = _u(option)
+    exec_dir = _u(base.get("exec_of"))
+    aur = base.get("aurora", {}) or {}
+    state = _u(aur.get("state"))
+    transition = _u(aur.get("transition"))
+    if option == "CE":
+        return exec_dir == "BULLISH" and state == "GREEN" and transition not in {"BULLISH_MOMENTUM_WEAKENING", "MOMENTUM_BALANCED"}
+    return exec_dir == "BEARISH" and state == "RED" and transition not in {"BEARISH_MOMENTUM_WEAKENING", "MOMENTUM_BALANCED"}
+
+
+def _sb44_tactical_side_candidates(base: Dict[str, Any], evidence: Dict[str, Any], option: str, freshness: str) -> List[Dict[str, Any]]:
+    option = _u(option)
+    rows = _sb44_tactical_rows(base, evidence, option)
+    if not rows:
+        return []
+
+    hold_hours = _sb44_planned_hold_hours(evidence)
+    odme = evidence.get("odme", {}) or {}
+    safe = _f(odme.get("safer_sell_pe" if option == "PE" else "safer_sell_ce"))
+    side_oi_key = "pe_oi" if option == "PE" else "ce_oi"
+    side_vol_key = "pe_volume" if option == "PE" else "ce_volume"
+    max_oi = max([_f(r.get(side_oi_key)) or 0.0 for r in rows] + [1.0])
+    max_vol = max([_f(r.get(side_vol_key)) or 0.0 for r in rows] + [1.0])
+    clean_accel = _sb44_clean_acceleration_toward_side(base, option)
+
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        cand = _evaluate_short_option(base, evidence, option, row)
+        if not cand.get("valid"):
+            continue
+        path = cand.get("path", {}) or {}
+        fastest_hours = _f(path.get("fastest_hours"))
+        if fastest_hours is None or fastest_hours <= 0:
+            continue
+        window_ratio = fastest_hours / max(hold_hours, 0.25)
+        delta_abs = abs(float(cand.get("delta", 0) or 0))
+        hurdles = int(_f(path.get("hurdle_count")) or 0)
+
+        # Hard safety remains behavioural rather than safer-boundary based.
+        # A strike whose stressed route reaches inside the tactical window is
+        # not a tactical theta candidate. Very high-delta OTM is also rejected.
+        if window_ratio <= 1.05 or delta_abs >= 0.60:
+            continue
+        if clean_accel and hurdles < 2:
+            continue
+
+        oi = _f(row.get(side_oi_key)) or 0.0
+        volume = _f(row.get(side_vol_key)) or 0.0
+        iv = float(cand.get("estimated_iv", 0) or 0)
+        premium = float(cand.get("premium", 0) or 0)
+        theta_day = max(0.0, float(cand.get("theta_day", 0) or 0))
+        theta_capture = theta_day * (hold_hours / 24.0) * int(cand.get("lot_size", 1) or 1)
+        theta_eff = theta_capture / max(float(cand.get("reward", 0) or 0), 1e-9)
+        rr = float(cand.get("rr", 0) or 0)
+        structural = _f(path.get("structural_friction")) or 0.0
+        oi_friction = _f(path.get("oi_friction")) or 0.0
+
+        boundary_eligible = None
+        if safe is not None:
+            boundary_eligible = cand["strike"] <= safe if option == "PE" else cand["strike"] >= safe
+
+        # Tactical score deliberately rewards short-window route separation,
+        # friction, executable participation and decay efficiency. Safer-boundary
+        # location is only a small bonus, never a Class-C hard requirement.
+        score = 0.0
+        score += min(3.0, max(0.0, window_ratio - 1.0) * 1.25)
+        score += min(2.0, structural * 2.5 + oi_friction * 1.5)
+        score += min(1.5, theta_eff * 12.0)
+        score += min(1.5, (oi / max_oi) + 0.5 * (volume / max_vol))
+        score += min(1.5, max(0.0, rr) * 1.5)
+        score += min(0.75, iv)
+        score -= max(0.0, delta_abs - 0.35) * 5.0
+        if clean_accel:
+            score -= 1.0
+        if boundary_eligible:
+            score += 0.35
+        if freshness == "MATURE":
+            score -= 1.75
+
+        cand.update({
+            "setup_class": "NA-C",
+            "tactical_theta": True,
+            "setup_freshness": freshness,
+            "planned_holding_hours": hold_hours,
+            "planned_holding_window": f"~{hold_hours:g}h",
+            "window_protection_ratio": window_ratio,
+            "theta_capture_est": theta_capture,
+            "oi": oi,
+            "volume": volume,
+            "odme_safer_boundary": safe,
+            "inside_safer_reference": (boundary_eligible is False) if boundary_eligible is not None else None,
+            "boundary_eligible": boundary_eligible,
+            "tactical_score": score,
+            "score": score,
+            "odme_side_sale_preferred": _sale_action_ok(odme, option),
+        })
+        out.append(cand)
+
+    out.sort(key=lambda x: float(x.get("tactical_score", -999) or -999), reverse=True)
+    return out
+
+
+def _sb44_tactical_candidate_line(cand: Dict[str, Any], evidence: Dict[str, Any], decision: str) -> str:
+    path = cand.get("path", {}) or {}
+    fastest = _f(path.get("fastest_hours"))
+    iv = _f(cand.get("estimated_iv"))
+    delta = _f(cand.get("delta"))
+    safe = cand.get("odme_safer_boundary")
+    ref = ""
+    if safe not in (None, ""):
+        ref = f" | safer ref {_fmt(safe)}"
+        if cand.get("inside_safer_reference"):
+            ref += " (inside by tactical design)"
+    return (
+        f"{decision} tactical {_u(cand.get('option'))} {_fmt(cand.get('strike'))} @ {_fmt_money(cand.get('premium'))}"
+        f" | IV {_fmt((iv or 0) * 100)}% | Δ {_fmt(delta)} | hold {cand.get('planned_holding_window')}"
+        f" | stressed route {(_fmt(fastest) + 'h') if fastest is not None else '?'}{ref}"
+    )
+
+
+def _sb44_tactical_assessment(base: Dict[str, Any], evidence: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if _s(evidence.get("mode")) != "TV + ODME":
+        return None
+    context = _sb44_setup_freshness(base, evidence)
+    freshness = context["freshness"]
+    if freshness == "NONE":
+        return None
+
+    pe_list = _sb44_tactical_side_candidates(base, evidence, "PE", freshness)
+    ce_list = _sb44_tactical_side_candidates(base, evidence, "CE", freshness)
+    pe = pe_list[0] if pe_list else None
+    ce = ce_list[0] if ce_list else None
+
+    # Mature range is intentionally not a fresh-entry signal. Preserve the best
+    # candidates for analyst inspection, but do not label it CONSIDER unless a
+    # fresh transition is present.
+    fresh_enough = context["active"] and freshness in {"EARLY", "DEVELOPING"}
+    eligible = [x for x in (pe, ce) if x and float(x.get("tactical_score", 0) or 0) >= 3.0]
+    if not eligible:
+        return None
+
+    focus = _current_focus(base, evidence)
+    if len(eligible) == 1:
+        chosen = eligible[0]
+        decision = "Consider" if fresh_enough else "Wait"
+        text = _sb44_tactical_candidate_line(chosen, evidence, decision)
+        if not fresh_enough:
+            text += " | containment is no longer fresh enough for a new IV-crush entry"
+        return {
+            "decision": decision.upper(),
+            "text": text,
+            "compact_line": text,
+            "candidate": chosen,
+            "setup_class": "NA-C",
+            "setup_freshness": freshness,
+            "planned_holding_window": chosen.get("planned_holding_window"),
+            "expression_hint": "ONE_SIDED_TACTICAL_THETA",
+        }
+
+    # Both sides are usable. Do not mechanically force a strangle: preserve both
+    # candidates and let analyst judgement choose one-sided vs two-sided based on
+    # residual directional asymmetry, current OI/IV and live event risk.
+    pe_score = float(pe.get("tactical_score", 0) or 0)
+    ce_score = float(ce.get("tactical_score", 0) or 0)
+    preferred = pe if pe_score >= ce_score else ce
+    if focus == "BULLISH" and pe and pe_score >= ce_score - 0.75:
+        preferred = pe
+    elif focus == "BEARISH" and ce and ce_score >= pe_score - 0.75:
+        preferred = ce
+
+    decision = "Consider" if fresh_enough else "Wait"
+    text = _sb44_tactical_candidate_line(preferred, evidence, decision)
+    text += f" | alternate {_u((ce if preferred is pe else pe).get('option'))} {_fmt((ce if preferred is pe else pe).get('strike'))}"
+    text += " | one-sided vs strangle should follow current asymmetry, not be forced"
+    if not fresh_enough:
+        text += " | range is already mature; require fresh premium expansion before entry"
+    return {
+        "decision": decision.upper(),
+        "text": text,
+        "compact_line": text,
+        "candidate": preferred,
+        "pe": pe,
+        "ce": ce,
+        "setup_class": "NA-C",
+        "setup_freshness": freshness,
+        "planned_holding_window": preferred.get("planned_holding_window"),
+        "expression_hint": "ONE_OR_TWO_SIDED_TACTICAL_THETA",
+    }
+
+
+def _sb44_nonarrival_assessment(base: Dict[str, Any], evidence: Dict[str, Any], plan: Dict[str, Any]) -> Dict[str, Any]:
+    tactical = _sb44_tactical_assessment(base, evidence)
+    if tactical and tactical.get("decision") == "CONSIDER":
+        return tactical
+
+    conventional = _sb40_nonarrival_assessment(base, evidence, plan)
+    if tactical and tactical.get("decision") == "WAIT":
+        # Prefer the tactical freshness warning over a generic distant-strike wait
+        # when the market is already in a mature containment phase.
+        return tactical
+    return conventional
+
+
+def analyze_market(evidence: Dict[str, Any], previous_evidence: Dict[str, Any], open_trades: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    # Preserve the mature SB3.7 campaign/directional engine; SB4.4 changes only
+    # the non-arrival/tactical-theta interpretation and candidate surface.
+    base = _analyze_market_sb37(evidence, previous_evidence, open_trades=open_trades)
+    plan = base.get("trade_plan", {}) or {}
+    base["reasoner_version"] = REASONER_VERSION
+    base["trade_plan"] = plan
+    base["relevance_focus"] = _u(plan.get("relevance_focus") or _current_focus(base, evidence))
+    base["waiting_for"] = [_relevant_setup_text(base, evidence)] if _u(plan.get("kind")) not in {"NEW", "MANAGE"} else []
+
+    na = _sb44_nonarrival_assessment(base, evidence, plan)
+    base["nonarrival_assessment"] = na
+    base["compact_state"] = _sb40_directional_state(base, plan)
+    base["compact_exposure"] = _sb40_exposure_line(base, evidence, plan)
+    base["compact_nonarrival"] = na.get("compact_line", na.get("text", ""))
+    base["compact_commentary"] = _sb40_compact_commentary(base, evidence, plan)
+    base["narrative"] = base["compact_commentary"]
+    return base

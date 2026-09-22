@@ -1,0 +1,49 @@
+SuperBrain SB4.2 — Non-Arrival Rules + Compact Persistence
+
+WHAT CHANGED
+1. SUPERBRAIN_RULES is authoritative and has been updated in the live Sheet:
+   - GOV-00: user proposals are hypotheses only; locked rules/current evidence decide.
+   - NA-03: Non-Arrival strikes MUST be the applicable ODME safer strike or farther away; never closer.
+   - NA-14..NA-30: tactical premium-harvesting rules, Momentum-Away and Barrier-Containment classes, active exit/roll management, holding-window safety.
+   - MEM-01..MEM-02: compact Non-Arrival persistence requirements.
+
+2. superbrain_bridge.py now stores a bounded `nonarrival` object inside the EXISTING
+   superbrain_memory.metadata_json state-row write.
+
+COMPACT PERSISTENCE KEEPS
+- decision / compact line
+- strategy/setup class when supplied
+- spot / expiry
+- safer PE / safer CE boundaries
+- selected candidate(s)
+- premium / bid / ask / IV / Greeks / OI when supplied
+- reward / stress risk / RR
+- stressed arrival / composite expected arrival / safe-through
+- protected-through-expiry
+- bounded route hurdles and OI clusters
+- explicit boundary_eligible audit flag
+- future planned_holding_window / safe_through_trade_window fields when reasoner supplies them
+
+PERFORMANCE / SAFETY
+- NO change to TradingView/Pine indicators.
+- NO change to Apps Script/webhook.
+- NO change to TV_TEST_CURRENT / TV_TEST_EVENTS writes.
+- NO new Sheet tab or Sheet API call.
+- NO new concurrency/locking path.
+- NO data_store.py schema change.
+- Uses the same existing superbrain state-row update; only metadata_json is slightly larger.
+- Compact object is deliberately bounded. Synthetic two-sided route payloads remain far below the existing 20k cell guard.
+- Existing market_state_json behavior/guard is unchanged.
+
+DEPLOYMENT
+Replace only:
+  superbrain_bridge.py
+
+app.py and superbrain_reasoner.py are included only for a complete matching build and are unchanged from SB4.1.
+Do NOT replace or modify the Apps Script webhook, Pine indicators, or data_store.py for this patch.
+
+After deployment the Streamlit caption should show:
+  Core build: SB4.2_NA_COMPACT_PERSISTENCE
+
+The compact Non-Arrival metadata becomes available from the NEXT SuperBrain scan after deployment.
+Existing already-truncated historical market_state_json cells are not reconstructable from the stored hash alone.

@@ -1,0 +1,23 @@
+SuperBrain SB4.3 — ETA Path Diagnostics
+
+Purpose
+- Fix missing Non-Arrival stressed/composite ETA and safe-through when the final decision is WAIT/Avoid.
+- Parse CE Action / PE Action / Final Action from ODME commentary into the compact live evidence used by SuperBrain.
+
+Files changed from SB4.2
+- superbrain_reasoner.py
+- superbrain_bridge.py
+
+Unchanged
+- app.py
+- data_store.py and Sheet schema
+- TradingView/Pine
+- Apps Script/webhook
+
+Important behaviour
+- Trade authorisation gates are NOT loosened.
+- _best_side_candidate remains the actionable-candidate gate.
+- New route-diagnostic evaluation only preserves deterministic ETA/path data for ODME-eligible safer-boundary strikes even when the trade decision remains WAIT.
+- No new Sheet write, column, tab, webhook call or concurrency path.
+
+Deploy both changed files together.

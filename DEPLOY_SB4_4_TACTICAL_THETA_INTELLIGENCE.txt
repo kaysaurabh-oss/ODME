@@ -1,0 +1,43 @@
+SuperBrain SB4.4 — Tactical Theta Intelligence
+=============================================
+
+Purpose
+-------
+Adds a separate short-horizon Class C tactical-theta interpretation without changing
+TradingView/Pine calculations, ODME calculations, or the established campaign engine.
+
+Key behaviour
+-------------
+1. Conventional Class A/B Non-Arrival remains safer-boundary based.
+2. Class C can evaluate nearer OTM intermediate strikes; ODME safer boundaries remain
+   visible risk references rather than mandatory Class-C strike gates.
+3. Tactical Class C uses a short dynamic holding window and evaluates:
+   - stressed/composite route timing versus the holding window
+   - route hurdles / structural and OI friction
+   - live option premium and executable bid where available
+   - estimated IV/Greeks from the live option mark when supplied Greeks are absent
+   - OI / volume participation
+   - delta/gamma and stress mark-to-market
+   - setup freshness (EARLY / DEVELOPING / MATURE)
+4. One-sided tactical CE/PE is allowed when only one route qualifies; a strangle is not forced.
+5. Mature range is not treated as a fresh entry signal; new entry normally requires a fresh
+   containment transition or renewed premium/IV expansion.
+6. Compact persistence now retains tactical setup freshness, holding window, volume,
+   tactical score, inside-safer-reference flag and decay estimate.
+
+Deployment
+----------
+Replace the current SuperBrain application files with the files in this folder:
+- superbrain_reasoner.py
+- superbrain_bridge.py
+- app.py (unchanged from SB4.3 but included for a complete deployable set)
+
+No Sheet/tab/schema change is required. The existing superbrain_memory row is reused.
+The authoritative SUPERBRAIN_RULES Sheet must be at rulebook version:
+SB_RULES_2026-09-22_04
+
+Important
+---------
+SB4.4 surfaces tactical candidates for analyst judgement. It does not auto-execute trades.
+External web opinions/tips are not inputs. Web use is limited by governance to factual market
+inputs and material scheduled/current event risk.
