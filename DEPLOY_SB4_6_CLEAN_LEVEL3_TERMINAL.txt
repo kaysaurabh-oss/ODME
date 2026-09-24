@@ -1,0 +1,32 @@
+SuperBrain SB4.6 — Clean Manual Level 3 Terminal
+
+Replace these files in the current SuperBrain Streamlit deployment:
+- app.py
+- superbrain_bridge.py
+- data_store.py
+- superbrain_reasoner.py
+
+What changed
+1. SuperBrain user control is now "Scan now". No Ask-AI/Ask-SuperBrain handoff or build/model/version label is shown in the Level-3 terminal.
+2. A manual scan refreshes ODME/options whenever the instrument has a saved expiry, even when batch scan is disabled.
+3. Freshness is shown first: scan timestamp, EDGE/AURORA/STRUCTURE/LIQUIDITY timestamps and ODME timestamp/expiry.
+4. No ACTIVE campaign:
+   - current indicator state
+   - nearest relevant location / hidden-intelligence line
+   - next likely event / pending Level-2 setup
+   - explicit ENTRY READY or HOLD against the stored ODME requirement
+   - compact ODME verdict/action plus POC, CE/PE walls, safer CE/PE and value area when available
+5. ACTIVE campaign:
+   - campaign / exposure
+   - actual behaviour now versus expected behaviour
+   - next locked management event being watched
+   - current ODME bias + precise options question
+   - next likely NEW campaign/event and what must happen
+   - compact ODME section
+6. Manual scans are observational for ACTIVE campaigns. They do not automatically close, roll, add, reduce or otherwise mutate a campaign.
+7. Fresh entries still become ACTIVE only after the user confirms "Trade taken — record campaign".
+
+Rulebook alignment
+- SUPERBRAIN_RULES version: SB_RULES_2026-09-25_02
+- ARCH-13: clean structured manual terminal
+- ARCH-14: Level-3 scan is observational / no automatic campaign mutation

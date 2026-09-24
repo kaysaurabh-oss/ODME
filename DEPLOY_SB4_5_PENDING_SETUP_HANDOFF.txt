@@ -1,0 +1,67 @@
+SuperBrain SB4.5 — PENDING SETUP → USER-CONFIRMED ACTIVE CAMPAIGN
+================================================================
+
+Purpose
+-------
+This patch implements the execution handoff agreed for the Level-2/Level-3 architecture.
+A SuperBrain NEW recommendation is NOT treated as an executed trade.
+
+Locked behaviour
+----------------
+1. Level 2 creates SETUP rows in superbrain_memory with status=PENDING_ENTRY.
+2. User runs Streamlit / Ask SuperBrain for the manual ODME Level-3 check.
+3. If Level 3 produces a NEW entry plan, Streamlit shows the matching pending setup(s).
+4. Nothing is recorded as ACTIVE merely because the scan recommends entry.
+5. AFTER the user actually takes the trade, click:
+      I took this trade — record campaign
+6. The click first creates a new ACTIVE TRADE/campaign row.
+7. The TRADE metadata stores:
+      parent_setup_id
+      origin_setup_record_id
+      origin_setup_id
+      origin_setup_name
+      origin_setup_direction
+      origin_setup_odme_requirement
+      origin_setup_fp
+      origin_setup_of_relationship
+      origin_setup_aurora_state
+      origin_setup_pitchfork_state
+      origin_setup_rulebook_version
+      management_family
+      execution_confirmed_by_user=true
+8. Only after the ACTIVE trade write succeeds, the originating SETUP row becomes:
+      status = ENTERED
+      action = EXECUTED
+      trade_id = <new trade id>
+      closed_at = <setup completion timestamp>
+      close_reason = ENTERED::<trade id>
+9. ENTERED means the setup has been consumed. It does NOT mean the campaign is closed.
+10. Level 2 ignores ENTERED setups, so the same setup cannot later be treated as an unexecuted break-watch setup.
+11. Existing ACTIVE campaigns are unchanged by this patch.
+12. External Ask-AI handoff is removed from the public Streamlit SuperBrain view. Streamlit itself is Level 3.
+
+Files to replace
+----------------
+- app.py
+- superbrain_bridge.py
+- data_store.py
+
+superbrain_reasoner.py is included unchanged from SB4.4 for package completeness.
+
+Rulebook
+--------
+Expected current version: SB_RULES_2026-09-24_04
+ARCH-08 = USER_CONFIRMED_PROMOTE
+
+Verification after deployment
+-----------------------------
+A. Trigger a Level-2 setup and confirm a SETUP / PENDING_ENTRY row exists.
+B. Run Ask SuperBrain. If the plan is NEW, confirm no TRADE row is created yet.
+C. Take the trade manually in the broker.
+D. Click "I took this trade — record campaign".
+E. Confirm:
+   - new TRADE row = ACTIVE
+   - originating SETUP row = ENTERED
+   - SETUP.trade_id equals TRADE.trade_id
+   - TRADE.metadata_json.parent_setup_id equals SETUP.record_id
+F. Run Level 2 again and confirm that ENTERED setup does not alert as a fresh pending setup.

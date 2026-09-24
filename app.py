@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
+import json
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, List
 
@@ -12,7 +13,12 @@ from data_store import get_store, make_key, make_snapshot_id, parse_previous_sum
 from odme_config import APP_NAME, REFRESH_INTERVAL_SECONDS, SUPPORTED_INSTRUMENTS
 from odme_engine import analyze_odme, reconstruct_saved_result
 from scan_service import run_odme_scan
-from superbrain_bridge import build_instrument_map, prepare_superbrain_scan, SUPERBRAIN_BRIDGE_VERSION
+from superbrain_bridge import (
+    build_instrument_map,
+    prepare_superbrain_scan,
+    pending_setup_choices,
+    record_superbrain_trade_taken,
+)
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
@@ -94,118 +100,549 @@ def login_page() -> None:
             st.error(str(exc))
 
 
+def _sb_json(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        x = json.loads(str(value or ""))
+        return x if isinstance(x, dict) else {}
+    except Exception:
+        return {}
+
+
+def _sb_list_json(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, list):
+        return [x for x in value if isinstance(x, dict)]
+    try:
+        x = json.loads(str(value or ""))
+        return [y for y in x if isinstance(y, dict)] if isinstance(x, list) else []
+    except Exception:
+        return []
+
+
+def _sb_fmt_time(value: Any) -> str:
+    if value in (None, ""):
+        return "—"
+    try:
+        if isinstance(value, (int, float)) or str(value).strip().isdigit():
+            n = float(value)
+            if n > 1e12:
+                dt = datetime.fromtimestamp(n / 1000.0, tz=timezone.utc)
+            elif n > 1e9:
+                dt = datetime.fromtimestamp(n, tz=timezone.utc)
+            else:
+                return str(value)
+        else:
+            txt = str(value).strip().replace("Z", "+00:00")
+            dt = datetime.fromisoformat(txt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ZoneInfo("Asia/Singapore")).strftime("%d %b %H:%M")
+    except Exception:
+        return str(value)
+
+
+def _sb_fmt_level(value: Any) -> str:
+    try:
+        n = float(value)
+        if abs(n) >= 1000:
+            return f"{n:,.0f}" if n.is_integer() else f"{n:,.2f}"
+        return f"{n:.2f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(value or "—")
+
+
+def _sb_tv_freshness(packet: Dict[str, Any]) -> List[str]:
+    tv = packet.get("tv_rows")
+    if tv is None or not isinstance(tv, pd.DataFrame) or tv.empty:
+        return []
+    rows = []
+    for source in ["EDGE", "AURORA", "STRUCTURE", "LIQUIDITY"]:
+        g = tv[tv.get("source", pd.Series(dtype=str)).astype(str).str.upper().eq(source)] if "source" in tv.columns else pd.DataFrame()
+        if g.empty:
+            continue
+        r = g.iloc[-1].to_dict()
+        stamp = r.get("bar_time") or r.get("updated_at") or ""
+        tf = str(r.get("tf", "") or "")
+        rows.append(f"{source} {_sb_fmt_time(stamp)}" + (f" · {tf}m" if tf else ""))
+    return rows
+
+
+def _sb_odme_data(packet: Dict[str, Any]) -> Dict[str, Any]:
+    live = ((packet.get("odme_outcome") or {}).get("result") or {}) if packet.get("odme_live") else {}
+    latest = packet.get("latest_odme") or {}
+    analysis = packet.get("analysis") or {}
+    evidence_odme = packet.get("memory", {}).get("analysis", {}).get("odme") if isinstance(packet.get("memory"), dict) else {}
+    data = dict(latest)
+    if isinstance(evidence_odme, dict):
+        data.update({k: v for k, v in evidence_odme.items() if v not in (None, "")})
+    if isinstance(live, dict):
+        # Live ODME result has richer keys than the saved compact row.
+        for k, v in live.items():
+            if v not in (None, "", [], {}):
+                data[k] = v
+    return data
+
+
+def _sb_first(data: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        v = data.get(key)
+        if v not in (None, ""):
+            return v
+    return ""
+
+
+def _sb_comment_section(text: str, heading: str) -> str:
+    if not text:
+        return ""
+    target = heading.lower() + ":"
+    known = ["odme verdict:", "what changed:", "positioning:", "walls:", "ce action:", "pe action:", "final action:", "risk note:"]
+    active = False
+    out = []
+    for raw in str(text).splitlines():
+        line = raw.strip()
+        low = line.lower()
+        if low.startswith(target):
+            active = True
+            out.append(line.split(":", 1)[1].strip())
+            continue
+        if active and any(low.startswith(k) for k in known):
+            break
+        if active and line:
+            out.append(line)
+    return " ".join(x for x in out if x).strip()
+
+
+def _sb_render_freshness(packet: Dict[str, Any]) -> None:
+    memory = packet.get("memory") or {}
+    odme = _sb_odme_data(packet)
+    parts = [f"Scan {_sb_fmt_time(memory.get('scanned_at'))}"]
+    parts.extend(_sb_tv_freshness(packet))
+    odme_ts = _sb_first(odme, "ts", "generated_at")
+    if odme_ts:
+        expiry = str(_sb_first(odme, "expiry") or (packet.get("mapping") or {}).get("selected_expiry") or "")
+        parts.append(f"ODME {_sb_fmt_time(odme_ts)}" + (f" · {expiry}" if expiry else ""))
+    elif (packet.get("mapping") or {}).get("selected_expiry"):
+        parts.append("ODME not refreshed")
+    st.caption("  |  ".join(parts))
+
+
+def _sb_render_odme(packet: Dict[str, Any]) -> None:
+    odme = _sb_odme_data(packet)
+    st.markdown("### Options / ODME")
+    if not odme:
+        st.write("No ODME snapshot is available for this instrument.")
+        return
+    tilt = str(_sb_first(odme, "odme_tilt", "tilt") or "—")
+    poc = _sb_first(odme, "option_poc", "poc")
+    ce_wall = _sb_first(odme, "active_ce_wall", "ce_wall")
+    pe_wall = _sb_first(odme, "active_pe_wall", "pe_wall")
+    safe_ce = _sb_first(odme, "safer_sell_ce", "safe_ce")
+    safe_pe = _sb_first(odme, "safer_sell_pe", "safe_pe")
+    va_low = _sb_first(odme, "value_area_low")
+    va_high = _sb_first(odme, "value_area_high")
+    st.write(f"**{tilt}**")
+    level_bits = [f"POC {_sb_fmt_level(poc)}", f"CE wall {_sb_fmt_level(ce_wall)}", f"PE wall {_sb_fmt_level(pe_wall)}", f"Safer CE {_sb_fmt_level(safe_ce)}", f"Safer PE {_sb_fmt_level(safe_pe)}"]
+    if va_low not in (None, "") and va_high not in (None, ""):
+        level_bits.append(f"Value area {_sb_fmt_level(va_low)}–{_sb_fmt_level(va_high)}")
+    st.caption("  |  ".join(level_bits))
+    commentary = str(_sb_first(odme, "commentary") or "")
+    final_action = str(_sb_first(odme, "final_action") or _sb_comment_section(commentary, "Final Action") or "").strip()
+    ce_action = str(_sb_first(odme, "ce_action") or _sb_comment_section(commentary, "CE Action") or "").strip()
+    pe_action = str(_sb_first(odme, "pe_action") or _sb_comment_section(commentary, "PE Action") or "").strip()
+    if final_action:
+        st.write(final_action)
+    elif commentary:
+        verdict = _sb_comment_section(commentary, "ODME Verdict")
+        if verdict:
+            st.write(verdict)
+    small = []
+    if ce_action:
+        small.append(f"CE: {ce_action}")
+    if pe_action:
+        small.append(f"PE: {pe_action}")
+    if small:
+        st.caption("  |  ".join(small))
+
+
+def _sb_setup_md(row: Dict[str, Any]) -> Dict[str, Any]:
+    return _sb_json((row or {}).get("metadata_json", ""))
+
+
+def _sb_setup_for_trade(store: Any, trade: Dict[str, Any]) -> Dict[str, Any]:
+    md = _sb_json((trade or {}).get("metadata_json", ""))
+    rid = str(md.get("parent_setup_id") or md.get("origin_setup_record_id") or "").strip()
+    if not rid:
+        return {}
+    try:
+        df = store.list_superbrain_setups(instrument=str(trade.get("instrument", "") or ""))
+    except Exception:
+        return {}
+    if df is None or df.empty:
+        return {}
+    hit = df[df["record_id"].astype(str).eq(rid)] if "record_id" in df.columns else pd.DataFrame()
+    return hit.iloc[-1].to_dict() if not hit.empty else {}
+
+
+def _sb_exposure_text(trade: Dict[str, Any]) -> str:
+    legs = _sb_list_json(trade.get("legs_json", ""))
+    labels = []
+    for leg in legs:
+        status = str(leg.get("status", "ACTIVE") or "ACTIVE").upper()
+        if status not in {"ACTIVE", "OPEN", ""}:
+            continue
+        side = str(leg.get("side", "") or "").upper()
+        opt = str(leg.get("option_type") or leg.get("option") or "").upper()
+        strike = leg.get("strike")
+        expiry = str(leg.get("expiry", "") or "")
+        bits = [x for x in [side, _sb_fmt_level(strike) if strike not in (None, "") else "", opt, expiry] if x]
+        if bits:
+            labels.append(" ".join(bits))
+    return " + ".join(labels) if labels else str(trade.get("strategy_type", "campaign") or "campaign")
+
+
+def _sb_current_market_line(analysis: Dict[str, Any]) -> str:
+    price = analysis.get("price")
+    macro = str(analysis.get("macro", "") or "NEUTRAL")
+    of = str(analysis.get("exec_of", "") or "NEUTRAL")
+    aur = analysis.get("aurora") or {}
+    aura = str(aur.get("state", "") or "—")
+    fork = analysis.get("fork") or {}
+    pf = "—"
+    if fork.get("valid"):
+        pf = f"{str(fork.get('slope','')).upper()} / {str(fork.get('position','')).replace('_',' ')}"
+    half = str(analysis.get("battlefield_half", "") or "—").replace("_", " ")
+    return f"Price {_sb_fmt_level(price)} | Macro {macro} | OF {of} | AURORA {aura} | Pitchfork {pf} | Battlefield {half}"
+
+
+def _sb_location_line(analysis: Dict[str, Any]) -> str:
+    price = analysis.get("price")
+    hurdles = analysis.get("hurdles") or []
+    ranked = []
+    for h in hurdles:
+        try:
+            p, lo, hi = float(price), float(h.get("low")), float(h.get("high"))
+            dist = 0 if lo <= p <= hi else min(abs(p-lo), abs(p-hi))
+            ranked.append((dist, h))
+        except Exception:
+            continue
+    if ranked:
+        h = sorted(ranked, key=lambda x: x[0])[0][1]
+        side = str(h.get("side", "") or "").title()
+        strength = str(h.get("strength", "") or "")
+        status = str(h.get("status", "") or "").replace("_", " ").title()
+        return f"Nearest {side.lower()} {_sb_fmt_level(h.get('low'))}–{_sb_fmt_level(h.get('high'))}" + (f" · {strength}" if strength else "") + (f" · {status}" if status else "")
+    defender = analysis.get("defender") or {}
+    challenger = analysis.get("challenger") or {}
+    bits=[]
+    if defender.get("low") not in (None, "") and defender.get("high") not in (None, ""):
+        bits.append(f"Defender {_sb_fmt_level(defender.get('low'))}–{_sb_fmt_level(defender.get('high'))}")
+    if challenger.get("low") not in (None, "") and challenger.get("high") not in (None, ""):
+        bits.append(f"Challenger {_sb_fmt_level(challenger.get('low'))}–{_sb_fmt_level(challenger.get('high'))}")
+    return " | ".join(bits) or "No nearby qualified FP zone."
+
+
+def _sb_hidden_line(analysis: Dict[str, Any]) -> str:
+    bits = []
+    liq = analysis.get("liquidity") or {}
+    if liq.get("meaning"):
+        bits.append(str(liq.get("meaning")))
+    elif liq.get("directional_read"):
+        bits.append(f"liquidity read {str(liq.get('directional_read')).lower()}")
+    of = str(analysis.get("exec_of", "") or "")
+    if of:
+        bits.append(f"OF {of.lower()}")
+    aur = analysis.get("aurora") or {}
+    if aur.get("state"):
+        bits.append(f"AURORA {aur.get('state')}")
+    fork = analysis.get("fork") or {}
+    if fork.get("valid"):
+        bits.append(f"Pitchfork {str(fork.get('slope','')).lower()} / {str(fork.get('position','')).replace('_',' ').lower()}")
+    return "; ".join(bits[:4]) or "No material hidden-intelligence change is visible on this scan."
+
+
+def _sb_campaign_expected(trade: Dict[str, Any], setup: Dict[str, Any]) -> str:
+    tmd = _sb_json(trade.get("metadata_json", ""))
+    if tmd.get("expected_behavior"):
+        return str(tmd.get("expected_behavior"))
+    if tmd.get("expected_behaviour"):
+        return str(tmd.get("expected_behaviour"))
+    smd = _sb_setup_md(setup)
+    name = str(smd.get("setup_name") or trade.get("strategy_type") or "").upper()
+    if name == "SHORT_CE_AFTER_DEMAND_BREAK":
+        return "Broken demand should stay unreclaimed and downside travel should remain effective while the sold CE stays protected."
+    if name == "SHORT_PE_AFTER_SUPPLY_BREAK":
+        return "Broken supply should stay accepted above and upside travel should remain effective while the sold PE stays protected."
+    direction = str(smd.get("direction") or trade.get("direction") or "").upper()
+    if "LONG" in direction or direction == "BULLISH":
+        return "Price should separate upward from the entry demand/location without persistent adverse pressure."
+    if "SHORT" in direction or direction == "BEARISH":
+        return "Price should separate downward from the entry supply/location without persistent adverse pressure."
+    return str(trade.get("thesis", "") or "Campaign thesis should continue to hold.")
+
+
+def _sb_campaign_management(trade: Dict[str, Any], setup: Dict[str, Any]) -> str:
+    tmd = _sb_json(trade.get("metadata_json", ""))
+    smd = _sb_setup_md(setup)
+    family = str(tmd.get("management_family") or "").upper()
+    setup_name = str(smd.get("setup_name") or tmd.get("origin_setup_name") or trade.get("strategy_type") or "").upper()
+    if family == "FP_BREAK_OPTION_CAMPAIGN_MANAGEMENT" or setup_name in {"SHORT_CE_AFTER_DEMAND_BREAK", "SHORT_PE_AFTER_SUPPLY_BREAK"}:
+        return "Adverse move: roll outward to the applicable 3rd-level short option and size only enough to recover accumulated loss. Recovery: roll inward again as the valid level improves."
+    direction = str(smd.get("direction") or tmd.get("origin_setup_direction") or trade.get("direction") or "").upper()
+    if "LONG" in direction or direction == "BULLISH":
+        return "Watch for accepted loss of the locked demand/Defender/location. Location failure activates same-direction roll-out/recovery; active demand break activates the opposite-side CE at the 2nd level."
+    if "SHORT" in direction or direction == "BEARISH":
+        return "Watch for accepted loss of the locked supply/Challenger/location. Location failure activates same-direction roll-out/recovery; active supply break activates the opposite-side PE at the 2nd level."
+    return "Watch the campaign's locked invalidation/location event; use current ODME before any roll or new leg."
+
+
+def _sb_campaign_option_question(trade: Dict[str, Any], setup: Dict[str, Any]) -> str:
+    tmd = _sb_json(trade.get("metadata_json", ""))
+    smd = _sb_setup_md(setup)
+    name = str(smd.get("setup_name") or tmd.get("origin_setup_name") or "").upper()
+    original = str(smd.get("odme_requirement") or tmd.get("origin_setup_odme_requirement") or "").strip()
+    if name == "SHORT_CE_AFTER_DEMAND_BREAK":
+        return "Check bearish ODME support, CE writer defence, CE wall/POC migration, safer CE and whether 2nd/3rd-level protection still holds."
+    if name == "SHORT_PE_AFTER_SUPPLY_BREAK":
+        return "Check bullish ODME support, PE writer defence, PE wall/POC migration, safer PE and whether 2nd/3rd-level protection still holds."
+    direction = str(smd.get("direction") or tmd.get("origin_setup_direction") or trade.get("direction") or "").upper()
+    if "LONG" in direction or direction == "BULLISH":
+        return ("Check that bullish option positioning has not materially deteriorated; PE writer defence, PE wall/POC migration and safer PE"
+                + (f". Original requirement: {original}" if original else "."))
+    if "SHORT" in direction or direction == "BEARISH":
+        return ("Check that bearish option positioning has not materially deteriorated; CE writer defence, CE wall/POC migration and safer CE"
+                + (f". Original requirement: {original}" if original else "."))
+    return "Check current ODME positioning against the recorded campaign thesis."
+
+
+def _sb_pending_setups(store: Any, instrument: str) -> List[Dict[str, Any]]:
+    try:
+        df = store.list_superbrain_setups(instrument=instrument, statuses=["PENDING_ENTRY", "BREAK_WATCH"])
+    except Exception:
+        return []
+    if df is None or df.empty:
+        return []
+    rows = df.to_dict("records")
+    rows.sort(key=lambda x: (1 if str(x.get("status", "")).upper() == "PENDING_ENTRY" else 0, str(x.get("updated_at", "") or x.get("created_at", ""))), reverse=True)
+    return rows
+
+
+def _sb_odme_bias(packet: Dict[str, Any]) -> str:
+    odme = _sb_odme_data(packet)
+    tilt = str(_sb_first(odme, "odme_tilt", "tilt") or "").upper()
+    if "BULLISH" in tilt and "BEARISH" not in tilt:
+        return "BULLISH"
+    if "BEARISH" in tilt and "BULLISH" not in tilt:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _sb_evaluate_pending_setup(row: Dict[str, Any], packet: Dict[str, Any]) -> Dict[str, Any]:
+    md = _sb_setup_md(row)
+    req = str(md.get("odme_requirement") or "").upper().strip()
+    remaining = [str(x) for x in (md.get("remaining_conditions") or []) if str(x).strip() and str(x).strip() != "ONLY ODME CHECK REMAINS"]
+    bias = _sb_odme_bias(packet)
+    satisfied = False
+    if "LONG_NOT_OPPOSING" in req:
+        satisfied = bias != "BEARISH"
+    elif "SHORT_NOT_OPPOSING" in req:
+        satisfied = bias != "BULLISH"
+    elif "LONG_SUPPORTS" in req or "BULLISH ODME SUPPORT" in req:
+        satisfied = bias == "BULLISH"
+    elif "SHORT_SUPPORTS" in req or "BEARISH ODME SUPPORT" in req:
+        satisfied = bias == "BEARISH"
+    elif not req:
+        satisfied = True
+    status = "HOLD"
+    reason = ""
+    if remaining:
+        reason = "Waiting for TV: " + " | ".join(remaining)
+    elif satisfied:
+        status = "ENTRY READY"
+        reason = f"ODME is {bias.lower()} and satisfies: {md.get('odme_requirement') or 'current setup requirement'}."
+    else:
+        reason = f"ODME is {bias.lower()}; setup still requires {md.get('odme_requirement') or 'option confirmation'}."
+    return {"status": status, "reason": reason, "odme_bias": bias, "requirement": str(md.get("odme_requirement") or "")}
+
+
+def _sb_pending_event_text(row: Dict[str, Any]) -> Dict[str, str]:
+    md = _sb_setup_md(row)
+    name = str(md.get("setup_name") or row.get("strategy_type") or "Setup")
+    remaining = md.get("remaining_conditions") if isinstance(md.get("remaining_conditions"), list) else []
+    odme = str(md.get("odme_requirement") or "").strip()
+    status = str(row.get("status", "") or "").upper()
+    if status == "BREAK_WATCH":
+        return {
+            "event": f"{name} break-watch",
+            "look": "Wait for an accepted FP break; if it occurs, ODME must support the break direction before the opposite-side short-option campaign is eligible.",
+            "odme": odme or "ODME confirmation is required only after the break."
+        }
+    look = " | ".join(str(x) for x in remaining if str(x).strip()) or "TV conditions are ready; check ODME now."
+    return {"event": name, "look": look, "odme": odme or "Check ODME against the setup requirement."}
+
+
+def _sb_next_market_event(analysis: Dict[str, Any]) -> Dict[str, str]:
+    price = analysis.get("price")
+    hurdles = analysis.get("hurdles") or []
+    valid = []
+    for h in hurdles:
+        try:
+            lo, hi = float(h.get("low")), float(h.get("high"))
+            p = float(price)
+            dist = 0 if lo <= p <= hi else min(abs(p-lo), abs(p-hi))
+            valid.append((dist, h))
+        except Exception:
+            continue
+    if valid:
+        _, h = sorted(valid, key=lambda x: x[0])[0]
+        side = str(h.get("side", "") or "").upper()
+        rng = f"{_sb_fmt_level(h.get('low'))}–{_sb_fmt_level(h.get('high'))}"
+        if side == "DEMAND":
+            return {"event": f"Demand interaction around {rng}", "look": "Watch whether the zone is strong and in the lower battlefield half, then classify OF/AURORA/Pitchfork and check ODME for a long setup; if it breaks instead, watch for the CE break campaign."}
+        if side == "SUPPLY":
+            return {"event": f"Supply interaction around {rng}", "look": "Watch whether the zone is strong and in the upper battlefield half, then classify OF/AURORA/Pitchfork and check ODME for a short setup; if it breaks instead, watch for the PE break campaign."}
+    waits = analysis.get("waiting_for") or []
+    if waits:
+        return {"event": "Next confirmation", "look": str(waits[0])}
+    return {"event": "No immediate setup", "look": "Wait for a qualified strong FP interaction or an accepted break-watch event."}
+
+
+def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str, Any]) -> None:
+    analysis = packet.get("analysis", {}) or {}
+    plan = analysis.get("trade_plan", {}) or {}
+    if str(plan.get("kind", "") or "").upper() != "NEW":
+        return
+    choices = pending_setup_choices(store, instrument)
+    if not choices:
+        return
+    selected = choices[0]
+    if len(choices) > 1:
+        selected_label = st.selectbox("Setup executed", [x["label"] for x in choices], key=f"pending_setup_choice_{instrument}")
+        selected = next(x for x in choices if x["label"] == selected_label)
+    if st.button("Trade taken — record campaign", type="primary", use_container_width=True, key=f"record_taken_trade_{instrument}_{selected['record_id']}"):
+        try:
+            result = record_superbrain_trade_taken(store, packet, selected["record_id"])
+            trade = result.get("trade", {}) or {}
+            st.success(f"Campaign recorded: {trade.get('trade_id', '')}")
+            st.session_state.public_superbrain_last = None
+            st.rerun()
+        except Exception:
+            st.error("Campaign could not be recorded. Refresh the scan and try again.")
+
+
 def render_public_superbrain() -> None:
-    """Public, no-login SuperBrain terminal in the locked concise format."""
-    st.subheader("Ask SuperBrain")
-    st.caption(f"Core build: {SUPERBRAIN_BRIDGE_VERSION}")
+    """Clean manual Level-3 scan terminal."""
+    st.subheader("SuperBrain")
 
     try:
         store = get_store()
-    except Exception as exc:
-        st.error(f"Could not load SuperBrain instruments: {exc}")
-        return
-
-    try:
         _run_expired_cleanup_once(store, show_notice=False)
-    except Exception:
-        pass
-
-    try:
         mapping = build_instrument_map(store)
-    except Exception as exc:
-        st.error(f"Could not load SuperBrain instruments: {exc}")
+    except Exception:
+        st.error("Market data is not available right now.")
         return
 
     if mapping is None or mapping.empty:
-        st.info("No TradingView instruments are currently available in TV_TEST_CURRENT.")
+        st.info("No instruments are available yet.")
         return
 
     instruments = mapping["instrument"].astype(str).tolist()
     instrument = st.selectbox("Instrument", instruments, key="public_superbrain_instrument")
-    row = mapping[mapping["instrument"].eq(instrument)].iloc[0].to_dict()
 
-    if row.get("odme_scan_enabled"):
-        st.caption(f"{instrument}: TradingView + ODME enabled ({row.get('selected_expiry')}).")
-    else:
-        st.caption(f"{instrument}: TradingView mode; ODME is used when this exact instrument is enabled for scanning.")
-
-    if st.button("Ask SuperBrain", type="primary", use_container_width=True, key="ask_superbrain_public"):
-        with st.spinner("Refreshing market inputs..."):
+    if st.button("Scan now", type="primary", use_container_width=True, key="scan_superbrain_public"):
+        with st.spinner("Scanning market and options..."):
             try:
-                packet = prepare_superbrain_scan(store, instrument)
-                st.session_state.public_superbrain_last = packet
-            except Exception as exc:
-                st.error(f"SuperBrain scan failed: {exc}")
+                st.session_state.public_superbrain_last = prepare_superbrain_scan(store, instrument)
+            except Exception:
+                st.error("Scan could not be completed. Check the data/login connection and retry.")
                 return
 
     packet = st.session_state.get("public_superbrain_last")
     if not packet or str(packet.get("instrument", "")) != instrument:
         return
-
     analysis = packet.get("analysis", {}) or {}
     if not analysis:
-        st.warning("SuperBrain returned no analysis for this scan.")
+        st.warning("No current read is available for this instrument.")
         return
 
-    # Small freshness/source line only; the operational view remains concise.
-    sources = ", ".join(packet.get("tv_sources", [])) or "TradingView"
-    if packet.get("odme_live"):
-        expiry = str(packet.get("mapping", {}).get("selected_expiry", "") or "")
-        st.caption(f"Live scan: {sources} + ODME {expiry}")
+    _sb_render_freshness(packet)
+    active = [x for x in (packet.get("open_trades") or []) if str(x.get("status", "ACTIVE") or "ACTIVE").upper() not in {"CLOSED","EXIT","TARGET","INVALIDATED","EXPIRED","CANCELLED"}]
+    pending = _sb_pending_setups(store, instrument)
+
+    if not active:
+        st.markdown("### Market now")
+        st.write(_sb_current_market_line(analysis))
+        st.caption(_sb_location_line(analysis))
+        st.caption(_sb_hidden_line(analysis))
+
+        st.markdown("### Next likely event")
+        if pending:
+            nxt = _sb_pending_event_text(pending[0])
+            st.write(f"**{nxt['event']}**")
+            st.write(nxt["look"])
+            if str(pending[0].get("status", "")).upper() == "PENDING_ENTRY":
+                entry_eval = _sb_evaluate_pending_setup(pending[0], packet)
+                if entry_eval["status"] == "ENTRY READY":
+                    st.success(f"ENTRY READY — {entry_eval['reason']}")
+                else:
+                    st.warning(f"HOLD — {entry_eval['reason']}")
+            if nxt.get("odme"):
+                st.caption(f"ODME requirement: {nxt['odme']}")
+        else:
+            nxt = _sb_next_market_event(analysis)
+            st.write(f"**{nxt['event']}**")
+            st.write(nxt["look"])
     else:
-        st.caption(f"Live scan: {sources} (TV-only)")
-        if packet.get("odme_error"):
-            st.caption(f"ODME unavailable for this scan: {packet.get('odme_error')}")
+        st.markdown("### Active campaign")
+        st.caption(_sb_current_market_line(analysis))
+        for i, trade in enumerate(active):
+            setup = _sb_setup_for_trade(store, trade)
+            tmd = _sb_json(trade.get("metadata_json", ""))
+            smd = _sb_setup_md(setup)
+            setup_name = str(smd.get("setup_name") or tmd.get("origin_setup_name") or trade.get("strategy_type") or "Campaign")
+            scan_plan = analysis.get("trade_plan") or {}
+            plan_health = scan_plan.get("behavior_health") if str(scan_plan.get("trade_id", "") or "") == str(trade.get("trade_id", "") or "") else ""
+            health = str(plan_health or tmd.get("behavior_health") or "").replace("_", " ").title()
+            title = f"{trade.get('trade_id','Campaign')} · {setup_name}"
+            if len(active) > 1:
+                st.markdown(f"**{title}**")
+            else:
+                st.write(f"**{title}**")
+            st.write(f"Exposure: {_sb_exposure_text(trade)}")
+            expected = _sb_campaign_expected(trade, setup)
+            now = _sb_hidden_line(analysis)
+            if health:
+                st.write(f"**Behavior now:** {health}. {now}")
+            else:
+                st.write(f"**Behavior now:** {now}")
+            st.caption(f"Expected: {expected}")
+            st.write(f"**Next management event:** {_sb_campaign_management(trade, setup)}")
+            st.caption(f"ODME now: {_sb_odme_bias(packet)} · {_sb_campaign_option_question(trade, setup)}")
+            if i < len(active) - 1:
+                st.markdown("---")
 
-    state = str(analysis.get("compact_state", "WATCH") or "WATCH").upper()
-    st.markdown("### SuperBrain View")
-    if state == "LONG":
-        st.success(f"LONG — {instrument}")
-    elif state == "SHORT":
-        st.error(f"SHORT — {instrument}")
-    else:
-        st.warning(f"WATCH — {instrument}")
+        st.markdown("### Next new campaign")
+        # Do not present the already-entered originating setup as a new campaign.
+        pending_new = [x for x in pending if str(x.get("status", "")).upper() in {"PENDING_ENTRY", "BREAK_WATCH"}]
+        if pending_new:
+            nxt = _sb_pending_event_text(pending_new[0])
+            st.write(f"**{nxt['event']}**")
+            st.write(nxt["look"])
+            if str(pending_new[0].get("status", "")).upper() == "PENDING_ENTRY":
+                entry_eval = _sb_evaluate_pending_setup(pending_new[0], packet)
+                if entry_eval["status"] == "ENTRY READY":
+                    st.success(f"ENTRY READY — {entry_eval['reason']}")
+                else:
+                    st.warning(f"HOLD — {entry_eval['reason']}")
+            if nxt.get("odme"):
+                st.caption(f"ODME requirement: {nxt['odme']}")
+        else:
+            nxt = _sb_next_market_event(analysis)
+            st.write(f"**{nxt['event']}**")
+            st.write(nxt["look"])
 
-    exposure = str(analysis.get("compact_exposure", "") or "").strip()
-    if exposure:
-        st.markdown(exposure)
-
-    nonarrival = str(analysis.get("compact_nonarrival", "") or "").strip()
-    if not nonarrival:
-        na = analysis.get("nonarrival_assessment", {}) or {}
-        nonarrival = str(na.get("compact_line") or na.get("text") or "").strip()
-    if nonarrival:
-        st.markdown(f"**Non-arrival:** {nonarrival}")
-
-    st.markdown("#### Detailed Commentary")
-    commentary = str(analysis.get("compact_commentary", "") or analysis.get("narrative", "") or "").strip()
-    if commentary:
-        st.write(commentary)
-    else:
-        st.caption("No additional commentary for this scan.")
-
-    # Ask AI deliberately does not call an API. It opens ChatGPT for rich,
-    # interactive analysis against SUPERBRAIN_RULES + live ODME/TV data.
-    ai_prompt = (
-        f"Read `SUPERBRAIN_RULES` first, then all relevant live data in my "
-        f"`ODME_Angel_Memory` Sheet and give me full SuperBrain analysis for {instrument}."
-    )
-    st.markdown("**Copy this prompt into ChatGPT:**")
-    try:
-        # Streamlit code blocks expose a built-in one-click copy control.
-        st.code(ai_prompt, language=None, wrap_lines=True)
-    except TypeError:
-        # Compatibility fallback for older Streamlit builds.
-        st.code(ai_prompt, language=None)
-
-    st.markdown(
-        '<a href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer" '
-        'style="display:block;width:100%;box-sizing:border-box;text-align:center;'
-        'padding:.68rem 1rem;background:#16a34a;color:#ffffff !important;'
-        'border:1px solid #15803d;border-radius:.5rem;text-decoration:none;'
-        'font-weight:700;line-height:1.2;">Ask AI</a>',
-        unsafe_allow_html=True,
-    )
+    _sb_render_odme(packet)
+    _sb_render_trade_confirmation(store, instrument, packet)
 
 def _run_expired_cleanup_once(store: Any, show_notice: bool = True) -> None:
     """Automatically remove finished-expiry ODME snapshots once per India date."""
@@ -1462,7 +1899,7 @@ def main_page() -> None:
                 "Enable Scan",
                 value=_as_bool(current_setting.get("scan_enabled", False)),
                 key=f"scan_enabled_{instrument}",
-                help="When enabled, this instrument is included whenever Scan All Enabled is pressed and is eligible for fresh ODME during Ask SuperBrain.",
+                help="When enabled, this instrument is included whenever Scan All Enabled is pressed and is eligible for scheduled/manual batch ODME scans. Manual SuperBrain scans use the saved expiry whenever one is configured.",
             )
 
             if st.button("Save expiry + scan setting", key=f"save_scan_{instrument}", use_container_width=True):

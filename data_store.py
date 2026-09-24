@@ -25,7 +25,7 @@ ODME_TAB = "odme_snapshots"
 INSTRUMENT_TAB = "instrument_settings"
 TV_CURRENT_TAB = "TV_TEST_CURRENT"
 SUPERBRAIN_TAB = "superbrain_memory"
-SUPERBRAIN_STORE_VERSION = "SBSTORE2.2_HARD_CELL_GUARD"
+SUPERBRAIN_STORE_VERSION = "SBSTORE2.3_PENDING_SETUP_HANDOFF"
 
 INSTRUMENT_COLUMNS = [
     "instrument", "active", "selected_expiry", "scan_enabled", "email_alert", "scan_times",
@@ -439,6 +439,23 @@ class BaseStore:
         """Create/update a SuperBrain-owned theoretical trade. No broker positions are read."""
         raise NotImplementedError
 
+    def list_superbrain_setups(
+        self,
+        instrument: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """Return Level-2 SETUP records, optionally filtered by instrument/status."""
+        raise NotImplementedError
+
+    def mark_superbrain_setup_entered(
+        self,
+        record_id: str,
+        trade_id: str,
+        execution_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Mark a PENDING_ENTRY Level-2 setup as ENTERED and link it to the ACTIVE trade."""
+        raise NotImplementedError
+
     def delete_superbrain_history(
         self,
         instrument: str,
@@ -704,6 +721,75 @@ class LocalStore(BaseStore):
             df.loc[idx, SUPERBRAIN_COLUMNS] = [row[c] for c in SUPERBRAIN_COLUMNS]
         else:
             df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        self._save_superbrain_df(df)
+        return row
+
+    def list_superbrain_setups(
+        self,
+        instrument: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        df = self._load_superbrain_df()
+        if df.empty:
+            return pd.DataFrame(columns=SUPERBRAIN_COLUMNS)
+        df = df[df["record_type"].astype(str).str.upper().eq("SETUP")].copy()
+        if instrument:
+            key = str(instrument).upper().strip()
+            df = df[df["instrument"].astype(str).str.upper().str.strip().eq(key)]
+        if statuses:
+            wanted = {str(x).upper().strip() for x in statuses if str(x).strip()}
+            if wanted:
+                df = df[df["status"].astype(str).str.upper().str.strip().isin(wanted)]
+        return df.reset_index(drop=True)
+
+    def mark_superbrain_setup_entered(
+        self,
+        record_id: str,
+        trade_id: str,
+        execution_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        df = self._load_superbrain_df()
+        rid = str(record_id or "").strip()
+        tid = str(trade_id or "").strip()
+        if not rid or not tid:
+            raise ValueError("record_id and trade_id are required.")
+        mask = (
+            df["record_type"].astype(str).str.upper().eq("SETUP")
+            & df["record_id"].astype(str).eq(rid)
+        ) if not df.empty else pd.Series(dtype=bool)
+        if df.empty or not mask.any():
+            raise ValueError(f"Pending setup not found: {rid}")
+        idx = df.index[mask][-1]
+        row = df.loc[idx].to_dict()
+        status = str(row.get("status", "") or "").upper().strip()
+        if status == "ENTERED":
+            return row
+        if status != "PENDING_ENTRY":
+            raise ValueError(f"Setup {rid} is not PENDING_ENTRY (status={status or 'blank'}).")
+        now = utc_now_iso()
+        try:
+            meta = json.loads(str(row.get("metadata_json", "") or "{}"))
+            if not isinstance(meta, dict):
+                meta = {}
+        except Exception:
+            meta = {}
+        meta.update({
+            "entry_trade_id": tid,
+            "setup_completion_status": "ENTERED",
+            "setup_completed_at": now,
+        })
+        if execution_meta:
+            meta["execution_meta"] = execution_meta
+        row.update({
+            "trade_id": tid,
+            "status": "ENTERED",
+            "action": "EXECUTED",
+            "updated_at": now,
+            "closed_at": now,
+            "close_reason": f"ENTERED::{tid}",
+            "metadata_json": _sheet_safe_superbrain_value("metadata_json", json.dumps(meta, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))),
+        })
+        df.loc[idx, SUPERBRAIN_COLUMNS] = [row.get(c, "") for c in SUPERBRAIN_COLUMNS]
         self._save_superbrain_df(df)
         return row
 
@@ -1115,6 +1201,78 @@ class GoogleSheetStore(BaseStore):
             ws.update(f"A{sheet_row}:{end_col}{sheet_row}", [_final_superbrain_row_values(row)])
         else:
             ws.append_row(_final_superbrain_row_values(row), value_input_option="USER_ENTERED")
+        return row
+
+    def list_superbrain_setups(
+        self,
+        instrument: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        df = self._load_superbrain_df()
+        if df.empty:
+            return pd.DataFrame(columns=SUPERBRAIN_COLUMNS)
+        df = df[df["record_type"].astype(str).str.upper().eq("SETUP")].copy()
+        if instrument:
+            key = str(instrument).upper().strip()
+            df = df[df["instrument"].astype(str).str.upper().str.strip().eq(key)]
+        if statuses:
+            wanted = {str(x).upper().strip() for x in statuses if str(x).strip()}
+            if wanted:
+                df = df[df["status"].astype(str).str.upper().str.strip().isin(wanted)]
+        return df.reset_index(drop=True)
+
+    def mark_superbrain_setup_entered(
+        self,
+        record_id: str,
+        trade_id: str,
+        execution_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        self.ensure()
+        ws = self._worksheet(SUPERBRAIN_TAB, SUPERBRAIN_COLUMNS)
+        df = self._load_superbrain_df()
+        rid = str(record_id or "").strip()
+        tid = str(trade_id or "").strip()
+        if not rid or not tid:
+            raise ValueError("record_id and trade_id are required.")
+        mask = (
+            df["record_type"].astype(str).str.upper().eq("SETUP")
+            & df["record_id"].astype(str).eq(rid)
+        ) if not df.empty else pd.Series(dtype=bool)
+        if df.empty or not mask.any():
+            raise ValueError(f"Pending setup not found: {rid}")
+        idx = df.index[mask][-1]
+        row = df.loc[idx].to_dict()
+        status = str(row.get("status", "") or "").upper().strip()
+        if status == "ENTERED":
+            return row
+        if status != "PENDING_ENTRY":
+            raise ValueError(f"Setup {rid} is not PENDING_ENTRY (status={status or 'blank'}).")
+        now = utc_now_iso()
+        try:
+            meta = json.loads(str(row.get("metadata_json", "") or "{}"))
+            if not isinstance(meta, dict):
+                meta = {}
+        except Exception:
+            meta = {}
+        meta.update({
+            "entry_trade_id": tid,
+            "setup_completion_status": "ENTERED",
+            "setup_completed_at": now,
+        })
+        if execution_meta:
+            meta["execution_meta"] = execution_meta
+        row.update({
+            "trade_id": tid,
+            "status": "ENTERED",
+            "action": "EXECUTED",
+            "updated_at": now,
+            "closed_at": now,
+            "close_reason": f"ENTERED::{tid}",
+            "metadata_json": _sheet_safe_superbrain_value("metadata_json", json.dumps(meta, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))),
+        })
+        sheet_row = int(idx) + 2
+        end_col = _column_letter(len(SUPERBRAIN_COLUMNS))
+        ws.update(f"A{sheet_row}:{end_col}{sheet_row}", [_final_superbrain_row_values(row)])
         return row
 
     def delete_superbrain_history(

@@ -581,9 +581,9 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
         odme_live = False
 
         # Exact-match ODME is optional. TV-only instruments never call Angel/ODME.
-        if bool(map_row.get("odme_scan_enabled")):
+        expiry = str(map_row.get("selected_expiry", "") or "").strip()
+        if expiry:
             stage = "OPTIONAL_ODME_REFRESH"
-            expiry = str(map_row.get("selected_expiry", "") or "").strip()
             try:
                 angel = AngelConnector(load_angel_credentials())
                 angel.login_automatic()
@@ -638,9 +638,7 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
             "superbrain_build": SUPERBRAIN_BRIDGE_VERSION,
         }
     except Exception as exc:
-        raise RuntimeError(
-            f"{SUPERBRAIN_BRIDGE_VERSION} [{stage}] {type(exc).__name__}: {exc}"
-        ) from exc
+        raise RuntimeError(str(exc)) from exc
 
 
 # ============================================================================
@@ -943,7 +941,7 @@ def _apply_trade_plan(store: BaseStore, instrument: str, mode: str, scan_id: str
 # ============================================================================
 # SB3.8 relevance / path / non-arrival intelligence overrides
 # ============================================================================
-SUPERBRAIN_BRIDGE_VERSION = "SB4.3_ETA_PATH_DIAGNOSTICS"
+SUPERBRAIN_BRIDGE_VERSION = "SB4.6_CLEAN_MANUAL_LEVEL3"
 
 _compact_live_odme_sb37 = _compact_live_odme
 _apply_trade_plan_sb37 = _apply_trade_plan
@@ -1094,33 +1092,183 @@ def _compact_live_odme(result: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str
 
 
 def _apply_trade_plan(store: BaseStore, instrument: str, mode: str, scan_id: str, analysis: Dict[str, Any], open_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Manual Level-3 scans are observational until the user confirms an execution.
+
+    NEW entries are persisted only through record_superbrain_trade_taken(). Existing
+    campaigns are read and explained but are never automatically closed, rolled,
+    reduced, added to, or otherwise mutated by a scan. This keeps campaign actions
+    tied to the locked management rules and explicit user execution.
+    """
+    plan = analysis.get("trade_plan", {}) or {}
+    kind = str(plan.get("kind", "") or "").upper()
+    if kind == "NEW":
+        analysis["trade_recording_required"] = True
+        analysis.pop("recorded_exposure", None)
+    elif open_trades:
+        analysis["campaign_scan_only"] = True
+    return {}
+
+
+def list_pending_entry_setups(store: BaseStore, instrument: str) -> List[Dict[str, Any]]:
+    """Return current Level-2 PENDING_ENTRY setup records for one instrument."""
+    try:
+        df = store.list_superbrain_setups(instrument=instrument, statuses=["PENDING_ENTRY"])
+    except Exception:
+        return []
+    rows = _safe_records(df)
+    rows.sort(key=lambda x: str(x.get("updated_at", "") or x.get("created_at", "")), reverse=True)
+    return rows
+
+
+def _setup_metadata(setup: Dict[str, Any]) -> Dict[str, Any]:
+    return _load_json_object((setup or {}).get("metadata_json", ""))
+
+
+def _setup_display_label(setup: Dict[str, Any]) -> str:
+    md = _setup_metadata(setup)
+    name = str(md.get("setup_name") or setup.get("strategy_type") or "SETUP")
+    fp = md.get("fp") if isinstance(md.get("fp"), dict) else {}
+    low = fp.get("low")
+    high = fp.get("high")
+    zone = ""
+    if low not in (None, "") and high not in (None, ""):
+        zone = f" | {low}-{high}"
+    rule_id = str(md.get("setup_id") or "")
+    odme = str(md.get("odme_requirement") or "")
+    return f"{name}{zone} | {rule_id} | ODME: {odme}"
+
+
+def pending_setup_choices(store: BaseStore, instrument: str) -> List[Dict[str, Any]]:
+    """UI-safe pending setup choices with raw records retained for execution handoff."""
+    out = []
+    for row in list_pending_entry_setups(store, instrument):
+        out.append({
+            "record_id": str(row.get("record_id", "") or ""),
+            "label": _setup_display_label(row),
+            "record": row,
+        })
+    return out
+
+
+def _persist_new_trade_after_user_confirmation(
+    store: BaseStore,
+    instrument: str,
+    mode: str,
+    scan_id: str,
+    analysis: Dict[str, Any],
+    open_trades: List[Dict[str, Any]],
+    setup: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Persist the current NEW plan only after the user confirms execution."""
+    plan = analysis.get("trade_plan", {}) or {}
+    if str(plan.get("kind", "") or "").upper() != "NEW":
+        raise ValueError("Current SuperBrain scan does not contain a NEW entry plan.")
+
+    # Use the mature SB3.7 campaign writer directly.  The normal scan-time
+    # wrapper intentionally suppresses NEW persistence in SB4.5.
     saved = _apply_trade_plan_sb37(store, instrument, mode, scan_id, analysis, open_trades)
     if not saved:
-        return saved
-    plan = analysis.get("trade_plan", {}) or {}
-    extra_keys = (
+        raise RuntimeError("Could not create the ACTIVE campaign record.")
+
+    setup_md = _setup_metadata(setup)
+    trade_meta = _load_json_object(saved.get("metadata_json", ""))
+    setup_name = str(setup_md.get("setup_name") or setup.get("strategy_type") or "")
+    setup_rule_id = str(setup_md.get("setup_id") or "")
+    management_family = (
+        "FP_BREAK_OPTION_CAMPAIGN_MANAGEMENT"
+        if setup_name in {"SHORT_CE_AFTER_DEMAND_BREAK", "SHORT_PE_AFTER_SUPPLY_BREAK"}
+        else "PRIMARY_FP_CAMPAIGN_MANAGEMENT"
+    )
+    trade_meta.update({
+        "parent_setup_id": str(setup.get("record_id", "") or ""),
+        "origin_setup_record_id": str(setup.get("record_id", "") or ""),
+        "origin_setup_id": setup_rule_id,
+        "origin_setup_name": setup_name,
+        "origin_setup_direction": setup_md.get("direction", setup.get("direction", "")),
+        "origin_setup_odme_requirement": setup_md.get("odme_requirement", ""),
+        "origin_setup_fp": setup_md.get("fp", {}),
+        "origin_setup_of_relationship": setup_md.get("of_relationship", ""),
+        "origin_setup_aurora_state": setup_md.get("aurora_state", ""),
+        "origin_setup_pitchfork_state": setup_md.get("pitchfork_state", ""),
+        "origin_setup_rulebook_version": setup_md.get("rulebook_version", ""),
+        "management_family": management_family,
+        "execution_confirmed_by_user": True,
+        "execution_confirmed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    })
+
+    # Preserve SB4.4 explanation snapshots when present in the live plan.
+    for key in (
         "expected_behavior", "behavior_health", "behavior_bad_streak",
         "path_snapshot", "nonarrival_snapshot", "relevance_focus",
-    )
-    if not any(plan.get(k) not in (None, "", {}, []) for k in extra_keys):
-        return saved
-    meta = _load_json_object(saved.get("metadata_json", ""))
-    for key in extra_keys:
+    ):
         value = plan.get(key)
         if value not in (None, "", {}, []):
-            meta[key] = value
-    meta["reasoner_version"] = analysis.get("reasoner_version", "")
+            trade_meta[key] = value
+
     saved = dict(saved)
-    saved["metadata_json"] = _json_dumps(meta)
+    saved["metadata_json"] = _json_dumps(trade_meta)
     saved["updated_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    return store.upsert_superbrain_trade(saved)
+    saved = store.upsert_superbrain_trade(saved)
+
+    # Only after the ACTIVE trade exists do we consume the pending setup.
+    entered_setup = store.mark_superbrain_setup_entered(
+        str(setup.get("record_id", "") or ""),
+        str(saved.get("trade_id", "") or ""),
+        execution_meta={
+            "scan_id": scan_id,
+            "strategy_type": saved.get("strategy_type", ""),
+            "direction": saved.get("direction", ""),
+            "entry_reference": saved.get("entry_reference", ""),
+            "management_family": management_family,
+        },
+    )
+
+    analysis["recorded_exposure"] = {
+        "trade_id": saved.get("trade_id", ""),
+        "status": saved.get("status", ""),
+        "strategy_type": saved.get("strategy_type", ""),
+        "direction": saved.get("direction", ""),
+        "action": saved.get("action", ""),
+        "parent_setup_id": setup.get("record_id", ""),
+    }
+    analysis["trade_recording_required"] = False
+    plan["trade_id"] = saved.get("trade_id", "")
+    return {"trade": saved, "setup": entered_setup}
+
+
+def record_superbrain_trade_taken(
+    store: BaseStore,
+    packet: Dict[str, Any],
+    setup_record_id: str,
+) -> Dict[str, Any]:
+    """User-confirmed handoff: PENDING_ENTRY -> ACTIVE campaign + SETUP=ENTERED."""
+    instrument = _norm(packet.get("instrument", ""))
+    if not instrument:
+        raise ValueError("Scan packet has no instrument.")
+    analysis = packet.get("analysis", {}) or {}
+    plan = analysis.get("trade_plan", {}) or {}
+    if str(plan.get("kind", "") or "").upper() != "NEW":
+        raise ValueError("There is no fresh entry plan to record on this scan.")
+
+    pending = list_pending_entry_setups(store, instrument)
+    setup = next((x for x in pending if str(x.get("record_id", "")) == str(setup_record_id or "")), None)
+    if not setup:
+        raise ValueError("Selected setup is no longer PENDING_ENTRY. Refresh SuperBrain before recording the trade.")
+
+    memory = packet.get("memory", {}) or {}
+    scan_id = str(memory.get("scan_id", "") or analysis.get("scan_id", "") or "")
+    mode = str(packet.get("mode", "") or "")
+    open_trades = packet.get("open_trades", []) or []
+    return _persist_new_trade_after_user_confirmation(
+        store, instrument, mode, scan_id, analysis, open_trades, setup
+    )
 
 
 def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]:
-    """SB3.8 orchestration; external feeds/writes remain exactly as before.
+    """Manual Level-3 orchestration.
 
-    The only added work is to expose Angel master lot size to the in-memory
-    SuperBrain evaluation after the unchanged ODME scan has completed.
+    A saved expiry triggers a fresh ODME scan. NEW entries remain advisory until
+    explicit execution confirmation; ACTIVE campaigns are read-only during scans.
     """
     instrument = _norm(instrument)
     stage = "START"
@@ -1141,9 +1289,9 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
         odme_error = ""
         odme_live = False
 
-        if bool(map_row.get("odme_scan_enabled")):
+        expiry = str(map_row.get("selected_expiry", "") or "").strip()
+        if expiry:
             stage = "OPTIONAL_ODME_REFRESH"
-            expiry = str(map_row.get("selected_expiry", "") or "").strip()
             try:
                 angel = AngelConnector(load_angel_credentials())
                 angel.login_automatic()
@@ -1202,6 +1350,4 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
             "superbrain_build": SUPERBRAIN_BRIDGE_VERSION,
         }
     except Exception as exc:
-        raise RuntimeError(
-            f"{SUPERBRAIN_BRIDGE_VERSION} [{stage}] {type(exc).__name__}: {exc}"
-        ) from exc
+        raise RuntimeError(str(exc)) from exc
