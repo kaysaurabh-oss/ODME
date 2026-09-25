@@ -168,18 +168,43 @@ def _sb_tv_freshness(packet: Dict[str, Any]) -> List[str]:
     return rows
 
 
+def _sb_has_value(value: Any) -> bool:
+    """True only for display-safe, non-empty ODME values.
+
+    Live ODME results can include pandas Series/DataFrames (for example strike
+    tables). Comparing those objects to []/{} asks pandas for a boolean truth
+    value and raises the ambiguous-truth ValueError. The clean terminal only
+    needs scalar/JSON-like summary values, so pandas table objects are skipped.
+    """
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (pd.Series, pd.DataFrame)):
+        return False
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) > 0
+    try:
+        missing = pd.isna(value)
+        if isinstance(missing, bool):
+            return not missing
+    except Exception:
+        pass
+    return True
+
+
 def _sb_odme_data(packet: Dict[str, Any]) -> Dict[str, Any]:
     live = ((packet.get("odme_outcome") or {}).get("result") or {}) if packet.get("odme_live") else {}
     latest = packet.get("latest_odme") or {}
-    analysis = packet.get("analysis") or {}
     evidence_odme = packet.get("memory", {}).get("analysis", {}).get("odme") if isinstance(packet.get("memory"), dict) else {}
     data = dict(latest)
     if isinstance(evidence_odme, dict):
-        data.update({k: v for k, v in evidence_odme.items() if v not in (None, "")})
+        data.update({k: v for k, v in evidence_odme.items() if _sb_has_value(v)})
     if isinstance(live, dict):
-        # Live ODME result has richer keys than the saved compact row.
+        # Live ODME result contains raw tables as well as summary values.
+        # Keep only display-safe values in the compact Level-3 terminal.
         for k, v in live.items():
-            if v not in (None, "", [], {}):
+            if _sb_has_value(v):
                 data[k] = v
     return data
 
@@ -187,7 +212,7 @@ def _sb_odme_data(packet: Dict[str, Any]) -> Dict[str, Any]:
 def _sb_first(data: Dict[str, Any], *keys: str) -> Any:
     for key in keys:
         v = data.get(key)
-        if v not in (None, ""):
+        if _sb_has_value(v):
             return v
     return ""
 

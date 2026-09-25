@@ -685,9 +685,14 @@ def _freshness_line(evidence: Dict[str, Any], current: Dict[str, Dict[str, Any]]
 
 def _option_note(evidence: Dict[str, Any]) -> str:
     mapping = evidence.get("mapping", {}) or {}
-    if not bool(mapping.get("odme_scan_enabled")):
-        instrument = _s(evidence.get("instrument")) or "This instrument"
-        return f"No options-positioning layer is available for {instrument} in this terminal, so this view is based on price, structure, momentum, order-flow and liquidity only."
+    instrument = _s(evidence.get("instrument")) or "This instrument"
+    # scan_enabled belongs to the Manual Scan All / batch selector. It must not
+    # disable the manual Level-3 ODME layer. A saved expiry is what makes a
+    # manual SuperBrain options refresh available.
+    if not _s(mapping.get("selected_expiry")):
+        return f"No option expiry is saved for {instrument}, so this view is based on price, structure, momentum, order-flow and liquidity only."
+    if not bool(evidence.get("odme_live")):
+        return f"Fresh options positioning could not be refreshed for {instrument} on this scan; use the displayed ODME timestamp before relying on the saved positioning read."
     return ""
 
 
