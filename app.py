@@ -454,7 +454,9 @@ def _sb_pending_setups(store: Any, instrument: str) -> List[Dict[str, Any]]:
 
 def _sb_odme_bias(packet: Dict[str, Any]) -> str:
     odme = _sb_odme_data(packet)
-    tilt = str(_sb_first(odme, "odme_tilt", "tilt") or "").upper()
+    tilt = str(_sb_first(odme, "odme_tilt", "tilt") or "").upper().strip()
+    if not tilt:
+        return "UNKNOWN"
     if "BULLISH" in tilt and "BEARISH" not in tilt:
         return "BULLISH"
     if "BEARISH" in tilt and "BULLISH" not in tilt:
@@ -462,32 +464,105 @@ def _sb_odme_bias(packet: Dict[str, Any]) -> str:
     return "NEUTRAL"
 
 
+def _sb_odme_label(packet: Dict[str, Any]) -> str:
+    odme = _sb_odme_data(packet)
+    return str(_sb_first(odme, "odme_tilt", "tilt") or "NO ODME READ").upper()
+
+
+def _sb_live_tv_condition_text(condition: str, analysis: Dict[str, Any]) -> str:
+    raw = str(condition or "").strip()
+    upper = raw.upper()
+    aurora = str(((analysis.get("aurora") or {}).get("state")) or "UNKNOWN").upper()
+    fork = analysis.get("fork") or {}
+    if fork.get("valid"):
+        fork_now = f"{str(fork.get('slope', '') or '').upper()} / {str(fork.get('position', '') or '').replace('_', ' ').upper()}".strip(" /")
+    else:
+        fork_now = "NOT VALID"
+    of_now = str(analysis.get("exec_of", "") or "NEUTRAL").upper()
+
+    if "AURORA MUST IMPROVE TO" in upper:
+        target = raw[upper.find("AURORA MUST IMPROVE TO") + len("AURORA MUST IMPROVE TO"):].strip()
+        return f"AURORA is {aurora}; wait for {target}."
+    if "AURORA" in upper and "IMPROVE" in upper:
+        return f"AURORA is {aurora}; {raw}."
+    if "PF_UPSLOPE_ENTRY" in upper:
+        return f"Pitchfork is {fork_now}; wait for PF_UPSLOPE_ENTRY."
+    if "PF_DOWNSLOPE_ENTRY" in upper:
+        return f"Pitchfork is {fork_now}; wait for PF_DOWNSLOPE_ENTRY."
+    if "BULLISH PITCHFORK" in upper:
+        return f"Pitchfork is {fork_now}; a bullish Pitchfork entry is still required."
+    if "BEARISH PITCHFORK" in upper:
+        return f"Pitchfork is {fork_now}; a bearish Pitchfork entry is still required."
+    if "OPPOSING OF MUST FAIL" in upper or "OF FAILURE" in upper:
+        return f"OF is {of_now}; the required failure-to-progress condition is not yet confirmed."
+    return raw.rstrip(".") + "."
+
+
+def _sb_odme_gate_text(requirement: str, packet: Dict[str, Any], satisfied: bool) -> str:
+    req = str(requirement or "").upper().strip()
+    label = _sb_odme_label(packet)
+    bias = _sb_odme_bias(packet)
+    if bias == "UNKNOWN":
+        return f"ODME is {label}; the ODME gate cannot be confirmed on this scan."
+    if not req:
+        return f"ODME is {label}; no additional ODME gate is required."
+    if "LONG_NOT_OPPOSING" in req:
+        return (f"ODME is {label}; it is not bearish, so the LONG non-opposition gate is satisfied."
+                if satisfied else f"ODME is {label}; it is bearish, so the LONG non-opposition gate is not satisfied.")
+    if "SHORT_NOT_OPPOSING" in req:
+        return (f"ODME is {label}; it is not bullish, so the SHORT non-opposition gate is satisfied."
+                if satisfied else f"ODME is {label}; it is bullish, so the SHORT non-opposition gate is not satisfied.")
+    if "LONG_SUPPORTS" in req or "BULLISH ODME SUPPORT" in req:
+        return (f"ODME is {label}; bullish ODME support is present and LONG_SUPPORTS is satisfied."
+                if satisfied else f"ODME is {label}; bullish ODME support is not present, so LONG_SUPPORTS is not satisfied.")
+    if "SHORT_SUPPORTS" in req or "BEARISH ODME SUPPORT" in req:
+        return (f"ODME is {label}; bearish ODME support is present and SHORT_SUPPORTS is satisfied."
+                if satisfied else f"ODME is {label}; bearish ODME support is not present, so SHORT_SUPPORTS is not satisfied.")
+    return (f"ODME is {label}; the stored ODME requirement is satisfied."
+            if satisfied else f"ODME is {label}; the stored ODME requirement ({requirement}) is not positively satisfied by this scan.")
+
+
 def _sb_evaluate_pending_setup(row: Dict[str, Any], packet: Dict[str, Any]) -> Dict[str, Any]:
     md = _sb_setup_md(row)
-    req = str(md.get("odme_requirement") or "").upper().strip()
+    req_raw = str(md.get("odme_requirement") or "").strip()
+    req = req_raw.upper()
     remaining = [str(x) for x in (md.get("remaining_conditions") or []) if str(x).strip() and str(x).strip() != "ONLY ODME CHECK REMAINS"]
+    analysis = packet.get("analysis") or {}
     bias = _sb_odme_bias(packet)
+
     satisfied = False
     if "LONG_NOT_OPPOSING" in req:
-        satisfied = bias != "BEARISH"
+        satisfied = bias in {"BULLISH", "NEUTRAL"}
     elif "SHORT_NOT_OPPOSING" in req:
-        satisfied = bias != "BULLISH"
+        satisfied = bias in {"BEARISH", "NEUTRAL"}
     elif "LONG_SUPPORTS" in req or "BULLISH ODME SUPPORT" in req:
         satisfied = bias == "BULLISH"
     elif "SHORT_SUPPORTS" in req or "BEARISH ODME SUPPORT" in req:
         satisfied = bias == "BEARISH"
     elif not req:
         satisfied = True
-    status = "HOLD"
-    reason = ""
-    if remaining:
-        reason = "Waiting for TV: " + " | ".join(remaining)
-    elif satisfied:
-        status = "ENTRY READY"
-        reason = f"ODME is {bias.lower()} and satisfies: {md.get('odme_requirement') or 'current setup requirement'}."
+
+    tv_details = [_sb_live_tv_condition_text(x, analysis) for x in remaining]
+    odme_detail = _sb_odme_gate_text(req_raw, packet, satisfied)
+    status = "ENTRY READY" if not remaining and satisfied else "HOLD"
+    parts = []
+    if tv_details:
+        parts.extend(tv_details)
     else:
-        reason = f"ODME is {bias.lower()}; setup still requires {md.get('odme_requirement') or 'option confirmation'}."
-    return {"status": status, "reason": reason, "odme_bias": bias, "requirement": str(md.get("odme_requirement") or "")}
+        parts.append("TV conditions are satisfied on this scan.")
+    parts.append(odme_detail)
+    reason = " ".join(x for x in parts if x).strip()
+    return {
+        "status": status,
+        "reason": reason,
+        "odme_bias": bias,
+        "odme_label": _sb_odme_label(packet),
+        "odme_satisfied": satisfied,
+        "tv_satisfied": not remaining,
+        "tv_details": tv_details,
+        "odme_detail": odme_detail,
+        "requirement": req_raw,
+    }
 
 
 def _sb_pending_event_text(row: Dict[str, Any]) -> Dict[str, str]:
@@ -604,15 +679,16 @@ def render_public_superbrain() -> None:
         if pending:
             nxt = _sb_pending_event_text(pending[0])
             st.write(f"**{nxt['event']}**")
-            st.write(nxt["look"])
             if str(pending[0].get("status", "")).upper() == "PENDING_ENTRY":
                 entry_eval = _sb_evaluate_pending_setup(pending[0], packet)
                 if entry_eval["status"] == "ENTRY READY":
                     st.success(f"ENTRY READY — {entry_eval['reason']}")
                 else:
                     st.warning(f"HOLD — {entry_eval['reason']}")
-            if nxt.get("odme"):
-                st.caption(f"ODME requirement: {nxt['odme']}")
+            else:
+                st.write(nxt["look"])
+                if nxt.get("odme"):
+                    st.caption(f"ODME after break: {nxt['odme']}")
         else:
             nxt = _sb_next_market_event(analysis)
             st.write(f"**{nxt['event']}**")
@@ -652,15 +728,16 @@ def render_public_superbrain() -> None:
         if pending_new:
             nxt = _sb_pending_event_text(pending_new[0])
             st.write(f"**{nxt['event']}**")
-            st.write(nxt["look"])
             if str(pending_new[0].get("status", "")).upper() == "PENDING_ENTRY":
                 entry_eval = _sb_evaluate_pending_setup(pending_new[0], packet)
                 if entry_eval["status"] == "ENTRY READY":
                     st.success(f"ENTRY READY — {entry_eval['reason']}")
                 else:
                     st.warning(f"HOLD — {entry_eval['reason']}")
-            if nxt.get("odme"):
-                st.caption(f"ODME requirement: {nxt['odme']}")
+            else:
+                st.write(nxt["look"])
+                if nxt.get("odme"):
+                    st.caption(f"ODME after break: {nxt['odme']}")
         else:
             nxt = _sb_next_market_event(analysis)
             st.write(f"**{nxt['event']}**")
