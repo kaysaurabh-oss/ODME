@@ -25,7 +25,7 @@ ODME_TAB = "odme_snapshots"
 INSTRUMENT_TAB = "instrument_settings"
 TV_CURRENT_TAB = "TV_TEST_CURRENT"
 SUPERBRAIN_TAB = "superbrain_memory"
-SUPERBRAIN_STORE_VERSION = "SBSTORE2.3_PENDING_SETUP_HANDOFF"
+SUPERBRAIN_STORE_VERSION = "SBSTORE2.4_EXPIRY_ROLLOVER"
 
 INSTRUMENT_COLUMNS = [
     "instrument", "active", "selected_expiry", "scan_enabled", "email_alert", "scan_times",
@@ -425,6 +425,10 @@ class BaseStore:
     ) -> int:
         raise NotImplementedError
 
+    def delete_earlier_odme_expiries(self, instrument: str, keep_expiry: str) -> int:
+        """Delete this instrument's parseable ODME snapshots from expiries earlier than keep_expiry."""
+        raise NotImplementedError
+
     def load_superbrain_state(self, instrument: str) -> Dict[str, Any]:
         raise NotImplementedError
 
@@ -618,6 +622,23 @@ class LocalStore(BaseStore):
             return 0
         remove = df["instrument"].astype(str).str.upper().str.strip().eq(str(instrument).upper().strip())
         remove &= _history_date_mask(df.get("ts", pd.Series(index=df.index, dtype=str)), start_date, end_date, tz_name)
+        deleted = int(remove.sum())
+        if deleted:
+            df.loc[~remove].to_csv(self.path, index=False)
+        return deleted
+
+    def delete_earlier_odme_expiries(self, instrument: str, keep_expiry: str) -> int:
+        self.ensure()
+        keep_date = _expiry_date(keep_expiry)
+        if keep_date is None:
+            return 0
+        df = pd.read_csv(self.path, dtype=str).fillna("")
+        if df.empty or "instrument" not in df.columns or "expiry" not in df.columns:
+            return 0
+        key = str(instrument or "").upper().strip()
+        inst = df["instrument"].astype(str).str.upper().str.strip().eq(key)
+        exp_dates = df["expiry"].apply(_expiry_date)
+        remove = inst & exp_dates.apply(lambda d: d is not None and d < keep_date)
         deleted = int(remove.sum())
         if deleted:
             df.loc[~remove].to_csv(self.path, index=False)
@@ -1097,6 +1118,30 @@ class GoogleSheetStore(BaseStore):
         key = str(instrument).upper().strip()
         remove = df["instrument"].astype(str).str.upper().str.strip().eq(key)
         remove &= _history_date_mask(df.get("ts", pd.Series(index=df.index, dtype=str)), start_date, end_date, tz_name)
+        deleted = int(remove.sum())
+        if deleted:
+            sheet_rows = [int(i) + 2 for i in df.index[remove].tolist()]
+            for start_row, end_row in reversed(_contiguous_ranges(sheet_rows)):
+                ws.delete_rows(start_row, end_row)
+        return deleted
+
+    def delete_earlier_odme_expiries(self, instrument: str, keep_expiry: str) -> int:
+        self.ensure()
+        keep_date = _expiry_date(keep_expiry)
+        if keep_date is None:
+            return 0
+        ws = self._worksheet(ODME_TAB, ODME_COLUMNS)
+        records = ws.get_all_records()
+        df = pd.DataFrame(records)
+        if df.empty:
+            return 0
+        for col in ODME_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        key = str(instrument or "").upper().strip()
+        inst = df["instrument"].astype(str).str.upper().str.strip().eq(key)
+        exp_dates = df["expiry"].apply(_expiry_date)
+        remove = inst & exp_dates.apply(lambda d: d is not None and d < keep_date)
         deleted = int(remove.sum())
         if deleted:
             sheet_rows = [int(i) + 2 for i in df.index[remove].tolist()]

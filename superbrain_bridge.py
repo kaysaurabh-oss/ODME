@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 import pandas as pd
 
 from angel_connector import AngelConnector, load_angel_credentials
-from data_store import BaseStore
+from data_store import BaseStore, make_key
 from scan_service import run_odme_scan
 from superbrain_reasoner import analyze_market, REASONER_VERSION
 
@@ -941,10 +941,66 @@ def _apply_trade_plan(store: BaseStore, instrument: str, mode: str, scan_id: str
 # ============================================================================
 # SB3.8 relevance / path / non-arrival intelligence overrides
 # ============================================================================
-SUPERBRAIN_BRIDGE_VERSION = "SB4.6_CLEAN_MANUAL_LEVEL3"
+SUPERBRAIN_BRIDGE_VERSION = "SB4.6.2_FARTHEST_EXPIRY_ONLY"
 
 _compact_live_odme_sb37 = _compact_live_odme
 _apply_trade_plan_sb37 = _apply_trade_plan
+
+
+def _sb_expiry_date(value: Any):
+    s = str(value or "").strip().upper()
+    if not s:
+        return None
+    for fmt in ("%d%b%Y", "%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    parsed = pd.to_datetime(s, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    try:
+        return parsed.date()
+    except Exception:
+        return None
+
+
+def _resolve_superbrain_expiry(store: BaseStore, instrument: str, selected_expiry: str) -> str:
+    """Use the farthest valid future expiry known for this instrument.
+
+    A blank selected expiry still means TV-only. When options are enabled by a
+    saved selected expiry, SuperBrain compares that saved expiry with any ODME
+    snapshot expiries already stored for the same instrument and chooses the
+    farthest non-expired date. The setting is rolled forward automatically.
+    """
+    selected = str(selected_expiry or "").strip()
+    if not selected:
+        return ""
+    today = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    candidates = {}
+
+    def add(value: Any) -> None:
+        d = _sb_expiry_date(value)
+        if d is not None and d >= today:
+            candidates[d] = d.strftime("%d%b%Y").upper()
+
+    add(selected)
+    try:
+        hist = store.load_odme_history(limit=100000)
+        if hist is not None and not hist.empty and "instrument" in hist.columns and "expiry" in hist.columns:
+            key = _norm(instrument)
+            matched = hist[hist["instrument"].astype(str).str.upper().str.strip().eq(key)]
+            for value in matched["expiry"].tolist():
+                add(value)
+    except Exception:
+        pass
+
+    if not candidates:
+        return selected
+    chosen = candidates[max(candidates)]
+    if _norm(chosen) != _norm(selected):
+        store.upsert_instrument_setting(instrument, selected_expiry=chosen)
+    return chosen
 
 
 def _positive_float(value: Any) -> float:
@@ -1267,8 +1323,11 @@ def record_superbrain_trade_taken(
 def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]:
     """Manual Level-3 orchestration.
 
-    A saved expiry triggers a fresh ODME scan. NEW entries remain advisory until
-    explicit execution confirmation; ACTIVE campaigns are read-only during scans.
+    A saved expiry enables ODME. If multiple future expiries already exist for
+    the instrument, SuperBrain rolls to the farthest one. After a successful
+    refresh, nearer-expiry snapshots for that instrument are deleted. NEW
+    entries remain advisory until explicit execution confirmation; ACTIVE
+    campaigns are read-only during scans.
     """
     instrument = _norm(instrument)
     stage = "START"
@@ -1288,9 +1347,12 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
         odme_outcome: Dict[str, Any] = {}
         odme_error = ""
         odme_live = False
+        pruned_earlier_expiry_snapshots = 0
 
-        expiry = str(map_row.get("selected_expiry", "") or "").strip()
+        stage = "RESOLVE_ODME_EXPIRY"
+        expiry = _resolve_superbrain_expiry(store, instrument, str(map_row.get("selected_expiry", "") or "").strip())
         if expiry:
+            map_row["selected_expiry"] = expiry
             stage = "OPTIONAL_ODME_REFRESH"
             try:
                 angel = AngelConnector(load_angel_credentials())
@@ -1309,11 +1371,15 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
                     meta["lot_size"] = _derive_lot_size_from_master(angel, master, instrument, expiry)
                     odme_outcome["meta"] = meta
                 odme_live = True
+
+                # Only prune after the farthest-expiry refresh succeeded.
+                stage = "PRUNE_NEARER_ODME_EXPIRIES"
+                pruned_earlier_expiry_snapshots = store.delete_earlier_odme_expiries(instrument, expiry)
             except Exception as exc:
                 odme_error = f"{type(exc).__name__}: {exc}"
 
         stage = "LOAD_MATCHED_ODME_HISTORY"
-        latest_odme = store.load_latest_odme_for_instrument(instrument)
+        latest_odme = store.load_latest_odme_snapshot(make_key(instrument, expiry)) if expiry else {}
         sources = []
         if tv_rows is not None and not tv_rows.empty and "source" in tv_rows.columns:
             sources = sorted({str(x).strip() for x in tv_rows["source"] if str(x).strip()})
@@ -1347,6 +1413,7 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
             "open_trades": open_trades,
             "memory": memory,
             "analysis": memory.get("analysis", {}),
+            "pruned_earlier_expiry_snapshots": pruned_earlier_expiry_snapshots,
             "superbrain_build": SUPERBRAIN_BRIDGE_VERSION,
         }
     except Exception as exc:
