@@ -152,20 +152,73 @@ def _sb_fmt_level(value: Any) -> str:
         return str(value or "—")
 
 
+def _sb_tv_close_dt(source: str, row: Dict[str, Any]) -> Optional[datetime]:
+    """Normalize the four TradingView feeds to the confirmed candle-close time.
+
+    EDGE/AURORA carry the confirmed close timestamp. STRUCTURE/LIQUIDITY carry
+    Pine `time` (bar open), so add the source timeframe before comparing/displaying.
+    """
+    raw = row.get("bar_time") or row.get("updated_at") or ""
+    if raw in (None, ""):
+        return None
+    try:
+        if isinstance(raw, (int, float)) or str(raw).strip().isdigit():
+            n = float(raw)
+            dt = datetime.fromtimestamp(n / 1000.0 if n > 1e12 else n, tz=timezone.utc)
+        else:
+            txt = str(raw).strip().replace("Z", "+00:00")
+            dt = datetime.fromisoformat(txt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        if str(source or "").upper() in {"STRUCTURE", "LIQUIDITY"} and row.get("bar_time") not in (None, ""):
+            try:
+                mins = int(float(row.get("tf")))
+            except Exception:
+                mins = 0
+            if mins > 0:
+                dt = dt + timedelta(minutes=mins)
+        return dt
+    except Exception:
+        return None
+
+
 def _sb_tv_freshness(packet: Dict[str, Any]) -> List[str]:
     tv = packet.get("tv_rows")
-    if tv is None or not isinstance(tv, pd.DataFrame) or tv.empty:
+    if tv is None or not isinstance(tv, pd.DataFrame) or tv.empty or "source" not in tv.columns:
         return []
-    rows = []
+
+    feeds = []
     for source in ["EDGE", "AURORA", "STRUCTURE", "LIQUIDITY"]:
-        g = tv[tv.get("source", pd.Series(dtype=str)).astype(str).str.upper().eq(source)] if "source" in tv.columns else pd.DataFrame()
+        g = tv[tv["source"].astype(str).str.upper().eq(source)]
         if g.empty:
             continue
         r = g.iloc[-1].to_dict()
-        stamp = r.get("bar_time") or r.get("updated_at") or ""
+        dt = _sb_tv_close_dt(source, r)
         tf = str(r.get("tf", "") or "")
-        rows.append(f"{source} {_sb_fmt_time(stamp)}" + (f" · {tf}m" if tf else ""))
-    return rows
+        feeds.append((source, dt, tf))
+
+    if not feeds:
+        return []
+
+    # When the synchronized sources refer to the same confirmed candle, show one
+    # authoritative TV timestamp instead of four visually different raw times.
+    # Only expose per-feed timestamps when a real normalized mismatch exists.
+    complete = len(feeds) == 4 and all(x[1] is not None for x in feeds)
+    same_tf = len({x[2] for x in feeds if x[2]}) <= 1
+    if complete and same_tf:
+        dts = [x[1] for x in feeds if x[1] is not None]
+        spread = (max(dts) - min(dts)).total_seconds()
+        if spread <= 60:
+            dt = max(dts)
+            tf = next((x[2] for x in feeds if x[2]), "")
+            stamp = dt.astimezone(ZoneInfo("Asia/Singapore")).strftime("%d %b %H:%M")
+            return [f"TV data {stamp}" + (f" · {tf}m" if tf else "")]
+
+    rows = []
+    for source, dt, tf in feeds:
+        stamp = dt.astimezone(ZoneInfo("Asia/Singapore")).strftime("%d %b %H:%M") if dt else "—"
+        rows.append(f"{source} {stamp}" + (f" · {tf}m" if tf else ""))
+    return ["TV mismatch — " + " | ".join(rows)]
 
 
 def _sb_has_value(value: Any) -> bool:
@@ -239,17 +292,16 @@ def _sb_comment_section(text: str, heading: str) -> str:
 
 
 def _sb_render_freshness(packet: Dict[str, Any]) -> None:
-    memory = packet.get("memory") or {}
     odme = _sb_odme_data(packet)
-    parts = [f"Scan {_sb_fmt_time(memory.get('scanned_at'))}"]
-    parts.extend(_sb_tv_freshness(packet))
+    parts = _sb_tv_freshness(packet)
     odme_ts = _sb_first(odme, "ts", "generated_at")
     if odme_ts:
         expiry = str(_sb_first(odme, "expiry") or (packet.get("mapping") or {}).get("selected_expiry") or "")
         parts.append(f"ODME {_sb_fmt_time(odme_ts)}" + (f" · {expiry}" if expiry else ""))
     elif (packet.get("mapping") or {}).get("selected_expiry"):
         parts.append("ODME not refreshed")
-    st.caption("  |  ".join(parts))
+    if parts:
+        st.caption("  |  ".join(parts))
 
 
 def _sb_render_odme(packet: Dict[str, Any]) -> None:
@@ -631,11 +683,21 @@ def _sb_next_market_event(analysis: Dict[str, Any]) -> Dict[str, str]:
     if valid:
         _, h = sorted(valid, key=lambda x: x[0])[0]
         side = str(h.get("side", "") or "").upper()
+        strength = str(h.get("strength", "") or "Strong").strip()
         rng = f"{_sb_fmt_level(h.get('low'))}–{_sb_fmt_level(h.get('high'))}"
+        # analysis.hurdles contains only EDGE entry-qualified FP zones. Therefore
+        # strength + correct battlefield-side qualification are already known facts;
+        # Level 3 should state them, not ask the user to re-check them manually.
         if side == "DEMAND":
-            return {"event": f"Demand interaction around {rng}", "look": "Watch whether the zone is strong and in the lower battlefield half, then classify OF/AURORA/Pitchfork and check ODME for a long setup; if it breaks instead, watch for the CE break campaign."}
+            return {
+                "event": f"Demand interaction around {rng}",
+                "look": f"This {strength} demand zone is already qualified in the lower battlefield half. On interaction, HOLD keeps the normal long path alive; accepted break below shifts to the CE break campaign. OF, AURORA and ODME are evaluated automatically; Pitchfork is location/stretch guidance only."
+            }
         if side == "SUPPLY":
-            return {"event": f"Supply interaction around {rng}", "look": "Watch whether the zone is strong and in the upper battlefield half, then classify OF/AURORA/Pitchfork and check ODME for a short setup; if it breaks instead, watch for the PE break campaign."}
+            return {
+                "event": f"Supply interaction around {rng}",
+                "look": f"This {strength} supply zone is already qualified in the upper battlefield half. On interaction, HOLD keeps the normal short path alive; accepted break above shifts to the PE break campaign. OF, AURORA and ODME are evaluated automatically; Pitchfork is location/stretch guidance only."
+            }
     waits = analysis.get("waiting_for") or []
     if waits:
         return {"event": "Next confirmation", "look": str(waits[0])}
