@@ -278,6 +278,7 @@ def _fork_state(structure: Dict[str, Any]) -> Dict[str, Any]:
         "short_reversal_location": pos == "UPPER_1SD_TO_2SD" or (reclaim and reclaim_side == "UPPER"),
         "long_extreme_unreclaimed": pos == "BELOW_LOWER_2SD" and not (reclaim and reclaim_side == "LOWER"),
         "short_extreme_unreclaimed": pos == "ABOVE_UPPER_2SD" and not (reclaim and reclaim_side == "UPPER"),
+        "entry_gate": "NON_BLOCKING_LOCATION_ONLY",
     }
 
 
@@ -533,16 +534,13 @@ def _directional_gate(
             else:
                 _wait(g, "the POI is armed, but momentum transfer has not completed")
         else:
-            reversal_ok = fork.get("long_reversal_location") if intended == "BULLISH" else fork.get("short_reversal_location")
-            extreme_bad = fork.get("long_extreme_unreclaimed") if intended == "BULLISH" else fork.get("short_extreme_unreclaimed")
-            if extreme_bad:
-                _wait(g, "price is beyond 2SD and has not reclaimed; no early reversal permission")
-            elif not reversal_ok:
-                _wait(g, "execution OF opposes and Pitchfork stretch/reclaim does not permit an early reversal")
-            elif aurora.get("direction") == intended and aurora.get("phase") == "ACTIVE":
-                _support(g, "qualified POI + Pitchfork stretch/reclaim + AURORA permit an early reversal against opposing OF")
+            # Pitchfork is location/stretch context only. It never grants or removes
+            # directional permission. Opposing OF is handled by the locked Level-2
+            # failure-to-progress rule; AURORA must still transfer as required.
+            if aurora.get("direction") == intended and aurora.get("phase") == "ACTIVE":
+                _wait(g, "execution OF still opposes; require the locked OF failure-to-progress / FP-defence condition. Pitchfork only refines entry location.")
             else:
-                _wait(g, "reversal location is valid, but AURORA has not transferred into the intended direction")
+                _wait(g, "execution OF opposes and AURORA has not transferred; Pitchfork slope/location is non-blocking context only")
         return g
 
     # No qualified POI: continuation only. No reversal privilege against OF.

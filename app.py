@@ -469,6 +469,40 @@ def _sb_odme_label(packet: Dict[str, Any]) -> str:
     return str(_sb_first(odme, "odme_tilt", "tilt") or "NO ODME READ").upper()
 
 
+def _sb_is_legacy_pitchfork_gate(condition: str) -> bool:
+    u = str(condition or "").upper()
+    return any(k in u for k in ("PITCHFORK", "PF_", "UPSLOPE", "DOWNSLOPE"))
+
+
+def _sb_pitchfork_location_text(analysis: Dict[str, Any], direction: str) -> str:
+    fork = analysis.get("fork") or {}
+    if not fork.get("valid"):
+        return "Pitchfork is unavailable; it does not block entry and provides no location guidance on this scan."
+
+    slope = str(fork.get("slope") or "").upper()
+    pos = str(fork.get("position") or "").upper()
+    d = str(direction or "").upper()
+    bullish = d in {"LONG", "BULLISH"}
+
+    if pos == "ABOVE_UPPER_2SD":
+        return "Pitchfork: price is structurally stretched up above +2SD. If the other entry gates align, entry is allowed without waiting for Pitchfork; carry a stretched-up warning."
+    if pos == "BELOW_LOWER_2SD":
+        return "Pitchfork: price is structurally stretched down below -2SD. If the other entry gates align, entry is allowed without waiting for Pitchfork; carry a stretched-down warning."
+
+    if bullish:
+        if slope == "DOWN":
+            return "Pitchfork location: downslope. Preferred LONG location is a bullish reclaim of any Pitchfork level; the downslope itself does not block entry."
+        if slope == "UP":
+            return "Pitchfork location: upslope. Preferred LONG location is a retracement to any Pitchfork level; the upslope itself does not block entry."
+        return "Pitchfork location is neutral/unclear; it does not block an otherwise valid LONG."
+
+    if slope == "DOWN":
+        return "Pitchfork location: downslope. Preferred SHORT location is a retracement to any Pitchfork level; the downslope itself does not block entry."
+    if slope == "UP":
+        return "Pitchfork location: upslope. Preferred SHORT location is a bearish rejection/loss of any Pitchfork level; the upslope itself does not block entry."
+    return "Pitchfork location is neutral/unclear; it does not block an otherwise valid SHORT."
+
+
 def _sb_live_tv_condition_text(condition: str, analysis: Dict[str, Any]) -> str:
     raw = str(condition or "").strip()
     upper = raw.upper()
@@ -485,14 +519,8 @@ def _sb_live_tv_condition_text(condition: str, analysis: Dict[str, Any]) -> str:
         return f"AURORA is {aurora}; wait for {target}."
     if "AURORA" in upper and "IMPROVE" in upper:
         return f"AURORA is {aurora}; {raw}."
-    if "PF_UPSLOPE_ENTRY" in upper:
-        return f"Pitchfork is {fork_now}; wait for PF_UPSLOPE_ENTRY."
-    if "PF_DOWNSLOPE_ENTRY" in upper:
-        return f"Pitchfork is {fork_now}; wait for PF_DOWNSLOPE_ENTRY."
-    if "BULLISH PITCHFORK" in upper:
-        return f"Pitchfork is {fork_now}; a bullish Pitchfork entry is still required."
-    if "BEARISH PITCHFORK" in upper:
-        return f"Pitchfork is {fork_now}; a bearish Pitchfork entry is still required."
+    if _sb_is_legacy_pitchfork_gate(raw):
+        return f"Pitchfork is {fork_now}; this is location guidance only and is not an entry blocker."
     if "OPPOSING OF MUST FAIL" in upper or "OF FAILURE" in upper:
         return f"OF is {of_now}; the required failure-to-progress condition is not yet confirmed."
     return raw.rstrip(".") + "."
@@ -526,7 +554,10 @@ def _sb_evaluate_pending_setup(row: Dict[str, Any], packet: Dict[str, Any]) -> D
     md = _sb_setup_md(row)
     req_raw = str(md.get("odme_requirement") or "").strip()
     req = req_raw.upper()
-    remaining = [str(x) for x in (md.get("remaining_conditions") or []) if str(x).strip() and str(x).strip() != "ONLY ODME CHECK REMAINS"]
+    raw_remaining = [str(x) for x in (md.get("remaining_conditions") or []) if str(x).strip() and str(x).strip() != "ONLY ODME CHECK REMAINS"]
+    # Legacy pending records may still carry old Pitchfork gate text. Pitchfork is
+    # now location-only and must never keep ENTRY READY on HOLD by itself.
+    remaining = [x for x in raw_remaining if not _sb_is_legacy_pitchfork_gate(x)]
     analysis = packet.get("analysis") or {}
     bias = _sb_odme_bias(packet)
 
@@ -544,13 +575,15 @@ def _sb_evaluate_pending_setup(row: Dict[str, Any], packet: Dict[str, Any]) -> D
 
     tv_details = [_sb_live_tv_condition_text(x, analysis) for x in remaining]
     odme_detail = _sb_odme_gate_text(req_raw, packet, satisfied)
+    pf_detail = _sb_pitchfork_location_text(analysis, md.get("direction") or row.get("direction"))
     status = "ENTRY READY" if not remaining and satisfied else "HOLD"
     parts = []
     if tv_details:
         parts.extend(tv_details)
     else:
-        parts.append("TV conditions are satisfied on this scan.")
+        parts.append("TV directional/timing conditions are satisfied on this scan.")
     parts.append(odme_detail)
+    parts.append(pf_detail)
     reason = " ".join(x for x in parts if x).strip()
     return {
         "status": status,
@@ -561,6 +594,7 @@ def _sb_evaluate_pending_setup(row: Dict[str, Any], packet: Dict[str, Any]) -> D
         "tv_satisfied": not remaining,
         "tv_details": tv_details,
         "odme_detail": odme_detail,
+        "pitchfork_detail": pf_detail,
         "requirement": req_raw,
     }
 
@@ -569,6 +603,7 @@ def _sb_pending_event_text(row: Dict[str, Any]) -> Dict[str, str]:
     md = _sb_setup_md(row)
     name = str(md.get("setup_name") or row.get("strategy_type") or "Setup")
     remaining = md.get("remaining_conditions") if isinstance(md.get("remaining_conditions"), list) else []
+    remaining = [x for x in remaining if str(x).strip() and str(x).strip() != "ONLY ODME CHECK REMAINS" and not _sb_is_legacy_pitchfork_gate(str(x))]
     odme = str(md.get("odme_requirement") or "").strip()
     status = str(row.get("status", "") or "").upper()
     if status == "BREAK_WATCH":
