@@ -1429,41 +1429,60 @@ def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str,
     side_options = list(dict.fromkeys([default_side, "SELL", "BUY"]))
     type_options = list(dict.fromkeys([default_type, "CE", "PE", "FUT", "CASH", "OTHER"]))
 
-    with st.form(f"record_taken_trade_form_{instrument}_{selected['record_id']}"):
-        st.caption("Record the position actually executed. This becomes the campaign exposure SuperBrain manages.")
-        side = st.selectbox("Side", side_options, key=f"entry_side_{instrument}_{selected['record_id']}")
-        contract_type = st.selectbox(
-            "Contract type", type_options, key=f"entry_type_{instrument}_{selected['record_id']}"
-        )
-        strike = st.text_input(
-            "Executed strike / contract level",
-            value=default_strike,
-            key=f"entry_strike_{instrument}_{selected['record_id']}",
-            help="Required for CE/PE. For FUT/CASH/OTHER, enter a level only if useful.",
-        )
-        expiry = st.text_input(
-            "Expiry",
-            value=default_expiry,
-            key=f"entry_expiry_{instrument}_{selected['record_id']}",
-        )
-        quantity = st.text_input(
-            "Size / quantity / lots (optional)",
-            value=default_qty,
-            key=f"entry_qty_{instrument}_{selected['record_id']}",
-        )
-        note = st.text_input(
-            "Entry note (optional)",
-            value="",
-            key=f"entry_note_{instrument}_{selected['record_id']}",
-        )
-        submitted = st.form_submit_button(
-            "I have taken this trade — record campaign",
-            type="primary",
-            use_container_width=True,
-        )
+    # Use normal widgets + button rather than a Streamlit form here. On mobile,
+    # a failed form submit could leave the error below the fold and look like the
+    # button did nothing. Normal widgets keep their keyed values and make the
+    # record action explicit on every rerun.
+    st.caption("Record the position actually executed. This becomes the campaign exposure SuperBrain manages.")
+    backend_name = type(store).__name__
+    st.caption(f"Storage backend: {backend_name}")
+    side = st.selectbox("Side", side_options, key=f"entry_side_{instrument}_{selected['record_id']}")
+    contract_type = st.selectbox(
+        "Contract type", type_options, key=f"entry_type_{instrument}_{selected['record_id']}"
+    )
+    strike = st.text_input(
+        "Executed strike / contract level",
+        value=default_strike,
+        key=f"entry_strike_{instrument}_{selected['record_id']}",
+        help="Required for CE/PE. For FUT/CASH/OTHER, enter a level only if useful.",
+    )
+    expiry = st.text_input(
+        "Expiry",
+        value=default_expiry,
+        key=f"entry_expiry_{instrument}_{selected['record_id']}",
+    )
+    quantity = st.text_input(
+        "Size / quantity / lots (optional)",
+        value=default_qty,
+        key=f"entry_qty_{instrument}_{selected['record_id']}",
+    )
+    note = st.text_input(
+        "Entry note (optional)",
+        value="",
+        key=f"entry_note_{instrument}_{selected['record_id']}",
+    )
+
+    ctype_now = str(contract_type or "").upper().strip()
+    strike_missing = ctype_now in {"CE", "PE"} and not str(strike or "").strip()
+    if strike_missing:
+        st.warning("Executed option strike is required before this campaign can be recorded.")
+
+    submitted = st.button(
+        "I have taken this trade — record campaign",
+        type="primary",
+        use_container_width=True,
+        disabled=strike_missing,
+        key=f"record_taken_trade_btn_{instrument}_{selected['record_id']}",
+    )
 
     if submitted:
         try:
+            if backend_name == "LocalStore":
+                raise RuntimeError(
+                    "SuperBrain is running on LocalStore, not the Google Sheet store. "
+                    "The campaign was not recorded because it would not be durable in superbrain_memory."
+                )
+
             trade = _sb_record_selected_pending_entry(
                 store=store,
                 packet=packet,
@@ -1476,22 +1495,48 @@ def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str,
                 quantity=quantity,
                 note=note,
             )
+
+            trade_id = str(trade.get("trade_id", "") or "").strip()
+            if not trade_id:
+                raise RuntimeError("The storage layer returned no trade_id after the write.")
+
+            # Hard read-back verification. Never tell the user a campaign is
+            # recorded unless the same store can immediately retrieve that TRADE.
+            verified = False
+            verify_error = ""
+            try:
+                persisted = store.list_superbrain_trades(instrument=instrument, open_only=False)
+                if persisted is not None and not persisted.empty and "trade_id" in persisted.columns:
+                    verified = bool(persisted["trade_id"].astype(str).eq(trade_id).any())
+            except Exception as verify_exc:
+                verify_error = f"{type(verify_exc).__name__}: {verify_exc}"
+
+            if not verified:
+                detail = f" Read-back error: {verify_error}" if verify_error else ""
+                raise RuntimeError(
+                    f"Trade {trade_id} was not found on read-back from {backend_name}.{detail}"
+                )
+
             # Make the recorded campaign visible immediately; the next Scan now
             # will refresh reasoning against this persisted exposure.
             existing_open = [
                 x for x in (packet.get("open_trades") or [])
-                if str(x.get("trade_id", "") or "") != str(trade.get("trade_id", "") or "")
+                if str(x.get("trade_id", "") or "") != trade_id
             ]
             existing_open.append(trade)
             packet["open_trades"] = existing_open
             st.session_state.public_superbrain_last = packet
             st.session_state["superbrain_notice"] = (
-                f"Campaign recorded: {trade.get('trade_id', '')}. "
+                f"Campaign recorded and verified in {backend_name}: {trade_id}. "
                 "SuperBrain will manage the recorded exposure from the next scan."
             )
+            st.session_state.pop("superbrain_error_notice", None)
             st.rerun()
         except Exception as exc:
-            st.error(f"Campaign could not be recorded: {type(exc).__name__}: {exc}")
+            st.session_state["superbrain_error_notice"] = (
+                f"Campaign was NOT recorded: {type(exc).__name__}: {exc}"
+            )
+            st.rerun()
 
 def render_public_superbrain() -> None:
     """Clean manual Level-3 scan terminal."""
@@ -1500,6 +1545,9 @@ def render_public_superbrain() -> None:
     notice = str(st.session_state.pop("superbrain_notice", "") or "").strip()
     if notice:
         st.success(notice)
+    error_notice = str(st.session_state.pop("superbrain_error_notice", "") or "").strip()
+    if error_notice:
+        st.error(error_notice)
 
     try:
         store = get_store()
