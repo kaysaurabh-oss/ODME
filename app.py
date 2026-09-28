@@ -16,7 +16,6 @@ from scan_service import run_odme_scan
 from superbrain_bridge import (
     build_instrument_map,
     prepare_superbrain_scan,
-    pending_setup_choices,
     record_superbrain_trade_taken,
 )
 
@@ -378,6 +377,416 @@ def _sb_exposure_text(trade: Dict[str, Any]) -> str:
     return " + ".join(labels) if labels else str(trade.get("strategy_type", "campaign") or "campaign")
 
 
+
+def _sb_management_value(value: Any) -> Any:
+    """Preserve user-entered contract fields while normalizing simple numerics."""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    try:
+        n = float(s.replace(",", ""))
+        return int(n) if n.is_integer() else n
+    except Exception:
+        return s
+
+
+def _sb_leg_identifier(trade_id: str, leg: Dict[str, Any], index: int) -> str:
+    existing = str((leg or {}).get("leg_id") or "").strip()
+    if existing:
+        return existing
+    return f"{trade_id or 'TRADE'}-L{index + 1}"
+
+
+def _sb_active_leg_rows(trade: Dict[str, Any]) -> List[Dict[str, Any]]:
+    trade_id = str((trade or {}).get("trade_id") or (trade or {}).get("record_id") or "TRADE").strip()
+    rows = []
+    for idx, raw in enumerate(_sb_list_json((trade or {}).get("legs_json", ""))):
+        leg = dict(raw)
+        status = str(leg.get("status", "ACTIVE") or "ACTIVE").upper()
+        if status not in {"ACTIVE", "OPEN", ""}:
+            continue
+        leg_id = _sb_leg_identifier(trade_id, leg, idx)
+        side = str(leg.get("side", "") or "").upper()
+        opt = str(leg.get("option_type") or leg.get("option") or leg.get("instrument_type") or "").upper()
+        strike = leg.get("strike")
+        expiry = str(leg.get("expiry", "") or "")
+        qty = leg.get("quantity", leg.get("qty", leg.get("lots", leg.get("size", ""))))
+        bits = [x for x in [
+            side,
+            _sb_fmt_level(strike) if strike not in (None, "") else "",
+            opt,
+            expiry,
+            f"Qty {qty}" if qty not in (None, "") else "",
+        ] if x]
+        rows.append({
+            "index": idx,
+            "leg": leg,
+            "leg_id": leg_id,
+            "label": " ".join(bits) if bits else f"Leg {idx + 1}",
+        })
+    return rows
+
+
+def _sb_management_recommendation(trade: Dict[str, Any], setup: Dict[str, Any], analysis: Dict[str, Any]) -> str:
+    """Use a structured current-plan management instruction when the deployed reasoner exposes one."""
+    plan = (analysis or {}).get("trade_plan") or {}
+    same_trade = str(plan.get("trade_id", "") or "").strip() == str((trade or {}).get("trade_id", "") or "").strip()
+    if same_trade:
+        for key in (
+            "management_action", "recommended_adjustment", "recommendation",
+            "next_action", "management", "action"
+        ):
+            value = plan.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return _sb_campaign_management(trade, setup)
+
+
+def _sb_record_management_adjustment(
+    store: Any,
+    packet: Dict[str, Any],
+    trade: Dict[str, Any],
+    action_code: str,
+    selected_leg_index: Optional[int] = None,
+    side: str = "",
+    contract_type: str = "",
+    strike: Any = "",
+    expiry: str = "",
+    quantity: Any = "",
+    note: str = "",
+) -> Dict[str, Any]:
+    """Update the SAME active campaign after a user-confirmed management action.
+
+    Old legs are retained with terminal leg statuses, while only current exposure
+    remains ACTIVE/OPEN. This preserves campaign lineage and gives SuperBrain and
+    the Level-2 monitor one authoritative current position.
+    """
+    if not trade:
+        raise ValueError("Active campaign is missing.")
+
+    trade_id = str(trade.get("trade_id") or "").strip()
+    instrument = str(trade.get("instrument") or "").strip()
+    if not trade_id or not instrument:
+        raise ValueError("Active campaign is missing trade_id or instrument.")
+
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    legs = [dict(x) for x in _sb_list_json(trade.get("legs_json", ""))]
+
+    # Stabilize leg identifiers without changing existing identifiers.
+    for idx, leg in enumerate(legs):
+        leg.setdefault("leg_id", _sb_leg_identifier(trade_id, leg, idx))
+
+    active_indexes = [
+        i for i, leg in enumerate(legs)
+        if str(leg.get("status", "ACTIVE") or "ACTIVE").upper() in {"ACTIVE", "OPEN", ""}
+    ]
+
+    action = str(action_code or "").upper().strip()
+    needs_existing = action in {"ROLL", "CLOSE", "RESIZE"}
+    if needs_existing:
+        if selected_leg_index is None or selected_leg_index not in active_indexes:
+            raise ValueError("Select the active leg that you adjusted.")
+
+    tmd = _sb_json(trade.get("metadata_json", ""))
+    try:
+        revision = int(float(tmd.get("management_revision") or 0)) + 1
+    except Exception:
+        revision = 1
+    event_id = f"MGMT-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{revision}"
+    event: Dict[str, Any] = {
+        "event_id": event_id,
+        "recorded_at": now,
+        "trade_id": trade_id,
+        "action": action,
+        "note": str(note or "").strip(),
+        "management_revision": revision,
+        "price": ((packet or {}).get("analysis") or {}).get("price"),
+        "scan_id": ((packet or {}).get("memory") or {}).get("scan_id")
+                   or ((packet or {}).get("analysis") or {}).get("scan_id")
+                   or "",
+        "source": "USER_CONFIRMED_SUPERBRAIN",
+    }
+
+    if action == "ROLL":
+        old = legs[selected_leg_index]
+        old_id = str(old.get("leg_id") or _sb_leg_identifier(trade_id, old, selected_leg_index))
+        old_snapshot = {
+            "leg_id": old_id,
+            "side": old.get("side", ""),
+            "option_type": old.get("option_type") or old.get("option") or old.get("instrument_type") or "",
+            "strike": old.get("strike", ""),
+            "expiry": old.get("expiry", ""),
+            "quantity": old.get("quantity", old.get("qty", old.get("lots", old.get("size", "")))),
+        }
+
+        old["status"] = "ROLLED"
+        old["closed_at"] = now
+        old["management_event_id"] = event_id
+
+        new_id = f"{trade_id}-M{revision}"
+        new_leg = dict(old)
+        for key in ("closed_at", "close_reason", "replaced_by_leg_id", "rolled_to_leg_id"):
+            new_leg.pop(key, None)
+        new_leg["leg_id"] = new_id
+        new_leg["status"] = "ACTIVE"
+        new_leg["opened_at"] = now
+        new_leg["management_event_id"] = event_id
+        new_leg["rolled_from_leg_id"] = old_id
+        new_leg["side"] = str(side or old_snapshot["side"] or "").upper()
+        new_leg["option_type"] = str(contract_type or old_snapshot["option_type"] or "").upper()
+        if str(strike).strip():
+            new_leg["strike"] = _sb_management_value(strike)
+        if str(expiry or "").strip():
+            new_leg["expiry"] = str(expiry).strip()
+        if str(quantity).strip():
+            new_leg["quantity"] = _sb_management_value(quantity)
+        old["rolled_to_leg_id"] = new_id
+        legs.append(new_leg)
+
+        event["from_leg"] = old_snapshot
+        event["to_leg"] = {
+            "leg_id": new_id,
+            "side": new_leg.get("side", ""),
+            "option_type": new_leg.get("option_type", ""),
+            "strike": new_leg.get("strike", ""),
+            "expiry": new_leg.get("expiry", ""),
+            "quantity": new_leg.get("quantity", new_leg.get("qty", new_leg.get("lots", new_leg.get("size", "")))),
+        }
+
+    elif action == "ADD":
+        new_id = f"{trade_id}-M{revision}"
+        new_leg = {
+            "leg_id": new_id,
+            "status": "ACTIVE",
+            "opened_at": now,
+            "management_event_id": event_id,
+            "side": str(side or "").upper(),
+            "option_type": str(contract_type or "").upper(),
+            "strike": _sb_management_value(strike),
+            "expiry": str(expiry or "").strip(),
+            "quantity": _sb_management_value(quantity),
+        }
+        legs.append(new_leg)
+        event["added_leg"] = dict(new_leg)
+
+    elif action == "CLOSE":
+        old = legs[selected_leg_index]
+        old["status"] = "CLOSED"
+        old["closed_at"] = now
+        old["close_reason"] = str(note or "User-confirmed management close").strip()
+        old["management_event_id"] = event_id
+        event["closed_leg"] = {
+            "leg_id": old.get("leg_id", ""),
+            "side": old.get("side", ""),
+            "option_type": old.get("option_type") or old.get("option") or "",
+            "strike": old.get("strike", ""),
+            "expiry": old.get("expiry", ""),
+            "quantity": old.get("quantity", old.get("qty", old.get("lots", old.get("size", "")))),
+        }
+
+    elif action == "RESIZE":
+        if not str(quantity).strip():
+            raise ValueError("Enter the new size/quantity.")
+        old = legs[selected_leg_index]
+        previous_qty = old.get("quantity", old.get("qty", old.get("lots", old.get("size", ""))))
+        old["quantity"] = _sb_management_value(quantity)
+        old["management_event_id"] = event_id
+        old["resized_at"] = now
+        event["resized_leg"] = {
+            "leg_id": old.get("leg_id", ""),
+            "previous_quantity": previous_qty,
+            "new_quantity": old.get("quantity", ""),
+        }
+
+    else:
+        raise ValueError("Unknown management adjustment.")
+
+    history = tmd.get("management_history")
+    if not isinstance(history, list):
+        history = []
+    history.append(event)
+    # Keep compact durable history; detailed prior legs remain in legs_json.
+    history = history[-40:]
+
+    tmd["management_revision"] = revision
+    tmd["last_management_at"] = now
+    tmd["last_management_action"] = action
+    tmd["last_management_event_id"] = event_id
+    tmd["management_history"] = history
+    tmd["current_exposure_source"] = "USER_CONFIRMED"
+
+    updated = dict(trade)
+    remaining_active = [
+        leg for leg in legs
+        if str(leg.get("status", "ACTIVE") or "ACTIVE").upper() in {"ACTIVE", "OPEN", ""}
+    ]
+    if action == "CLOSE" and not remaining_active:
+        updated["status"] = "CLOSED"
+        updated["closed_at"] = now
+        updated["close_reason"] = str(note or "All active legs closed by user-confirmed management action").strip()
+    else:
+        updated["status"] = "ACTIVE"
+        updated["closed_at"] = ""
+        updated["close_reason"] = ""
+    updated["legs_json"] = json.dumps(legs, separators=(",", ":"), default=str)
+    updated["metadata_json"] = json.dumps(tmd, separators=(",", ":"), default=str)
+
+    return store.upsert_superbrain_trade(updated)
+
+
+def _sb_render_management_confirmation(
+    store: Any,
+    packet: Dict[str, Any],
+    trade: Dict[str, Any],
+    setup: Dict[str, Any],
+    analysis: Dict[str, Any],
+) -> None:
+    """User confirmation layer for rolls/adds/closes/resizes on an active campaign."""
+    trade_id = str(trade.get("trade_id") or trade.get("record_id") or "campaign").strip()
+    active_legs = _sb_active_leg_rows(trade)
+    recommendation = _sb_management_recommendation(trade, setup, analysis)
+
+    with st.expander("I did a management adjustment", expanded=False):
+        st.caption(
+            "Record only an adjustment you actually executed. This updates the same campaign; "
+            "it does not create a new trade."
+        )
+        if recommendation:
+            st.write(f"**Current management context:** {recommendation}")
+        st.caption(f"Current exposure: {_sb_exposure_text(trade)}")
+
+        action_labels = ["Add a new management leg"]
+        if active_legs:
+            action_labels = [
+                "Roll / replace an active leg",
+                "Add a new management leg",
+                "Close an active leg",
+                "Change size of an active leg",
+            ]
+
+        action_label = st.selectbox(
+            "What did you do?",
+            action_labels,
+            key=f"sb_mgmt_action_{trade_id}",
+        )
+        action_map = {
+            "Roll / replace an active leg": "ROLL",
+            "Add a new management leg": "ADD",
+            "Close an active leg": "CLOSE",
+            "Change size of an active leg": "RESIZE",
+        }
+        action_code = action_map[action_label]
+
+        selected_leg = None
+        selected_idx = None
+        if action_code in {"ROLL", "CLOSE", "RESIZE"}:
+            selected_label = st.selectbox(
+                "Which active leg did you adjust?",
+                [x["label"] for x in active_legs],
+                key=f"sb_mgmt_leg_{trade_id}_{action_code}",
+            )
+            selected_leg = next(x for x in active_legs if x["label"] == selected_label)
+            selected_idx = int(selected_leg["index"])
+
+        base_leg = selected_leg["leg"] if selected_leg else {}
+        base_side = str(base_leg.get("side", "") or "SELL").upper()
+        base_type = str(
+            base_leg.get("option_type") or base_leg.get("option")
+            or base_leg.get("instrument_type") or "CE"
+        ).upper()
+        side_options = list(dict.fromkeys([base_side, "SELL", "BUY"]))
+        type_options = list(dict.fromkeys([base_type, "CE", "PE", "FUT", "CASH", "OTHER"]))
+
+        with st.form(f"sb_mgmt_form_{trade_id}_{action_code}"):
+            side = base_side
+            contract_type = base_type
+            strike = str(base_leg.get("strike", "") or "")
+            expiry = str(base_leg.get("expiry", "") or "")
+            quantity = str(
+                base_leg.get("quantity", base_leg.get("qty", base_leg.get("lots", base_leg.get("size", ""))))
+                or ""
+            )
+
+            if action_code in {"ROLL", "ADD"}:
+                side = st.selectbox("Side", side_options, key=f"sb_mgmt_side_{trade_id}_{action_code}")
+                contract_type = st.selectbox(
+                    "Contract type", type_options, key=f"sb_mgmt_type_{trade_id}_{action_code}"
+                )
+                strike = st.text_input(
+                    "New strike / contract level",
+                    value=strike if action_code == "ROLL" else "",
+                    key=f"sb_mgmt_strike_{trade_id}_{action_code}",
+                    help="Required for CE/PE. Leave blank for a non-option leg if no strike applies.",
+                )
+                expiry = st.text_input(
+                    "Expiry",
+                    value=expiry,
+                    key=f"sb_mgmt_expiry_{trade_id}_{action_code}",
+                )
+                quantity = st.text_input(
+                    "Size / quantity / lots",
+                    value=quantity,
+                    key=f"sb_mgmt_qty_{trade_id}_{action_code}",
+                )
+            elif action_code == "RESIZE":
+                quantity = st.text_input(
+                    "New size / quantity / lots",
+                    value=quantity,
+                    key=f"sb_mgmt_qty_{trade_id}_{action_code}",
+                )
+
+            note = st.text_input(
+                "Adjustment note (optional)",
+                value="",
+                key=f"sb_mgmt_note_{trade_id}_{action_code}",
+            )
+
+            submitted = st.form_submit_button(
+                "I did this adjustment — update campaign",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if submitted:
+            try:
+                if action_code in {"ROLL", "ADD"} and str(contract_type).upper() in {"CE", "PE"} and not str(strike).strip():
+                    raise ValueError("Enter the executed option strike.")
+
+                updated_trade = _sb_record_management_adjustment(
+                    store=store,
+                    packet=packet,
+                    trade=trade,
+                    action_code=action_code,
+                    selected_leg_index=selected_idx,
+                    side=side,
+                    contract_type=contract_type,
+                    strike=strike,
+                    expiry=expiry,
+                    quantity=quantity,
+                    note=note,
+                )
+
+                # Refresh the visible packet immediately so the terminal shows the
+                # new exposure without waiting for another scan.
+                open_trades = []
+                for item in (packet.get("open_trades") or []):
+                    if str(item.get("trade_id", "") or "") == str(updated_trade.get("trade_id", "") or ""):
+                        open_trades.append(updated_trade)
+                    else:
+                        open_trades.append(item)
+                packet["open_trades"] = open_trades
+                st.session_state.public_superbrain_last = packet
+                st.session_state["superbrain_notice"] = (
+                    f"Management adjustment recorded for {updated_trade.get('trade_id', trade_id)}. "
+                    "The campaign now uses the updated exposure; run the next SuperBrain scan for fresh management intelligence."
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Adjustment could not be recorded: {type(exc).__name__}: {exc}")
+
+
 def _sb_current_market_line(analysis: Dict[str, Any]) -> str:
     price = analysis.get("price")
     macro = str(analysis.get("macro", "") or "NEUTRAL")
@@ -705,31 +1114,121 @@ def _sb_next_market_event(analysis: Dict[str, Any]) -> Dict[str, str]:
 
 
 def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str, Any]) -> None:
+    """Render user-confirmed campaign recording for every executable pending setup.
+
+    The old UI incorrectly required analysis.trade_plan.kind == "NEW" before the
+    button could appear. That hid the control even when a stored PENDING_ENTRY was
+    visibly ENTRY READY. Recording is now driven by the actual setup records.
+    """
     analysis = packet.get("analysis", {}) or {}
     plan = analysis.get("trade_plan", {}) or {}
-    if str(plan.get("kind", "") or "").upper() != "NEW":
+
+    # A setup already linked to an open campaign must not be offered again even if
+    # a stale setup row still says PENDING_ENTRY.
+    linked_setup_ids = set()
+    for trade in (packet.get("open_trades") or []):
+        tmd = _sb_json((trade or {}).get("metadata_json", ""))
+        for key in ("parent_setup_id", "origin_setup_record_id", "setup_record_id"):
+            rid = str(tmd.get(key) or "").strip()
+            if rid:
+                linked_setup_ids.add(rid)
+
+    pending_rows = [
+        row for row in _sb_pending_setups(store, instrument)
+        if str(row.get("status", "") or "").upper() == "PENDING_ENTRY"
+        and str(row.get("record_id", "") or "").strip()
+        and str(row.get("record_id", "") or "").strip() not in linked_setup_ids
+    ]
+    if not pending_rows:
         return
-    choices = pending_setup_choices(store, instrument)
-    if not choices:
-        return
+
+    # If the current scan produced a NEW plan and exposes a persisted setup id,
+    # identify that row in the selector. We never manufacture an unlinked trade.
+    plan_setup_id = ""
+    if str(plan.get("kind", "") or "").upper() == "NEW":
+        for key in ("setup_record_id", "record_id", "parent_setup_id", "origin_setup_record_id"):
+            candidate = str(plan.get(key) or "").strip()
+            if candidate:
+                plan_setup_id = candidate
+                break
+
+    choices = []
+    for row in pending_rows:
+        rid = str(row.get("record_id", "") or "").strip()
+        md = _sb_setup_md(row)
+        evaluation = _sb_evaluate_pending_setup(row, packet)
+        readiness = str(evaluation.get("status", "PENDING") or "PENDING").upper()
+        setup_name = str(md.get("setup_name") or row.get("strategy_type") or "Setup").strip()
+        direction = str(md.get("direction") or row.get("direction") or "").upper().strip()
+        entry_ref = row.get("entry_reference")
+
+        label_bits = []
+        if rid == plan_setup_id:
+            label_bits.append("CURRENT NEW")
+        label_bits.append(readiness)
+        label_bits.append(setup_name)
+        if direction:
+            label_bits.append(direction)
+        if entry_ref not in (None, ""):
+            label_bits.append(f"Entry {_sb_fmt_level(entry_ref)}")
+
+        choices.append({
+            "record_id": rid,
+            "row": row,
+            "evaluation": evaluation,
+            "label": " · ".join(label_bits),
+        })
+
+    # Put genuinely ready setups first, then newest pending setup order already
+    # supplied by _sb_pending_setups().
+    choices.sort(key=lambda x: 0 if x["evaluation"].get("status") == "ENTRY READY" else 1)
+
+    st.markdown("### Record trade taken")
     selected = choices[0]
     if len(choices) > 1:
-        selected_label = st.selectbox("Setup executed", [x["label"] for x in choices], key=f"pending_setup_choice_{instrument}")
+        selected_label = st.selectbox(
+            "Which setup did you execute?",
+            [x["label"] for x in choices],
+            key=f"pending_setup_choice_{instrument}",
+        )
         selected = next(x for x in choices if x["label"] == selected_label)
-    if st.button("Trade taken — record campaign", type="primary", use_container_width=True, key=f"record_taken_trade_{instrument}_{selected['record_id']}"):
+    else:
+        st.caption(selected["label"])
+
+    evaluation = selected["evaluation"]
+    if str(evaluation.get("status", "")).upper() == "ENTRY READY":
+        st.success("Selected setup is ENTRY READY on the current scan.")
+    else:
+        st.warning(
+            "Selected setup is still HOLD in SuperBrain. Record it only if you actually executed it manually."
+        )
+        reason = str(evaluation.get("reason", "") or "").strip()
+        if reason:
+            st.caption(reason)
+
+    if st.button(
+        "I have taken this trade — record campaign",
+        type="primary",
+        use_container_width=True,
+        key=f"record_taken_trade_{instrument}_{selected['record_id']}",
+    ):
         try:
             result = record_superbrain_trade_taken(store, packet, selected["record_id"])
             trade = result.get("trade", {}) or {}
             st.success(f"Campaign recorded: {trade.get('trade_id', '')}")
             st.session_state.public_superbrain_last = None
             st.rerun()
-        except Exception:
-            st.error("Campaign could not be recorded. Refresh the scan and try again.")
+        except Exception as exc:
+            st.error(f"Campaign could not be recorded: {type(exc).__name__}: {exc}")
 
 
 def render_public_superbrain() -> None:
     """Clean manual Level-3 scan terminal."""
     st.subheader("SuperBrain")
+
+    notice = str(st.session_state.pop("superbrain_notice", "") or "").strip()
+    if notice:
+        st.success(notice)
 
     try:
         store = get_store()
@@ -816,6 +1315,7 @@ def render_public_superbrain() -> None:
             st.caption(f"Expected: {expected}")
             st.write(f"**Next management event:** {_sb_campaign_management(trade, setup)}")
             st.caption(f"ODME now: {_sb_odme_bias(packet)} · {_sb_campaign_option_question(trade, setup)}")
+            _sb_render_management_confirmation(store, packet, trade, setup, analysis)
             if i < len(active) - 1:
                 st.markdown("---")
 
