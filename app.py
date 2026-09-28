@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 import json
+import uuid
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, List
 
@@ -1113,20 +1114,224 @@ def _sb_next_market_event(analysis: Dict[str, Any]) -> Dict[str, str]:
     return {"event": "No immediate setup", "look": "Wait for a qualified strong FP interaction or an accepted break-watch event."}
 
 
-def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str, Any]) -> None:
-    """Render user-confirmed campaign recording for every executable pending setup.
+def _sb_infer_entry_contract(row: Dict[str, Any]) -> Dict[str, str]:
+    """Infer only the contract family/side from the persisted setup; never invent a strike."""
+    md = _sb_setup_md(row)
+    hay = " ".join(
+        str(x or "").upper()
+        for x in (
+            md.get("setup_name"), row.get("strategy_type"), md.get("direction"), row.get("direction")
+        )
+    )
+    if "SHORT_CE" in hay or "SELL_CE" in hay:
+        return {"side": "SELL", "contract_type": "CE"}
+    if "SHORT_PE" in hay or "SELL_PE" in hay:
+        return {"side": "SELL", "contract_type": "PE"}
+    if "LONG_CE" in hay or "BUY_CE" in hay:
+        return {"side": "BUY", "contract_type": "CE"}
+    if "LONG_PE" in hay or "BUY_PE" in hay:
+        return {"side": "BUY", "contract_type": "PE"}
+    # Directional setup with no explicit derivative family: do not guess a strike.
+    if "LONG" in hay or "BULLISH" in hay:
+        return {"side": "BUY", "contract_type": "OTHER"}
+    if "SHORT" in hay or "BEARISH" in hay:
+        return {"side": "SELL", "contract_type": "OTHER"}
+    return {"side": "SELL", "contract_type": "OTHER"}
 
-    The old UI incorrectly required analysis.trade_plan.kind == "NEW" before the
-    button could appear. That hid the control even when a stored PENDING_ENTRY was
-    visibly ENTRY READY. Recording is now driven by the actual setup records.
+
+def _sb_first_plan_leg(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort prefill from a fresh structured plan, without making it authoritative."""
+    if not isinstance(plan, dict):
+        return {}
+    for key in ("legs", "trade_legs", "option_legs"):
+        value = plan.get(key)
+        if isinstance(value, list) and value and isinstance(value[0], dict):
+            return dict(value[0])
+        if isinstance(value, dict):
+            return dict(value)
+    raw = plan.get("legs_json")
+    legs = _sb_list_json(raw)
+    if legs:
+        return dict(legs[0])
+    for key in ("leg", "option_leg", "entry_leg"):
+        value = plan.get(key)
+        if isinstance(value, dict):
+            return dict(value)
+    direct = {}
+    for key in ("side", "option_type", "option", "instrument_type", "strike", "expiry", "quantity", "qty", "lots", "size"):
+        if plan.get(key) not in (None, ""):
+            direct[key] = plan.get(key)
+    return direct
+
+
+def _sb_record_selected_pending_entry(
+    store: Any,
+    packet: Dict[str, Any],
+    setup_row: Dict[str, Any],
+    evaluation: Dict[str, Any],
+    side: str,
+    contract_type: str,
+    strike: Any,
+    expiry: str,
+    quantity: Any,
+    note: str = "",
+) -> Dict[str, Any]:
+    """Create an ACTIVE campaign directly from the selected persisted PENDING_ENTRY.
+
+    The persisted setup is the authority. This intentionally does not require the
+    current scan to expose trade_plan.kind == NEW; that old bridge gate is what
+    prevented legitimate user-confirmed pending/HOLD entries from being recorded.
     """
+    row = dict(setup_row or {})
+    rid = str(row.get("record_id", "") or "").strip()
+    instrument = str(row.get("instrument") or packet.get("instrument") or "").upper().strip()
+    if not rid:
+        raise ValueError("Selected setup has no record_id.")
+    if not instrument:
+        raise ValueError("Selected setup has no instrument.")
+
+    # Never create a duplicate active campaign for the same setup, even if the
+    # browser packet is stale after a previous successful write.
+    try:
+        existing = store.list_superbrain_trades(instrument=instrument, open_only=True)
+    except Exception:
+        existing = pd.DataFrame()
+    if existing is not None and not existing.empty:
+        for old in existing.to_dict("records"):
+            omd = _sb_json(old.get("metadata_json", ""))
+            parent = str(
+                omd.get("parent_setup_id") or omd.get("origin_setup_record_id")
+                or omd.get("setup_record_id") or ""
+            ).strip()
+            if parent == rid:
+                return old
+
+    side_u = str(side or "").upper().strip()
+    ctype = str(contract_type or "").upper().strip()
+    if not side_u:
+        raise ValueError("Select whether the executed leg was BUY or SELL.")
+    if not ctype:
+        raise ValueError("Select the executed contract type.")
+    if ctype in {"CE", "PE"} and not str(strike or "").strip():
+        raise ValueError("Enter the option strike you actually executed.")
+
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    trade_id = f"SB-{uuid.uuid4().hex[:12].upper()}"
+    md = _sb_setup_md(row)
+    setup_name = str(md.get("setup_name") or row.get("strategy_type") or "Campaign").strip()
+    setup_direction = str(md.get("direction") or row.get("direction") or "").strip()
+    readiness = str((evaluation or {}).get("status") or "PENDING").upper().strip()
+    is_manual_override = readiness != "ENTRY READY"
+
+    leg = {
+        "leg_id": f"{trade_id}-E1",
+        "status": "ACTIVE",
+        "opened_at": now,
+        "source": "USER_CONFIRMED_ENTRY",
+        "side": side_u,
+        "option_type": ctype,
+        "strike": _sb_management_value(strike),
+        "expiry": str(expiry or "").strip(),
+        "quantity": _sb_management_value(quantity),
+    }
+
+    management_family = (
+        "FP_BREAK_OPTION_CAMPAIGN_MANAGEMENT"
+        if setup_name.upper() in {"SHORT_CE_AFTER_DEMAND_BREAK", "SHORT_PE_AFTER_SUPPLY_BREAK"}
+        else "PRIMARY_CAMPAIGN_MANAGEMENT"
+    )
+    tmd = dict(md)
+    tmd.update({
+        "memory_schema": "SB_TRADE_USER_CONFIRMED_2",
+        "parent_setup_id": rid,
+        "origin_setup_record_id": rid,
+        "setup_record_id": rid,
+        "origin_setup_name": setup_name,
+        "origin_setup_direction": setup_direction,
+        "origin_setup_odme_requirement": md.get("odme_requirement", ""),
+        "entry_recorded_at": now,
+        "entry_recorded_by_user": True,
+        "entry_readiness_at_recording": readiness,
+        "manual_entry_override": bool(is_manual_override),
+        "manual_entry_note": str(note or "").strip(),
+        "management_family": management_family,
+        "management_revision": 0,
+        "current_exposure_source": "USER_CONFIRMED_ENTRY",
+    })
+
+    analysis = packet.get("analysis", {}) or {}
+    memory = packet.get("memory", {}) or {}
+    trade = {
+        "instrument": instrument,
+        "trade_id": trade_id,
+        "status": "ACTIVE",
+        "strategy_type": row.get("strategy_type") or setup_name,
+        "direction": row.get("direction") or setup_direction,
+        "created_at": now,
+        "updated_at": now,
+        "closed_at": "",
+        "scan_id": memory.get("scan_id") or analysis.get("scan_id") or row.get("scan_id", ""),
+        "previous_scan_id": memory.get("previous_scan_id") or row.get("previous_scan_id", ""),
+        "mode": packet.get("mode") or row.get("mode") or "USER_CONFIRMED",
+        "action": "TRADE_TAKEN",
+        "thesis": row.get("thesis") or setup_name,
+        "entry_reference": row.get("entry_reference", ""),
+        "target": row.get("target", ""),
+        "invalidation": row.get("invalidation", ""),
+        "expected_eta": row.get("expected_eta", ""),
+        "risk": row.get("risk", ""),
+        "reward": row.get("reward", ""),
+        "rr": row.get("rr", ""),
+        "legs_json": json.dumps([leg], separators=(",", ":"), default=str),
+        "market_state_json": json.dumps({
+            "price": analysis.get("price"),
+            "macro": analysis.get("macro"),
+            "exec_of": analysis.get("exec_of"),
+            "battlefield_half": analysis.get("battlefield_half"),
+            "recorded_from_scan": memory.get("scan_id") or analysis.get("scan_id") or "",
+        }, separators=(",", ":"), default=str),
+        "previous_state_json": "",
+        "metadata_json": json.dumps(tmd, separators=(",", ":"), default=str),
+        "close_reason": "",
+    }
+    saved = store.upsert_superbrain_trade(trade)
+
+    # Newer stores may expose a setup-upsert API. Mark the setup entered when
+    # available, but never make campaign recording depend on that optional API.
+    setup_upsert = getattr(store, "upsert_superbrain_setup", None)
+    if callable(setup_upsert):
+        try:
+            updated_setup = dict(row)
+            updated_setup["status"] = "ENTERED"
+            updated_setup["trade_id"] = str(saved.get("trade_id") or trade_id)
+            updated_setup["updated_at"] = now
+            smd = _sb_setup_md(updated_setup)
+            smd["entered_at"] = now
+            smd["entered_trade_id"] = str(saved.get("trade_id") or trade_id)
+            updated_setup["metadata_json"] = json.dumps(smd, separators=(",", ":"), default=str)
+            setup_upsert(updated_setup)
+        except Exception:
+            pass
+
+    return saved
+
+
+def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str, Any]) -> None:
+    """Render user-confirmed campaign recording for every persisted PENDING_ENTRY."""
     analysis = packet.get("analysis", {}) or {}
     plan = analysis.get("trade_plan", {}) or {}
 
-    # A setup already linked to an open campaign must not be offered again even if
-    # a stale setup row still says PENDING_ENTRY.
+    # Include persisted active trades as well as the current packet so a stale
+    # browser session cannot offer an already-entered setup twice.
     linked_setup_ids = set()
-    for trade in (packet.get("open_trades") or []):
+    all_open = list(packet.get("open_trades") or [])
+    try:
+        persisted = store.list_superbrain_trades(instrument=instrument, open_only=True)
+        if persisted is not None and not persisted.empty:
+            all_open.extend(persisted.to_dict("records"))
+    except Exception:
+        pass
+    for trade in all_open:
         tmd = _sb_json((trade or {}).get("metadata_json", ""))
         for key in ("parent_setup_id", "origin_setup_record_id", "setup_record_id"):
             rid = str(tmd.get(key) or "").strip()
@@ -1142,8 +1347,6 @@ def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str,
     if not pending_rows:
         return
 
-    # If the current scan produced a NEW plan and exposes a persisted setup id,
-    # identify that row in the selector. We never manufacture an unlinked trade.
     plan_setup_id = ""
     if str(plan.get("kind", "") or "").upper() == "NEW":
         for key in ("setup_record_id", "record_id", "parent_setup_id", "origin_setup_record_id"):
@@ -1161,26 +1364,21 @@ def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str,
         setup_name = str(md.get("setup_name") or row.get("strategy_type") or "Setup").strip()
         direction = str(md.get("direction") or row.get("direction") or "").upper().strip()
         entry_ref = row.get("entry_reference")
-
         label_bits = []
         if rid == plan_setup_id:
             label_bits.append("CURRENT NEW")
-        label_bits.append(readiness)
-        label_bits.append(setup_name)
+        label_bits.extend([readiness, setup_name])
         if direction:
             label_bits.append(direction)
         if entry_ref not in (None, ""):
-            label_bits.append(f"Entry {_sb_fmt_level(entry_ref)}")
-
+            label_bits.append(f"Entry {entry_ref}")
         choices.append({
             "record_id": rid,
             "row": row,
             "evaluation": evaluation,
-            "label": " · ".join(label_bits),
+            "label": " · ".join(str(x) for x in label_bits if str(x).strip()),
         })
 
-    # Put genuinely ready setups first, then newest pending setup order already
-    # supplied by _sb_pending_setups().
     choices.sort(key=lambda x: 0 if x["evaluation"].get("status") == "ENTRY READY" else 1)
 
     st.markdown("### Record trade taken")
@@ -1200,27 +1398,100 @@ def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str,
         st.success("Selected setup is ENTRY READY on the current scan.")
     else:
         st.warning(
-            "Selected setup is still HOLD in SuperBrain. Record it only if you actually executed it manually."
+            "Selected setup is still HOLD in SuperBrain. If you took it anyway, record the exact exposure you actually executed."
         )
         reason = str(evaluation.get("reason", "") or "").strip()
         if reason:
             st.caption(reason)
 
-    if st.button(
-        "I have taken this trade — record campaign",
-        type="primary",
-        use_container_width=True,
-        key=f"record_taken_trade_{instrument}_{selected['record_id']}",
-    ):
+    defaults = _sb_infer_entry_contract(selected["row"])
+    plan_leg = _sb_first_plan_leg(plan) if (
+        str(plan.get("kind", "") or "").upper() == "NEW"
+        and (not plan_setup_id or plan_setup_id == selected["record_id"])
+    ) else {}
+    default_side = str(plan_leg.get("side") or defaults["side"] or "SELL").upper()
+    default_type = str(
+        plan_leg.get("option_type") or plan_leg.get("option") or plan_leg.get("instrument_type")
+        or defaults["contract_type"] or "OTHER"
+    ).upper()
+    default_strike = str(plan_leg.get("strike", "") or "")
+    default_expiry = str(
+        plan_leg.get("expiry")
+        or (packet.get("mapping") or {}).get("selected_expiry")
+        or _sb_first(_sb_odme_data(packet), "expiry")
+        or ""
+    )
+    default_qty = str(
+        plan_leg.get("quantity", plan_leg.get("qty", plan_leg.get("lots", plan_leg.get("size", ""))))
+        or ""
+    )
+
+    side_options = list(dict.fromkeys([default_side, "SELL", "BUY"]))
+    type_options = list(dict.fromkeys([default_type, "CE", "PE", "FUT", "CASH", "OTHER"]))
+
+    with st.form(f"record_taken_trade_form_{instrument}_{selected['record_id']}"):
+        st.caption("Record the position actually executed. This becomes the campaign exposure SuperBrain manages.")
+        side = st.selectbox("Side", side_options, key=f"entry_side_{instrument}_{selected['record_id']}")
+        contract_type = st.selectbox(
+            "Contract type", type_options, key=f"entry_type_{instrument}_{selected['record_id']}"
+        )
+        strike = st.text_input(
+            "Executed strike / contract level",
+            value=default_strike,
+            key=f"entry_strike_{instrument}_{selected['record_id']}",
+            help="Required for CE/PE. For FUT/CASH/OTHER, enter a level only if useful.",
+        )
+        expiry = st.text_input(
+            "Expiry",
+            value=default_expiry,
+            key=f"entry_expiry_{instrument}_{selected['record_id']}",
+        )
+        quantity = st.text_input(
+            "Size / quantity / lots (optional)",
+            value=default_qty,
+            key=f"entry_qty_{instrument}_{selected['record_id']}",
+        )
+        note = st.text_input(
+            "Entry note (optional)",
+            value="",
+            key=f"entry_note_{instrument}_{selected['record_id']}",
+        )
+        submitted = st.form_submit_button(
+            "I have taken this trade — record campaign",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
         try:
-            result = record_superbrain_trade_taken(store, packet, selected["record_id"])
-            trade = result.get("trade", {}) or {}
-            st.success(f"Campaign recorded: {trade.get('trade_id', '')}")
-            st.session_state.public_superbrain_last = None
+            trade = _sb_record_selected_pending_entry(
+                store=store,
+                packet=packet,
+                setup_row=selected["row"],
+                evaluation=evaluation,
+                side=side,
+                contract_type=contract_type,
+                strike=strike,
+                expiry=expiry,
+                quantity=quantity,
+                note=note,
+            )
+            # Make the recorded campaign visible immediately; the next Scan now
+            # will refresh reasoning against this persisted exposure.
+            existing_open = [
+                x for x in (packet.get("open_trades") or [])
+                if str(x.get("trade_id", "") or "") != str(trade.get("trade_id", "") or "")
+            ]
+            existing_open.append(trade)
+            packet["open_trades"] = existing_open
+            st.session_state.public_superbrain_last = packet
+            st.session_state["superbrain_notice"] = (
+                f"Campaign recorded: {trade.get('trade_id', '')}. "
+                "SuperBrain will manage the recorded exposure from the next scan."
+            )
             st.rerun()
         except Exception as exc:
             st.error(f"Campaign could not be recorded: {type(exc).__name__}: {exc}")
-
 
 def render_public_superbrain() -> None:
     """Clean manual Level-3 scan terminal."""
@@ -1320,8 +1591,18 @@ def render_public_superbrain() -> None:
                 st.markdown("---")
 
         st.markdown("### Next new campaign")
-        # Do not present the already-entered originating setup as a new campaign.
-        pending_new = [x for x in pending if str(x.get("status", "")).upper() in {"PENDING_ENTRY", "BREAK_WATCH"}]
+        # Do not present an originating setup already linked to an active campaign.
+        active_setup_ids = set()
+        for active_trade in active:
+            amd = _sb_json((active_trade or {}).get("metadata_json", ""))
+            linked = str(amd.get("parent_setup_id") or amd.get("origin_setup_record_id") or amd.get("setup_record_id") or "").strip()
+            if linked:
+                active_setup_ids.add(linked)
+        pending_new = [
+            x for x in pending
+            if str(x.get("status", "")).upper() in {"PENDING_ENTRY", "BREAK_WATCH"}
+            and str(x.get("record_id", "") or "").strip() not in active_setup_ids
+        ]
         if pending_new:
             nxt = _sb_pending_event_text(pending_new[0])
             st.write(f"**{nxt['event']}**")
