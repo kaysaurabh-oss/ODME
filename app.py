@@ -1018,7 +1018,7 @@ def _sb_evaluate_pending_setup(row: Dict[str, Any], packet: Dict[str, Any]) -> D
     req = req_raw.upper()
     raw_remaining = [str(x) for x in (md.get("remaining_conditions") or []) if str(x).strip() and str(x).strip() != "ONLY ODME CHECK REMAINS"]
     # Legacy pending records may still carry old Pitchfork gate text. Pitchfork is
-    # now location-only and must never keep ENTRY READY on HOLD by itself.
+    # now location-only and must never keep ENTRY READY on WAIT by itself.
     remaining = [x for x in raw_remaining if not _sb_is_legacy_pitchfork_gate(x)]
     analysis = packet.get("analysis") or {}
     bias = _sb_odme_bias(packet)
@@ -1038,7 +1038,7 @@ def _sb_evaluate_pending_setup(row: Dict[str, Any], packet: Dict[str, Any]) -> D
     tv_details = [_sb_live_tv_condition_text(x, analysis) for x in remaining]
     odme_detail = _sb_odme_gate_text(req_raw, packet, satisfied)
     pf_detail = _sb_pitchfork_location_text(analysis, md.get("direction") or row.get("direction"))
-    status = "ENTRY READY" if not remaining and satisfied else "HOLD"
+    status = "ENTRY READY" if not remaining and satisfied else "WAIT"
     parts = []
     if tv_details:
         parts.extend(tv_details)
@@ -1101,12 +1101,12 @@ def _sb_next_market_event(analysis: Dict[str, Any]) -> Dict[str, str]:
         if side == "DEMAND":
             return {
                 "event": f"Demand interaction around {rng}",
-                "look": f"This {strength} demand zone is already qualified in the lower battlefield half. On interaction, HOLD keeps the normal long path alive; accepted break below shifts to the CE break campaign. OF, AURORA and ODME are evaluated automatically; Pitchfork is location/stretch guidance only."
+                "look": f"This {strength} demand zone is already qualified in the lower battlefield half. On interaction, WAIT keeps the normal long path alive; accepted break below shifts to the CE break campaign. OF, AURORA and ODME are evaluated automatically; Pitchfork is location/stretch guidance only."
             }
         if side == "SUPPLY":
             return {
                 "event": f"Supply interaction around {rng}",
-                "look": f"This {strength} supply zone is already qualified in the upper battlefield half. On interaction, HOLD keeps the normal short path alive; accepted break above shifts to the PE break campaign. OF, AURORA and ODME are evaluated automatically; Pitchfork is location/stretch guidance only."
+                "look": f"This {strength} supply zone is already qualified in the upper battlefield half. On interaction, WAIT keeps the normal short path alive; accepted break above shifts to the PE break campaign. OF, AURORA and ODME are evaluated automatically; Pitchfork is location/stretch guidance only."
             }
     waits = analysis.get("waiting_for") or []
     if waits:
@@ -1180,7 +1180,7 @@ def _sb_record_selected_pending_entry(
 
     The persisted setup is the authority. This intentionally does not require the
     current scan to expose trade_plan.kind == NEW; that old bridge gate is what
-    prevented legitimate user-confirmed pending/HOLD entries from being recorded.
+    prevented legitimate user-confirmed pending/WAIT entries from being recorded.
     """
     row = dict(setup_row or {})
     rid = str(row.get("record_id", "") or "").strip()
@@ -1398,7 +1398,7 @@ def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str,
         st.success("Selected setup is ENTRY READY on the current scan.")
     else:
         st.warning(
-            "Selected setup is still HOLD in SuperBrain. If you took it anyway, record the exact exposure you actually executed."
+            "Selected setup is still WAIT in SuperBrain. If you took it anyway, record the exact exposure you actually executed."
         )
         reason = str(evaluation.get("reason", "") or "").strip()
         if reason:
@@ -1599,7 +1599,7 @@ def render_public_superbrain() -> None:
                 if entry_eval["status"] == "ENTRY READY":
                     st.success(f"ENTRY READY — {entry_eval['reason']}")
                 else:
-                    st.warning(f"HOLD — {entry_eval['reason']}")
+                    st.warning(f"WAIT — {entry_eval['reason']}")
             else:
                 st.write(nxt["look"])
                 if nxt.get("odme"):
@@ -1659,7 +1659,7 @@ def render_public_superbrain() -> None:
                 if entry_eval["status"] == "ENTRY READY":
                     st.success(f"ENTRY READY — {entry_eval['reason']}")
                 else:
-                    st.warning(f"HOLD — {entry_eval['reason']}")
+                    st.warning(f"WAIT — {entry_eval['reason']}")
             else:
                 st.write(nxt["look"])
                 if nxt.get("odme"):
