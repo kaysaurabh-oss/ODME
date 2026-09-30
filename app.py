@@ -319,6 +319,23 @@ def _sb_render_odme(packet: Dict[str, Any]) -> None:
     va_low = _sb_first(odme, "value_area_low")
     va_high = _sb_first(odme, "value_area_high")
     st.write(f"**{tilt}**")
+    assessment = _sb_odme_assessment(packet)
+    direction = assessment.get("direction", "UNKNOWN")
+    strength = assessment.get("strength", "NONE")
+    control = assessment.get("control_quality", "UNKNOWN")
+    expansion_dir = assessment.get("expansion_direction", "NONE")
+    expansion_risk = assessment.get("expansion_risk", "LOW")
+    expression = assessment.get("preferred_expression", "NONE")
+    if direction in {"BULLISH", "BEARISH"}:
+        support_text = f"{strength} SUPPORT" if strength in {"STRONG", "WEAK"} else "NO SUPPORT"
+        directional_bits = [f"{direction} · {support_text}", f"{control} CONTROL"]
+        if expansion_dir != "NONE":
+            directional_bits.append(f"{expansion_dir} EXPANSION {expansion_risk}")
+        if expression != "NONE":
+            directional_bits.append(f"Preferred: {expression}")
+        st.markdown("**Directional read:** " + " · ".join(directional_bits))
+    elif direction == "NEUTRAL":
+        st.markdown("**Directional read:** NEUTRAL · NO DIRECTIONAL SUPPORT")
     level_bits = [f"POC {_sb_fmt_level(poc)}", f"CE wall {_sb_fmt_level(ce_wall)}", f"PE wall {_sb_fmt_level(pe_wall)}", f"Safer CE {_sb_fmt_level(safe_ce)}", f"Safer PE {_sb_fmt_level(safe_pe)}"]
     if va_low not in (None, "") and va_high not in (None, ""):
         level_bits.append(f"Value area {_sb_fmt_level(va_low)}–{_sb_fmt_level(va_high)}")
@@ -914,21 +931,173 @@ def _sb_pending_setups(store: Any, instrument: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def _sb_odme_bias(packet: Dict[str, Any]) -> str:
+def _sb_odme_score(odme: Dict[str, Any], nested_key: str, flat_key: str) -> float:
+    scores = odme.get("scores") if isinstance(odme.get("scores"), dict) else {}
+    value = scores.get(nested_key, odme.get(flat_key, 0))
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _sb_odme_assessment(packet: Dict[str, Any]) -> Dict[str, Any]:
+    """Interpret ODME regime separately from directional support.
+
+    A MIXED/RANGE headline must not erase a strong asymmetric options read.
+    Direction is established from the directional score imbalance (with the
+    explicit tilt retained as an override). Support strength is then upgraded
+    when same-direction expansion risk is high. Control quality remains MIXED
+    when ODME itself says there is no clean edge/control.
+    """
     odme = _sb_odme_data(packet)
     tilt = str(_sb_first(odme, "odme_tilt", "tilt") or "").upper().strip()
-    if not tilt:
-        return "UNKNOWN"
-    if "BULLISH" in tilt and "BEARISH" not in tilt:
-        return "BULLISH"
-    if "BEARISH" in tilt and "BULLISH" not in tilt:
-        return "BEARISH"
-    return "NEUTRAL"
+    if not odme and not tilt:
+        return {
+            "regime": "UNKNOWN", "direction": "UNKNOWN", "strength": "NONE",
+            "control_quality": "UNKNOWN", "expansion_direction": "NONE",
+            "expansion_risk": "LOW", "preferred_expression": "NONE",
+            "bullish_score": 0.0, "bearish_score": 0.0, "range_score": 0.0,
+            "expansion_score": 0.0,
+        }
+
+    bull = _sb_odme_score(odme, "Bullish", "bullish_score")
+    bear = _sb_odme_score(odme, "Bearish", "bearish_score")
+    range_score = _sb_odme_score(odme, "Range", "range_score")
+    expansion = _sb_odme_score(odme, "Expansion", "expansion_score")
+
+    commentary = " ".join(str(x or "") for x in [
+        _sb_first(odme, "commentary"),
+        _sb_first(odme, "final_action", "hero_action"),
+        _sb_first(odme, "ce_action"),
+        _sb_first(odme, "pe_action"),
+        _sb_first(odme, "premium_alert"),
+    ]).lower()
+
+    if "RANGE" in tilt:
+        regime = "RANGE"
+    elif "MIXED" in tilt or "NO CLEAN EDGE" in tilt:
+        regime = "MIXED"
+    elif "BULLISH" in tilt or "BEARISH" in tilt:
+        regime = "DIRECTIONAL"
+    else:
+        regime = "UNKNOWN"
+
+    explicit_bull = "BULLISH" in tilt and "BEARISH" not in tilt
+    explicit_bear = "BEARISH" in tilt and "BULLISH" not in tilt
+    if explicit_bull:
+        direction = "BULLISH"
+    elif explicit_bear:
+        direction = "BEARISH"
+    elif bear >= 55 and bear >= bull + 20:
+        direction = "BEARISH"
+    elif bull >= 55 and bull >= bear + 20:
+        direction = "BULLISH"
+    else:
+        bearish_text = any(x in commentary for x in (
+            "cleaner bearish condition", "downside expansion", "downside stress",
+            "overhead pressure", "pe side is not clean support", "put writers covering",
+        ))
+        bullish_text = any(x in commentary for x in (
+            "cleaner bullish condition", "upside expansion", "upside stress",
+            "underlying support", "ce side is not clean resistance", "call writers covering",
+        ))
+        if bearish_text and not bullish_text:
+            direction = "BEARISH"
+        elif bullish_text and not bearish_text:
+            direction = "BULLISH"
+        else:
+            direction = "NEUTRAL"
+
+    if expansion >= 75:
+        expansion_risk = "HIGH"
+    elif expansion >= 55:
+        expansion_risk = "ELEVATED"
+    elif expansion >= 35:
+        expansion_risk = "WATCH"
+    else:
+        expansion_risk = "LOW"
+
+    if direction == "BEARISH":
+        directional_score, opposing_score = bear, bull
+        expansion_direction = "DOWNSIDE" if expansion >= 35 else "NONE"
+        preferred_expression = "SELL CE"
+        confirming_text = any(x in commentary for x in (
+            "cleaner bearish condition", "ce pressure is valid", "ce selling is acceptable",
+            "downside stress", "put writers covering", "pe side is not clean support",
+        ))
+    elif direction == "BULLISH":
+        directional_score, opposing_score = bull, bear
+        expansion_direction = "UPSIDE" if expansion >= 35 else "NONE"
+        preferred_expression = "SELL PE"
+        confirming_text = any(x in commentary for x in (
+            "cleaner bullish condition", "pe pressure is valid", "pe selling is acceptable",
+            "upside stress", "call writers covering", "ce side is not clean resistance",
+        ))
+    else:
+        directional_score = opposing_score = 0.0
+        expansion_direction = "NONE"
+        preferred_expression = "NONE"
+        confirming_text = False
+
+    strength = "NONE"
+    if direction in {"BULLISH", "BEARISH"}:
+        # High same-direction expansion is STRONG support even when the headline
+        # regime remains MIXED / NO CLEAN EDGE. Direction must already be clear.
+        if (
+            expansion >= 75
+            and directional_score >= 70
+            and directional_score >= opposing_score + 25
+        ) or (
+            directional_score >= 85
+            and directional_score >= opposing_score + 30
+            and confirming_text
+        ):
+            strength = "STRONG"
+        else:
+            strength = "WEAK"
+
+    mixed_control_terms = (
+        "no clean edge", "not clean bearish control", "not clean bullish control",
+        "not clean control", "mixed",
+    )
+    control_quality = "MIXED" if regime in {"MIXED", "RANGE"} or any(x in commentary for x in mixed_control_terms) else "CLEAN"
+
+    return {
+        "regime": regime,
+        "direction": direction,
+        "strength": strength,
+        "control_quality": control_quality,
+        "expansion_direction": expansion_direction,
+        "expansion_risk": expansion_risk,
+        "preferred_expression": preferred_expression,
+        "bullish_score": bull,
+        "bearish_score": bear,
+        "range_score": range_score,
+        "expansion_score": expansion,
+    }
+
+
+def _sb_odme_bias(packet: Dict[str, Any]) -> str:
+    # Compatibility wrapper: callers that only need direction still receive it,
+    # but the direction now comes from the full ODME assessment rather than the
+    # headline tilt alone.
+    return str(_sb_odme_assessment(packet).get("direction") or "UNKNOWN")
 
 
 def _sb_odme_label(packet: Dict[str, Any]) -> str:
     odme = _sb_odme_data(packet)
     return str(_sb_first(odme, "odme_tilt", "tilt") or "NO ODME READ").upper()
+
+
+def _sb_odme_support_label(packet: Dict[str, Any]) -> str:
+    a = _sb_odme_assessment(packet)
+    direction = a.get("direction", "UNKNOWN")
+    strength = a.get("strength", "NONE")
+    if direction in {"BULLISH", "BEARISH"} and strength in {"STRONG", "WEAK"}:
+        return f"{strength} {direction} SUPPORT"
+    if direction == "NEUTRAL":
+        return "NEUTRAL / NO DIRECTIONAL SUPPORT"
+    return "ODME DIRECTION UNKNOWN"
 
 
 def _sb_is_legacy_pitchfork_gate(condition: str) -> bool:
@@ -991,25 +1160,47 @@ def _sb_live_tv_condition_text(condition: str, analysis: Dict[str, Any]) -> str:
 def _sb_odme_gate_text(requirement: str, packet: Dict[str, Any], satisfied: bool) -> str:
     req = str(requirement or "").upper().strip()
     label = _sb_odme_label(packet)
-    bias = _sb_odme_bias(packet)
-    if bias == "UNKNOWN":
+    a = _sb_odme_assessment(packet)
+    direction = str(a.get("direction") or "UNKNOWN")
+    strength = str(a.get("strength") or "NONE")
+    control = str(a.get("control_quality") or "UNKNOWN")
+    expansion_dir = str(a.get("expansion_direction") or "NONE")
+    expansion_risk = str(a.get("expansion_risk") or "LOW")
+    expression = str(a.get("preferred_expression") or "NONE")
+
+    if direction == "UNKNOWN":
         return f"ODME is {label}; the ODME gate cannot be confirmed on this scan."
+
+    support_phrase = ""
+    if direction in {"BULLISH", "BEARISH"}:
+        support_phrase = f"{strength.lower()} {direction.lower()} support" if strength in {"STRONG", "WEAK"} else f"{direction.lower()} direction"
+    else:
+        support_phrase = "neutral / no directional support"
+
+    extras = []
+    if expansion_dir != "NONE" and expansion_risk in {"HIGH", "ELEVATED"}:
+        extras.append(f"{expansion_dir.lower()} expansion risk is {expansion_risk.lower()}")
+    if expression != "NONE":
+        extras.append(f"{expression} preferred")
+    extras.append(f"{control.lower()} control")
+    context = "; ".join(extras)
+
     if not req:
-        return f"ODME is {label}; no additional ODME gate is required."
+        return f"ODME: {support_phrase}; {context}. No additional ODME gate is required."
     if "LONG_NOT_OPPOSING" in req:
-        return (f"ODME is {label}; it is not bearish, so the LONG non-opposition gate is satisfied."
-                if satisfied else f"ODME is {label}; it is bearish, so the LONG non-opposition gate is not satisfied.")
+        return (f"ODME: {support_phrase}; {context}. LONG non-opposition gate is satisfied."
+                if satisfied else f"ODME: {support_phrase}; {context}. LONG non-opposition gate is not satisfied because ODME is bearish.")
     if "SHORT_NOT_OPPOSING" in req:
-        return (f"ODME is {label}; it is not bullish, so the SHORT non-opposition gate is satisfied."
-                if satisfied else f"ODME is {label}; it is bullish, so the SHORT non-opposition gate is not satisfied.")
+        return (f"ODME: {support_phrase}; {context}. SHORT non-opposition gate is satisfied."
+                if satisfied else f"ODME: {support_phrase}; {context}. SHORT non-opposition gate is not satisfied because ODME is bullish.")
     if "LONG_SUPPORTS" in req or "BULLISH ODME SUPPORT" in req:
-        return (f"ODME is {label}; bullish ODME support is present and LONG_SUPPORTS is satisfied."
-                if satisfied else f"ODME is {label}; bullish ODME support is not present, so LONG_SUPPORTS is not satisfied.")
+        return (f"ODME: {support_phrase}; {context}. LONG_SUPPORTS is satisfied."
+                if satisfied else f"ODME: {support_phrase}; {context}. LONG_SUPPORTS is not satisfied.")
     if "SHORT_SUPPORTS" in req or "BEARISH ODME SUPPORT" in req:
-        return (f"ODME is {label}; bearish ODME support is present and SHORT_SUPPORTS is satisfied."
-                if satisfied else f"ODME is {label}; bearish ODME support is not present, so SHORT_SUPPORTS is not satisfied.")
-    return (f"ODME is {label}; the stored ODME requirement is satisfied."
-            if satisfied else f"ODME is {label}; the stored ODME requirement ({requirement}) is not positively satisfied by this scan.")
+        return (f"ODME: {support_phrase}; {context}. SHORT_SUPPORTS is satisfied."
+                if satisfied else f"ODME: {support_phrase}; {context}. SHORT_SUPPORTS is not satisfied.")
+    return (f"ODME: {support_phrase}; {context}. The stored ODME requirement is satisfied."
+            if satisfied else f"ODME: {support_phrase}; {context}. The stored ODME requirement ({requirement}) is not positively satisfied by this scan.")
 
 
 def _sb_evaluate_pending_setup(row: Dict[str, Any], packet: Dict[str, Any]) -> Dict[str, Any]:
@@ -1021,7 +1212,9 @@ def _sb_evaluate_pending_setup(row: Dict[str, Any], packet: Dict[str, Any]) -> D
     # now location-only and must never keep ENTRY READY on WAIT by itself.
     remaining = [x for x in raw_remaining if not _sb_is_legacy_pitchfork_gate(x)]
     analysis = packet.get("analysis") or {}
-    bias = _sb_odme_bias(packet)
+    assessment = _sb_odme_assessment(packet)
+    bias = str(assessment.get("direction") or "UNKNOWN")
+    support_strength = str(assessment.get("strength") or "NONE")
 
     satisfied = False
     if "LONG_NOT_OPPOSING" in req:
@@ -1029,9 +1222,12 @@ def _sb_evaluate_pending_setup(row: Dict[str, Any], packet: Dict[str, Any]) -> D
     elif "SHORT_NOT_OPPOSING" in req:
         satisfied = bias in {"BEARISH", "NEUTRAL"}
     elif "LONG_SUPPORTS" in req or "BULLISH ODME SUPPORT" in req:
-        satisfied = bias == "BULLISH"
+        # Both WEAK and STRONG same-direction support satisfy the support gate.
+        satisfied = bias == "BULLISH" and support_strength in {"WEAK", "STRONG"}
     elif "SHORT_SUPPORTS" in req or "BEARISH ODME SUPPORT" in req:
-        satisfied = bias == "BEARISH"
+        # High downside expansion can produce STRONG bearish support even when
+        # the ODME regime remains MIXED / NO CLEAN EDGE.
+        satisfied = bias == "BEARISH" and support_strength in {"WEAK", "STRONG"}
     elif not req:
         satisfied = True
 
@@ -1051,6 +1247,8 @@ def _sb_evaluate_pending_setup(row: Dict[str, Any], packet: Dict[str, Any]) -> D
         "status": status,
         "reason": reason,
         "odme_bias": bias,
+        "odme_strength": support_strength,
+        "odme_assessment": assessment,
         "odme_label": _sb_odme_label(packet),
         "odme_satisfied": satisfied,
         "tv_satisfied": not remaining,
@@ -1633,7 +1831,9 @@ def render_public_superbrain() -> None:
                 st.write(f"**Behavior now:** {now}")
             st.caption(f"Expected: {expected}")
             st.write(f"**Next management event:** {_sb_campaign_management(trade, setup)}")
-            st.caption(f"ODME now: {_sb_odme_bias(packet)} · {_sb_campaign_option_question(trade, setup)}")
+            odme_a = _sb_odme_assessment(packet)
+            odme_now = f"{odme_a.get('direction', 'UNKNOWN')} · {odme_a.get('strength', 'NONE')} SUPPORT · {odme_a.get('control_quality', 'UNKNOWN')} CONTROL"
+            st.caption(f"ODME now: {odme_now} · {_sb_campaign_option_question(trade, setup)}")
             _sb_render_management_confirmation(store, packet, trade, setup, analysis)
             if i < len(active) - 1:
                 st.markdown("---")
