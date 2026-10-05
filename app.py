@@ -660,11 +660,13 @@ def _sb_render_management_confirmation(
     trade: Dict[str, Any],
     setup: Dict[str, Any],
     analysis: Dict[str, Any],
+    final_decisions: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """User confirmation layer for rolls/adds/closes/resizes on an active campaign."""
     trade_id = str(trade.get("trade_id") or trade.get("record_id") or "campaign").strip()
     active_legs = _sb_active_leg_rows(trade)
-    recommendation = _sb_management_recommendation(trade, setup, analysis)
+    decision_lines = [_sb_campaign_decision_line(x) for x in (final_decisions or [])]
+    recommendation = " ".join(decision_lines) if decision_lines else "No strike-ladder adjustment is recommended on this scan."
 
     with st.expander("I did a management adjustment", expanded=False):
         st.caption(
@@ -1075,6 +1077,314 @@ def _sb_odme_assessment(packet: Dict[str, Any]) -> Dict[str, Any]:
         "range_score": range_score,
         "expansion_score": expansion,
     }
+
+
+
+def _sb_num(value: Any) -> Optional[float]:
+    try:
+        if value in (None, ""):
+            return None
+        n = float(value)
+        return n if n == n else None
+    except Exception:
+        return None
+
+
+def _sb_level_zone(label: str, low: Any, high: Any = None, source: str = "", strength: str = "") -> Optional[Dict[str, Any]]:
+    lo = _sb_num(low)
+    hi = _sb_num(high if high is not None else low)
+    if lo is None or hi is None:
+        return None
+    if lo > hi:
+        lo, hi = hi, lo
+    return {
+        "low": lo,
+        "high": hi,
+        "labels": [str(label or source or "Level").strip()],
+        "sources": [str(source or label or "LEVEL").strip()],
+        "strengths": [str(strength or "").strip()] if str(strength or "").strip() else [],
+    }
+
+
+def _sb_merge_level_groups(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge only truly overlapping hurdles so confluence is not double-counted."""
+    groups: List[Dict[str, Any]] = []
+    for item in sorted(items, key=lambda x: (float(x["low"]), float(x["high"]))):
+        current = {
+            "low": float(item["low"]),
+            "high": float(item["high"]),
+            "labels": list(item.get("labels") or []),
+            "sources": list(item.get("sources") or []),
+            "strengths": list(item.get("strengths") or []),
+        }
+        if groups and current["low"] <= float(groups[-1]["high"]):
+            hit = groups[-1]
+            hit["low"] = min(float(hit["low"]), current["low"])
+            hit["high"] = max(float(hit["high"]), current["high"])
+            for key in ("labels", "sources", "strengths"):
+                for value in current.get(key) or []:
+                    if value and value not in hit[key]:
+                        hit[key].append(value)
+        else:
+            groups.append(current)
+    return groups
+
+
+def _sb_combined_level_ladder(packet: Dict[str, Any], analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the final-scan hurdle ladder from TV structure + ODME levels.
+
+    FP zones and Defender/Challenger are kept as ranges. ODME POC/walls/safer
+    strikes are exact point levels. A point that sits inside a structural zone is
+    merged into that same hurdle so it does not falsely create an extra level.
+    """
+    price = _sb_num((analysis or {}).get("price"))
+    if price is None:
+        return {"price": None, "above": [], "below": [], "at_price": []}
+
+    raw: List[Dict[str, Any]] = []
+
+    # EDGE qualified FP hurdles.
+    for h in (analysis or {}).get("hurdles") or []:
+        side = str((h or {}).get("side") or "FP").upper()
+        strength = str((h or {}).get("strength") or "").strip()
+        label = f"FP {side.title()}"
+        z = _sb_level_zone(label, (h or {}).get("low"), (h or {}).get("high"), source="FP", strength=strength)
+        if z:
+            raw.append(z)
+
+    # Strategic EDGE map levels. They may overlap a FP; the merge preserves
+    # confluence without counting the same price barrier twice.
+    for role in ("defender", "challenger"):
+        zraw = (analysis or {}).get(role) or {}
+        side = str(zraw.get("side") or "").upper()
+        role_label = role.title() + (f" {side.title()}" if side else "")
+        z = _sb_level_zone(role_label, zraw.get("low"), zraw.get("high"), source=role.upper())
+        if z:
+            raw.append(z)
+
+    odme = _sb_odme_data(packet)
+    odme_points = [
+        ("ODME POC", _sb_first(odme, "option_poc", "poc"), "POC"),
+        ("CE Wall", _sb_first(odme, "active_ce_wall", "ce_wall"), "CE_WALL"),
+        ("PE Wall", _sb_first(odme, "active_pe_wall", "pe_wall"), "PE_WALL"),
+        ("Safer CE", _sb_first(odme, "safer_sell_ce", "safe_ce"), "SAFER_CE"),
+        ("Safer PE", _sb_first(odme, "safer_sell_pe", "safe_pe"), "SAFER_PE"),
+    ]
+    for label, value, source in odme_points:
+        z = _sb_level_zone(label, value, source=source)
+        if z:
+            raw.append(z)
+
+    groups = _sb_merge_level_groups(raw)
+    above: List[Dict[str, Any]] = []
+    below: List[Dict[str, Any]] = []
+    at_price: List[Dict[str, Any]] = []
+    for g in groups:
+        if float(g["low"]) > price:
+            g["side"] = "ABOVE"
+            g["approach"] = float(g["low"])
+            g["far"] = float(g["high"])
+            above.append(g)
+        elif float(g["high"]) < price:
+            g["side"] = "BELOW"
+            g["approach"] = float(g["high"])
+            g["far"] = float(g["low"])
+            below.append(g)
+        else:
+            g["side"] = "AT_PRICE"
+            g["approach"] = price
+            g["far"] = price
+            at_price.append(g)
+
+    above.sort(key=lambda x: (float(x["approach"]), float(x["far"])))
+    below.sort(key=lambda x: (-float(x["approach"]), -float(x["far"])))
+    for seq in (above, below):
+        for idx, g in enumerate(seq, start=1):
+            g["rank"] = idx
+
+    return {"price": price, "above": above, "below": below, "at_price": at_price}
+
+
+def _sb_level_group_text(group: Optional[Dict[str, Any]], with_rank: bool = True) -> str:
+    if not group:
+        return "not available"
+    lo = float(group.get("low"))
+    hi = float(group.get("high"))
+    rng = _sb_fmt_level(lo) if abs(hi - lo) < 1e-12 else f"{_sb_fmt_level(lo)}–{_sb_fmt_level(hi)}"
+    labels = " + ".join(group.get("labels") or [])
+    rank = f"L{group.get('rank')} " if with_rank and group.get("rank") else ""
+    return f"{rank}{rng}" + (f" ({labels})" if labels else "")
+
+
+def _sb_strike_relation(strike: float, ladder: List[Dict[str, Any]], option_type: str) -> Dict[str, Any]:
+    """Locate a sold strike against the ordered structural hurdle ladder."""
+    opt = str(option_type or "").upper()
+    passed = 0
+    inside_rank = None
+    before_rank = None
+    for g in ladder:
+        lo, hi, rank = float(g["low"]), float(g["high"]), int(g.get("rank") or 0)
+        if opt == "CE":
+            if lo <= strike <= hi:
+                inside_rank = rank
+                break
+            if strike > hi:
+                passed = max(passed, rank)
+                continue
+            before_rank = rank
+            break
+        if opt == "PE":
+            if lo <= strike <= hi:
+                inside_rank = rank
+                break
+            if strike < lo:
+                passed = max(passed, rank)
+                continue
+            before_rank = rank
+            break
+    if inside_rank:
+        if inside_rank > 3:
+            text = f"beyond L3 (within L{inside_rank})"
+        else:
+            text = f"within L{inside_rank}"
+    elif passed >= 3:
+        text = "beyond L3" + (f", before L{before_rank}" if before_rank and before_rank > 3 else "")
+    elif passed:
+        if before_rank:
+            text = f"beyond L{passed}, before L{before_rank}"
+        else:
+            text = f"beyond L{passed}"
+    elif before_rank:
+        text = f"inside the path before L{before_rank}"
+    else:
+        text = "outside the mapped ladder"
+    return {"passed": passed, "inside_rank": inside_rank, "before_rank": before_rank, "text": text}
+
+
+def _sb_campaign_final_decisions(packet: Dict[str, Any], trade: Dict[str, Any], setup: Dict[str, Any], analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return decisive final-scan management for active short-option legs.
+
+    Strong same-direction ODME permits protection at L2. Weak same-direction or
+    neutral ODME requires L3. Opposing ODME also requires L3 and never permits a
+    roll inward; if the ODME safer strike is farther than L3, that safer boundary
+    becomes the required target.
+    """
+    ladder_map = _sb_combined_level_ladder(packet, analysis)
+    odme_a = _sb_odme_assessment(packet)
+    odme_dir = str(odme_a.get("direction") or "NEUTRAL").upper()
+    odme_strength = str(odme_a.get("strength") or "NONE").upper()
+    odme_control = str(odme_a.get("control_quality") or "UNKNOWN").upper()
+    odme = _sb_odme_data(packet)
+    decisions: List[Dict[str, Any]] = []
+
+    for row in _sb_active_leg_rows(trade):
+        leg = row.get("leg") or {}
+        side = str(leg.get("side") or "").upper()
+        opt = str(leg.get("option_type") or leg.get("option") or leg.get("instrument_type") or "").upper()
+        strike = _sb_num(leg.get("strike"))
+        if side != "SELL" or opt not in {"CE", "PE"} or strike is None:
+            continue
+
+        ladder = ladder_map["above"] if opt == "CE" else ladder_map["below"]
+        expected_odme = "BEARISH" if opt == "CE" else "BULLISH"
+        same_direction = odme_dir == expected_odme
+        opposing = odme_dir in {"BULLISH", "BEARISH"} and odme_dir != expected_odme
+
+        if same_direction and odme_strength == "STRONG":
+            required_rank = 2
+            posture = "STRONG_SUPPORT"
+        elif same_direction:
+            required_rank = 3
+            posture = "WEAK_SUPPORT"
+        elif opposing:
+            required_rank = 3
+            posture = "OPPOSING"
+        else:
+            required_rank = 3
+            posture = "NEUTRAL"
+
+        target_group = ladder[required_rank - 1] if len(ladder) >= required_rank else (ladder[-1] if ladder else None)
+        relation = _sb_strike_relation(strike, ladder, opt)
+        target = float(target_group["far"]) if target_group else None
+        target_label = f"L{required_rank}" if target_group and len(ladder) >= required_rank else (f"L{target_group.get('rank')}" if target_group else "")
+
+        # When ODME actively opposes the campaign, the explicit safer strike is a
+        # hard minimum protection boundary if it lies farther than mapped L3.
+        safer = _sb_num(_sb_first(odme, "safer_sell_ce", "safe_ce") if opt == "CE" else _sb_first(odme, "safer_sell_pe", "safe_pe"))
+        if opposing and safer is not None and target is not None:
+            if opt == "CE" and safer > target:
+                target = safer
+                target_label = "ODME safer CE beyond L3"
+            elif opt == "PE" and safer < target:
+                target = safer
+                target_label = "ODME safer PE beyond L3"
+        elif opposing and target is None and safer is not None:
+            target = safer
+            target_label = f"ODME safer {opt}"
+
+        action = "HOLD"
+        reason = ""
+        if target is None:
+            action = "HOLD"
+            reason = "No valid structural roll target is available on this scan; do not move the strike closer."
+        elif opt == "CE":
+            underprotected = strike < target - 1e-9
+            if underprotected:
+                action = "ROLL FARTHER"
+                reason = f"Current CE is not beyond the required {target_label} protection."
+            elif same_direction and odme_strength == "STRONG" and relation.get("passed", 0) >= 3 and required_rank == 2:
+                action = "ROLL IN"
+                reason = "Strong bearish ODME allows the campaign to use L2 protection; the current CE is at least one full hurdle farther away."
+            else:
+                reason = f"Current CE already satisfies the required {target_label} protection."
+        else:  # PE
+            underprotected = strike > target + 1e-9
+            if underprotected:
+                action = "ROLL FARTHER"
+                reason = f"Current PE is not beyond the required {target_label} protection."
+            elif same_direction and odme_strength == "STRONG" and relation.get("passed", 0) >= 3 and required_rank == 2:
+                action = "ROLL IN"
+                reason = "Strong bullish ODME allows the campaign to use L2 protection; the current PE is at least one full hurdle farther away."
+            else:
+                reason = f"Current PE already satisfies the required {target_label} protection."
+
+        # Never recommend rolling inward when ODME is neutral/opposing/only weak.
+        if action == "ROLL IN" and not (same_direction and odme_strength == "STRONG"):
+            action = "HOLD"
+            reason = "ODME does not justify moving the strike closer."
+
+        l2 = ladder[1] if len(ladder) >= 2 else None
+        l3 = ladder[2] if len(ladder) >= 3 else None
+        decisions.append({
+            "leg_id": row.get("leg_id"),
+            "option_type": opt,
+            "strike": strike,
+            "action": action,
+            "target": target,
+            "target_label": target_label,
+            "relation": relation.get("text"),
+            "required_rank": required_rank,
+            "posture": posture,
+            "reason": reason,
+            "odme_direction": odme_dir,
+            "odme_strength": odme_strength,
+            "odme_control": odme_control,
+            "l2": l2,
+            "l3": l3,
+            "ladder": ladder,
+        })
+
+    return decisions
+
+
+def _sb_campaign_decision_line(decision: Dict[str, Any]) -> str:
+    action = str(decision.get("action") or "HOLD").upper()
+    strike = _sb_fmt_level(decision.get("strike"))
+    opt = str(decision.get("option_type") or "").upper()
+    target = decision.get("target")
+    if action in {"ROLL IN", "ROLL FARTHER"} and target is not None:
+        return f"{action} — move {strike} {opt} to {decision.get('target_label')} {_sb_fmt_level(target)}."
+    return f"HOLD {strike} {opt}."
 
 
 def _sb_odme_bias(packet: Dict[str, Any]) -> str:
@@ -1809,6 +2119,17 @@ def render_public_superbrain() -> None:
     else:
         st.markdown("### Active campaign")
         st.caption(_sb_current_market_line(analysis))
+        final_level_map = _sb_combined_level_ladder(packet, analysis)
+        above_l2 = final_level_map.get("above", [])[1] if len(final_level_map.get("above", [])) >= 2 else None
+        above_l3 = final_level_map.get("above", [])[2] if len(final_level_map.get("above", [])) >= 3 else None
+        below_l2 = final_level_map.get("below", [])[1] if len(final_level_map.get("below", [])) >= 2 else None
+        below_l3 = final_level_map.get("below", [])[2] if len(final_level_map.get("below", [])) >= 3 else None
+        st.caption(
+            "Final level map — Above: L2 " + _sb_level_group_text(above_l2, with_rank=False)
+            + " | L3 " + _sb_level_group_text(above_l3, with_rank=False)
+            + " · Below: L2 " + _sb_level_group_text(below_l2, with_rank=False)
+            + " | L3 " + _sb_level_group_text(below_l3, with_rank=False)
+        )
         for i, trade in enumerate(active):
             setup = _sb_setup_for_trade(store, trade)
             tmd = _sb_json(trade.get("metadata_json", ""))
@@ -1830,11 +2151,33 @@ def render_public_superbrain() -> None:
             else:
                 st.write(f"**Behavior now:** {now}")
             st.caption(f"Expected: {expected}")
-            st.write(f"**Next management event:** {_sb_campaign_management(trade, setup)}")
-            odme_a = _sb_odme_assessment(packet)
-            odme_now = f"{odme_a.get('direction', 'UNKNOWN')} · {odme_a.get('strength', 'NONE')} SUPPORT · {odme_a.get('control_quality', 'UNKNOWN')} CONTROL"
-            st.caption(f"ODME now: {odme_now} · {_sb_campaign_option_question(trade, setup)}")
-            _sb_render_management_confirmation(store, packet, trade, setup, analysis)
+
+            final_decisions = _sb_campaign_final_decisions(packet, trade, setup, analysis)
+            if final_decisions:
+                for decision in final_decisions:
+                    action = str(decision.get("action") or "HOLD").upper()
+                    decision_line = _sb_campaign_decision_line(decision)
+                    if action == "ROLL FARTHER":
+                        st.error(f"**Campaign decision: {decision_line}**")
+                    elif action == "ROLL IN":
+                        st.success(f"**Campaign decision: {decision_line}**")
+                    else:
+                        st.info(f"**Campaign decision: {decision_line}**")
+
+                    st.write(
+                        f"Current {_sb_fmt_level(decision.get('strike'))} {decision.get('option_type')} is "
+                        f"{decision.get('relation')}. "
+                        f"ODME is {decision.get('odme_direction')} · {decision.get('odme_strength')} support · "
+                        f"{decision.get('odme_control')} control. {decision.get('reason')}"
+                    )
+                    l2_text = _sb_level_group_text(decision.get("l2"))
+                    l3_text = _sb_level_group_text(decision.get("l3"))
+                    side_word = "above" if str(decision.get("option_type")).upper() == "CE" else "below"
+                    st.caption(f"Protection ladder {side_word} price: L2 {l2_text.replace('L2 ', '', 1)} | L3 {l3_text.replace('L3 ', '', 1)}")
+            else:
+                st.info("Campaign decision: HOLD — no active sold CE/PE leg with a valid strike requires strike-ladder management on this scan.")
+
+            _sb_render_management_confirmation(store, packet, trade, setup, analysis, final_decisions=final_decisions)
             if i < len(active) - 1:
                 st.markdown("---")
 
