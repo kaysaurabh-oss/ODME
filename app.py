@@ -661,11 +661,21 @@ def _sb_render_management_confirmation(
     setup: Dict[str, Any],
     analysis: Dict[str, Any],
     final_decisions: Optional[List[Dict[str, Any]]] = None,
+    companion_action: Optional[Dict[str, Any]] = None,
 ) -> None:
     """User confirmation layer for rolls/adds/closes/resizes on an active campaign."""
     trade_id = str(trade.get("trade_id") or trade.get("record_id") or "campaign").strip()
     active_legs = _sb_active_leg_rows(trade)
     decision_lines = [_sb_campaign_decision_line(x) for x in (final_decisions or [])]
+    if companion_action:
+        c_action = str(companion_action.get("action") or "WATCH").upper()
+        c_opt = str(companion_action.get("option_type") or "").upper()
+        c_rank = companion_action.get("rank")
+        c_strike = companion_action.get("strike")
+        if c_action == "ADD" and c_strike is not None:
+            decision_lines.append(f"ADD / SELL {_sb_fmt_level(c_strike)} {c_opt} at L{c_rank}.")
+        else:
+            decision_lines.append(f"{c_action} {c_opt} at L{c_rank}.")
     recommendation = " ".join(decision_lines) if decision_lines else "No strike-ladder adjustment is recommended on this scan."
 
     with st.expander("I did a management adjustment", expanded=False):
@@ -821,7 +831,23 @@ def _sb_current_market_line(analysis: Dict[str, Any]) -> str:
     return f"Price {_sb_fmt_level(price)} | Macro {macro} | OF {of} | AURORA {aura} | Pitchfork {pf} | Battlefield {half}"
 
 
-def _sb_location_line(analysis: Dict[str, Any]) -> str:
+def _sb_location_line(analysis: Dict[str, Any], packet: Optional[Dict[str, Any]] = None) -> str:
+    # Prefer the same authoritative all-source ladder used for L1/L2/L3 decisions.
+    if packet:
+        try:
+            level_map = _sb_combined_level_ladder(packet, analysis)
+            if level_map.get("level_rank_reliable"):
+                above = level_map.get("above") or []
+                below = level_map.get("below") or []
+                a1 = above[0] if above else None
+                b1 = below[0] if below else None
+                return (
+                    "Nearest ranked levels — Above L1 " + _sb_level_group_text(a1, with_rank=False)
+                    + " | Below L1 " + _sb_level_group_text(b1, with_rank=False)
+                )
+        except Exception:
+            pass
+
     price = analysis.get("price")
     hurdles = analysis.get("hurdles") or []
     ranked = []
@@ -846,7 +872,6 @@ def _sb_location_line(analysis: Dict[str, Any]) -> str:
     if challenger.get("low") not in (None, "") and challenger.get("high") not in (None, ""):
         bits.append(f"Challenger {_sb_fmt_level(challenger.get('low'))}–{_sb_fmt_level(challenger.get('high'))}")
     return " | ".join(bits) or "No nearby qualified FP zone."
-
 
 def _sb_hidden_line(analysis: Dict[str, Any]) -> str:
     bits = []
@@ -1148,18 +1173,21 @@ def _sb_boolish(value: Any) -> bool:
         return bool(value)
     return str(value or "").strip().upper() in {"TRUE", "YES", "Y", "1", "ACTIVE"}
 
-def _sb_authoritative_edge_hurdle_book(packet: Dict[str, Any]) -> Dict[str, Any]:
-    """Read the exact EDGE hurdle export from the authoritative execution row.
+def _sb_authoritative_edge_context(packet: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the authoritative current EDGE row plus exact structural context.
 
-    The bridge already returns the current TV rows in the scan packet. Prefer the
-    EDGE row whose chart TF equals edge_required_exec_tf; this prevents an older
-    handoff TF (for example 60m while required TF is 3m) from supplying stale
-    hurdles. The raw book is the full Moderate+ exit-eligible hurdle export and is
-    therefore more complete for final level ranking than analysis['hurdles'].
+    Prefer the ACTIVE EDGE row whose chart TF equals the required execution TF.
+    Defender/Challenger and the one-sided FP book are read from that same row so
+    an old handoff row cannot contaminate the final level map.
     """
     tv_rows = (packet or {}).get("tv_rows")
     if tv_rows is None:
-        return {"available": False, "hurdles": [], "exec_tf": "", "lowest_tf": False, "paired": None}
+        return {
+            "available": False, "row": {}, "raw": {}, "price": None, "exec_tf": "",
+            "paired": None, "defender": {}, "challenger": {}, "hurdles": [],
+            "book_available": False, "one_sided_side": "", "eligibility": "",
+            "warning": "", "context_note": "",
+        }
 
     try:
         if hasattr(tv_rows, "to_dict"):
@@ -1173,169 +1201,362 @@ def _sb_authoritative_edge_hurdle_book(packet: Dict[str, Any]) -> Dict[str, Any]
 
     edge_rows = [r for r in rows if str((r or {}).get("source") or "").strip().upper() == "EDGE"]
     if not edge_rows:
-        return {"available": False, "hurdles": [], "exec_tf": "", "lowest_tf": False, "paired": None}
+        return {
+            "available": False, "row": {}, "raw": {}, "price": None, "exec_tf": "",
+            "paired": None, "defender": {}, "challenger": {}, "hurdles": [],
+            "book_available": False, "one_sided_side": "", "eligibility": "",
+            "warning": "", "context_note": "",
+        }
 
-    def score(row: Dict[str, Any]) -> tuple:
+    def row_score(row: Dict[str, Any]) -> tuple:
         tf = _sb_tf_key(row.get("tf"))
         req = _sb_tf_key(row.get("edge_required_exec_tf") or row.get("exec_tf"))
         tracking = str(row.get("edge_tracking_state") or "").strip().upper()
         raw = _sb_json(row.get("raw_json"))
         has_book = isinstance(raw.get("fp_hurdle_book"), dict)
+        close_ms = _sb_num(row.get("bar_time")) or 0.0
         return (
             1 if tf and req and tf == req else 0,
             1 if tracking == "ACTIVE" else 0,
             1 if has_book else 0,
+            close_ms,
         )
 
-    row = sorted(edge_rows, key=score, reverse=True)[0]
+    row = sorted(edge_rows, key=row_score, reverse=True)[0]
     raw = _sb_json(row.get("raw_json"))
     book = raw.get("fp_hurdle_book") if isinstance(raw.get("fp_hurdle_book"), dict) else None
     exec_tf = _sb_tf_key(row.get("edge_required_exec_tf") or row.get("exec_tf") or row.get("tf"))
-    try:
-        tf_num = float(exec_tf)
-    except Exception:
-        tf_num = None
-    lowest_tf = tf_num is not None and tf_num <= 3
-    paired = _sb_boolish(row.get("battlefield_paired")) if row.get("battlefield_paired") not in (None, "") else None
+    price = _sb_num(row.get("close"))
 
-    if book is None:
-        return {"available": False, "hurdles": [], "exec_tf": exec_tf, "lowest_tf": lowest_tf, "paired": paired}
+    def role_zone(role: str) -> Dict[str, Any]:
+        side = str(row.get(f"{role}_side") or "").strip().upper()
+        state = str(row.get(f"{role}_state") or "").strip().upper()
+        low = _sb_num(row.get(f"{role}_low"))
+        high = _sb_num(row.get(f"{role}_high"))
+        if side not in {"DEMAND", "SUPPLY"} or state == "NONE" or low is None or high is None:
+            return {}
+        if low > high:
+            low, high = high, low
+        # For hurdle ranking the strategic role contributes ONE exact distal
+        # level. The whole EMA zone must not swallow FP/ODME levels inside it.
+        distal = low if side == "DEMAND" else high
+        proximal = high if side == "DEMAND" else low
+        return {
+            "role": role.upper(), "side": side, "state": state or "ACTIVE",
+            "low": low, "high": high, "distal": distal, "proximal": proximal,
+            "tf": row.get(f"{role}_tf"),
+        }
 
-    hurdles = [x for x in (book.get("hurdles") or []) if isinstance(x, dict)]
-    demand_total = int(_sb_num(book.get("demand_total")) or 0)
-    supply_total = int(_sb_num(book.get("supply_total")) or 0)
-    eligibility = str(book.get("eligibility") or "")
-    defender_side = str(row.get("defender_side") or "").strip().upper()
-    one_sided_side = defender_side if paired is False and defender_side in {"DEMAND", "SUPPLY"} else ""
+    defender = role_zone("defender")
+    challenger = role_zone("challenger")
+
+    paired_raw = row.get("battlefield_paired")
+    if paired_raw not in (None, ""):
+        paired = _sb_boolish(paired_raw)
+    else:
+        # The typed sheet schema may not expose battlefield_paired. Infer only
+        # from the actual current strategic roles; never invent the missing side.
+        paired = bool(defender and challenger)
+
+    hurdles = [x for x in ((book or {}).get("hurdles") or []) if isinstance(x, dict)]
+    eligibility = str((book or {}).get("eligibility") or "")
     one_sided_capable = paired is True or "ONE_SIDED" in eligibility.upper()
+    one_sided_side = ""
+    if paired is False and defender.get("side") in {"DEMAND", "SUPPLY"}:
+        one_sided_side = str(defender.get("side"))
+
     warning = ""
-    if paired is False and not one_sided_capable:
-        warning = "EDGE terminal feed has not yet delivered the one-sided battlefield FP export — update/recreate the EDGE terminal alert before relying on FP ranking."
+    if book is None:
+        warning = "EDGE raw FP hurdle book is unavailable on the authoritative execution row."
+    elif paired is False and not one_sided_capable:
+        warning = (
+            "EDGE terminal feed has not yet delivered the one-sided battlefield FP export — "
+            "recreate/update the EDGE terminal alert before relying on FP ranking."
+        )
+
     context_note = ""
     if one_sided_side and one_sided_capable:
         context_note = (
             f"One-sided battlefield: {one_sided_side} DEFENDER retained; opposite strategic side is missing. "
-            "FP hurdles are still retained within the surviving battlefield boundary; no synthetic opposite boundary/divider is created."
+            "No synthetic opposite boundary or divider is used."
         )
 
     return {
         "available": True,
-        "hurdles": hurdles,
+        "row": row,
+        "raw": raw,
+        "price": price,
         "exec_tf": exec_tf,
-        "lowest_tf": lowest_tf,
         "paired": paired,
+        "defender": defender,
+        "challenger": challenger,
+        "hurdles": hurdles,
+        "book_available": book is not None,
         "one_sided_side": one_sided_side,
         "one_sided_capable": one_sided_capable,
-        "demand_total": demand_total,
-        "supply_total": supply_total,
+        "eligibility": eligibility,
+        "demand_total": int(_sb_num((book or {}).get("demand_total")) or 0),
+        "supply_total": int(_sb_num((book or {}).get("supply_total")) or 0),
         "warning": warning,
         "context_note": context_note,
-        "eligibility": eligibility,
     }
 
 
-def _sb_combined_level_ladder(packet: Dict[str, Any], analysis: Dict[str, Any]) -> Dict[str, Any]:
-    """Build the final-scan hurdle ladder from TV structure + ODME levels.
+def _sb_authoritative_edge_hurdle_book(packet: Dict[str, Any]) -> Dict[str, Any]:
+    """Compatibility wrapper used by the final level ladder."""
+    ctx = _sb_authoritative_edge_context(packet)
+    if not ctx.get("available"):
+        return {
+            "available": False, "hurdles": [], "exec_tf": "", "lowest_tf": False,
+            "paired": None, "one_sided_side": "", "one_sided_capable": False,
+            "demand_total": 0, "supply_total": 0, "warning": "", "context_note": "",
+            "eligibility": "",
+        }
+    try:
+        tf_num = float(ctx.get("exec_tf") or "")
+    except Exception:
+        tf_num = None
+    return {
+        "available": bool(ctx.get("book_available")),
+        "hurdles": list(ctx.get("hurdles") or []),
+        "exec_tf": ctx.get("exec_tf", ""),
+        "lowest_tf": tf_num is not None and tf_num <= 3,
+        "paired": ctx.get("paired"),
+        "one_sided_side": ctx.get("one_sided_side", ""),
+        "one_sided_capable": bool(ctx.get("one_sided_capable")),
+        "demand_total": ctx.get("demand_total", 0),
+        "supply_total": ctx.get("supply_total", 0),
+        "warning": ctx.get("warning", ""),
+        "context_note": ctx.get("context_note", ""),
+        "eligibility": ctx.get("eligibility", ""),
+    }
 
-    FP zones and Defender/Challenger are kept as ranges. ODME POC/walls/safer
-    strikes are exact point levels. A point that sits inside a structural zone is
-    merged into that same hurdle so it does not falsely create an extra level.
+
+def _sb_directional_level_item(item: Dict[str, Any], price: float, direction: str) -> Optional[Dict[str, Any]]:
+    """Project one source hurdle into ABOVE or BELOW price.
+
+    If price is inside an FP zone, DEMAND remains the current below-price support
+    hurdle and SUPPLY remains the current above-price resistance hurdle. Thus an
+    interacting zone is still visible as L1 instead of disappearing from ranking.
     """
-    price = _sb_num((analysis or {}).get("price"))
-    if price is None:
-        return {"price": None, "above": [], "below": [], "at_price": []}
+    lo, hi = float(item["low"]), float(item["high"])
+    semantic = str(item.get("semantic_side") or "").upper()
+    d = str(direction or "").upper()
 
-    raw: List[Dict[str, Any]] = []
-
-    # Final-scan FP ladder: prefer the exact raw EDGE hurdle book because it
-    # includes the full Moderate+ hurdle set. Paired battlefield behavior remains
-    # unchanged; in one-sided mode the terminal feed retains hurdles inside the
-    # surviving DEFENDER boundary without inventing the missing opposite side.
-    edge_book = _sb_authoritative_edge_hurdle_book(packet)
-    if edge_book.get("available"):
-        fp_hurdles = edge_book.get("hurdles") or []
+    if lo > price:
+        actual = "ABOVE"
+    elif hi < price:
+        actual = "BELOW"
     else:
-        fp_hurdles = (analysis or {}).get("hurdles") or []
+        if semantic == "DEMAND":
+            actual = "BELOW"
+        elif semantic == "SUPPLY":
+            actual = "ABOVE"
+        else:
+            actual = d
+
+    if actual != d:
+        return None
+
+    out = {
+        "low": lo,
+        "high": hi,
+        "labels": list(item.get("labels") or []),
+        "sources": list(item.get("sources") or []),
+        "strengths": list(item.get("strengths") or []),
+        "semantic_side": semantic,
+        "kind": str(item.get("kind") or ("POINT" if abs(hi - lo) < 1e-12 else "ZONE")),
+    }
+    if d == "ABOVE":
+        out["approach"] = price if lo <= price <= hi else lo
+        out["far"] = hi
+    else:
+        out["approach"] = price if lo <= price <= hi else hi
+        out["far"] = lo
+    out["side"] = d
+    return out
+
+
+def _sb_directional_levels_confluent(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """Merge true confluence without letting a broad zone swallow interior levels."""
+    alo, ahi = float(a["low"]), float(a["high"])
+    blo, bhi = float(b["low"]), float(b["high"])
+    aa, ba = float(a["approach"]), float(b["approach"])
+    aw, bw = max(0.0, ahi - alo), max(0.0, bhi - blo)
+    eps = max(1e-9, max(abs(aa), abs(ba), 1.0) * 1e-10)
+
+    if abs(aa - ba) <= eps:
+        return True
+
+    a_point = aw <= eps
+    b_point = bw <= eps
+    if a_point and b_point:
+        return False
+
+    # A point deep inside a broad zone is a later level, not the same first-contact
+    # hurdle. Merge only when the point is near the zone's approach edge.
+    if a_point != b_point:
+        point = aa if a_point else ba
+        zone = b if a_point else a
+        zlo, zhi = float(zone["low"]), float(zone["high"])
+        zw = max(zhi - zlo, eps)
+        if zlo - eps <= point <= zhi + eps:
+            return abs(point - float(zone["approach"])) <= max(eps, zw * 0.10)
+        return False
+
+    overlap = max(0.0, min(ahi, bhi) - max(alo, blo))
+    if overlap <= eps:
+        return False
+    return abs(aa - ba) <= max(eps, min(aw, bw) * 0.50)
+
+
+def _sb_merge_directional_levels(items: List[Dict[str, Any]], direction: str) -> List[Dict[str, Any]]:
+    d = str(direction or "").upper()
+    if d == "ABOVE":
+        ordered = sorted(items, key=lambda x: (float(x["approach"]), float(x["far"])))
+    else:
+        ordered = sorted(items, key=lambda x: (-float(x["approach"]), -float(x["far"])))
+
+    groups: List[Dict[str, Any]] = []
+    for item in ordered:
+        merged = False
+        for g in reversed(groups[-2:]):
+            if not _sb_directional_levels_confluent(g, item):
+                continue
+            g["low"] = min(float(g["low"]), float(item["low"]))
+            g["high"] = max(float(g["high"]), float(item["high"]))
+            if d == "ABOVE":
+                g["approach"] = min(float(g["approach"]), float(item["approach"]))
+                g["far"] = max(float(g["far"]), float(item["far"]))
+            else:
+                g["approach"] = max(float(g["approach"]), float(item["approach"]))
+                g["far"] = min(float(g["far"]), float(item["far"]))
+            for key in ("labels", "sources", "strengths"):
+                for value in item.get(key) or []:
+                    if value and value not in g[key]:
+                        g[key].append(value)
+            merged = True
+            break
+        if not merged:
+            groups.append(dict(item))
+
+    if d == "ABOVE":
+        groups.sort(key=lambda x: (float(x["approach"]), float(x["far"])))
+    else:
+        groups.sort(key=lambda x: (-float(x["approach"]), -float(x["far"])))
+    for idx, g in enumerate(groups, start=1):
+        g["rank"] = idx
+    return groups
+
+
+def _sb_combined_level_ladder(packet: Dict[str, Any], analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Build one authoritative L1/L2/L3 ladder above and below current price.
+
+    Every current FP hurdle, Defender, Challenger, ODME POC, walls and safer
+    strikes is considered. Ranking itself is purely geometric; TV/ODME decide
+    which rank a setup or campaign needs, not what L1/L2/L3 mean.
+    """
+    edge_ctx = _sb_authoritative_edge_context(packet)
+    price = _sb_num(edge_ctx.get("price"))
+    if price is None:
+        price = _sb_num((analysis or {}).get("price"))
+    if price is None:
+        return {
+            "price": None, "above": [], "below": [], "at_price": [],
+            "fp_rank_reliable": False, "level_rank_reliable": False,
+        }
+
+    raw_items: List[Dict[str, Any]] = []
+
+    fp_hurdles = list(edge_ctx.get("hurdles") or [])
+    if not fp_hurdles and not edge_ctx.get("book_available"):
+        fp_hurdles = list((analysis or {}).get("hurdles") or [])
 
     for h in fp_hurdles:
         side = str((h or {}).get("side") or "FP").upper()
         strength = str((h or {}).get("strength") or "").strip()
-        label = f"FP {side.title()}"
-        z = _sb_level_zone(label, (h or {}).get("low"), (h or {}).get("high"), source="FP", strength=strength)
+        z = _sb_level_zone(
+            f"FP {side.title()}", (h or {}).get("low"), (h or {}).get("high"),
+            source="FP", strength=strength,
+        )
         if z:
-            raw.append(z)
+            z["semantic_side"] = side
+            z["kind"] = "ZONE"
+            z["zone_id"] = (h or {}).get("zone_id")
+            raw_items.append(z)
 
-    # Strategic EDGE map levels. They may overlap a FP; the merge preserves
-    # confluence without counting the same price barrier twice.
+    # Defender/Challenger are exact distal hurdle levels, not their whole EMA zones.
     for role in ("defender", "challenger"):
-        zraw = (analysis or {}).get(role) or {}
-        side = str(zraw.get("side") or "").upper()
-        role_label = role.title() + (f" {side.title()}" if side else "")
-        z = _sb_level_zone(role_label, zraw.get("low"), zraw.get("high"), source=role.upper())
+        rz = edge_ctx.get(role) or {}
+        side = str(rz.get("side") or "").upper()
+        distal = _sb_num(rz.get("distal"))
+        if distal is None:
+            continue
+        z = _sb_level_zone(
+            role.title() + (f" {side.title()}" if side else ""),
+            distal, source=role.upper(),
+        )
         if z:
-            raw.append(z)
+            z["semantic_side"] = side
+            z["kind"] = "POINT"
+            raw_items.append(z)
 
     odme = _sb_odme_data(packet)
     odme_points = [
-        ("ODME POC", _sb_first(odme, "option_poc", "poc"), "POC"),
-        ("CE Wall", _sb_first(odme, "active_ce_wall", "ce_wall"), "CE_WALL"),
-        ("PE Wall", _sb_first(odme, "active_pe_wall", "pe_wall"), "PE_WALL"),
-        ("Safer CE", _sb_first(odme, "safer_sell_ce", "safe_ce"), "SAFER_CE"),
-        ("Safer PE", _sb_first(odme, "safer_sell_pe", "safe_pe"), "SAFER_PE"),
+        ("ODME POC", _sb_first(odme, "option_poc", "poc"), "POC", ""),
+        ("CE Wall", _sb_first(odme, "active_ce_wall", "ce_wall"), "CE_WALL", "SUPPLY"),
+        ("PE Wall", _sb_first(odme, "active_pe_wall", "pe_wall"), "PE_WALL", "DEMAND"),
+        ("Safer CE", _sb_first(odme, "safer_sell_ce", "safe_ce"), "SAFER_CE", "SUPPLY"),
+        ("Safer PE", _sb_first(odme, "safer_sell_pe", "safe_pe"), "SAFER_PE", "DEMAND"),
     ]
-    for label, value, source in odme_points:
+    for label, value, source, semantic in odme_points:
         z = _sb_level_zone(label, value, source=source)
         if z:
-            raw.append(z)
+            z["semantic_side"] = semantic
+            z["kind"] = "POINT"
+            raw_items.append(z)
 
-    groups = _sb_merge_level_groups(raw)
-    above: List[Dict[str, Any]] = []
-    below: List[Dict[str, Any]] = []
+    above_items: List[Dict[str, Any]] = []
+    below_items: List[Dict[str, Any]] = []
     at_price: List[Dict[str, Any]] = []
-    for g in groups:
-        if float(g["low"]) > price:
-            g["side"] = "ABOVE"
-            g["approach"] = float(g["low"])
-            g["far"] = float(g["high"])
-            above.append(g)
-        elif float(g["high"]) < price:
-            g["side"] = "BELOW"
-            g["approach"] = float(g["high"])
-            g["far"] = float(g["low"])
-            below.append(g)
-        else:
-            g["side"] = "AT_PRICE"
-            g["approach"] = price
-            g["far"] = price
-            at_price.append(g)
+    for item in raw_items:
+        lo, hi = float(item["low"]), float(item["high"])
+        if lo <= price <= hi:
+            at_price.append(dict(item))
+        a = _sb_directional_level_item(item, price, "ABOVE")
+        b = _sb_directional_level_item(item, price, "BELOW")
+        if a:
+            above_items.append(a)
+        if b:
+            below_items.append(b)
 
-    above.sort(key=lambda x: (float(x["approach"]), float(x["far"])))
-    below.sort(key=lambda x: (-float(x["approach"]), -float(x["far"])))
-    for seq in (above, below):
-        for idx, g in enumerate(seq, start=1):
-            g["rank"] = idx
+    above = _sb_merge_directional_levels(above_items, "ABOVE")
+    below = _sb_merge_directional_levels(below_items, "BELOW")
 
-    # A present raw book is authoritative even when it contains zero FP hurdles:
-    # zero then means "none currently qualify", not "feed unavailable". In an
-    # unpaired battlefield, require the new one-sided-capable export marker.
-    fp_rank_reliable = bool(edge_book.get("available")) and bool(edge_book.get("one_sided_capable", True))
-    if not edge_book.get("available"):
-        fp_rank_reliable = bool(fp_hurdles)
+    book_ok = bool(edge_ctx.get("book_available"))
+    one_sided_ok = bool(edge_ctx.get("paired") is True or edge_ctx.get("one_sided_capable"))
+    level_rank_reliable = bool(edge_ctx.get("available")) and book_ok and one_sided_ok
+    if not edge_ctx.get("available"):
+        level_rank_reliable = bool(raw_items)
+
     return {
         "price": price,
         "above": above,
         "below": below,
         "at_price": at_price,
-        "fp_hurdles_considered": bool(edge_book.get("available")),
-        "fp_rank_reliable": fp_rank_reliable,
-        "fp_hurdle_source": "EDGE_RAW" if edge_book.get("available") else "ANALYSIS_FALLBACK",
-        "exec_tf": edge_book.get("exec_tf", ""),
-        "lowest_tf": bool(edge_book.get("lowest_tf")),
-        "one_sided_side": edge_book.get("one_sided_side", ""),
-        "level_warning": edge_book.get("warning", ""),
-        "context_note": edge_book.get("context_note", ""),
+        "raw_levels": raw_items,
+        "fp_hurdles_considered": bool(edge_ctx.get("book_available")),
+        "fp_rank_reliable": level_rank_reliable,
+        "level_rank_reliable": level_rank_reliable,
+        "fp_hurdle_source": "EDGE_RAW" if edge_ctx.get("book_available") else "ANALYSIS_FALLBACK",
+        "exec_tf": edge_ctx.get("exec_tf", ""),
+        "one_sided_side": edge_ctx.get("one_sided_side", ""),
+        "paired": edge_ctx.get("paired"),
+        "defender": edge_ctx.get("defender") or {},
+        "challenger": edge_ctx.get("challenger") or {},
+        "level_warning": edge_ctx.get("warning", ""),
+        "context_note": edge_ctx.get("context_note", ""),
     }
-
 
 def _sb_level_group_text(group: Optional[Dict[str, Any]], with_rank: bool = True) -> str:
     if not group:
@@ -1346,6 +1567,21 @@ def _sb_level_group_text(group: Optional[Dict[str, Any]], with_rank: bool = True
     labels = " + ".join(group.get("labels") or [])
     rank = f"L{group.get('rank')} " if with_rank and group.get("rank") else ""
     return f"{rank}{rng}" + (f" ({labels})" if labels else "")
+
+
+def _sb_level_map_summary(level_map: Dict[str, Any]) -> str:
+    above = level_map.get("above") or []
+    below = level_map.get("below") or []
+    def pick(seq: List[Dict[str, Any]], idx: int) -> Optional[Dict[str, Any]]:
+        return seq[idx] if len(seq) > idx else None
+    return (
+        "Final level map — Above: L1 " + _sb_level_group_text(pick(above, 0), with_rank=False)
+        + " | L2 " + _sb_level_group_text(pick(above, 1), with_rank=False)
+        + " | L3 " + _sb_level_group_text(pick(above, 2), with_rank=False)
+        + " · Below: L1 " + _sb_level_group_text(pick(below, 0), with_rank=False)
+        + " | L2 " + _sb_level_group_text(pick(below, 1), with_rank=False)
+        + " | L3 " + _sb_level_group_text(pick(below, 2), with_rank=False)
+    )
 
 
 def _sb_strike_relation(strike: float, ladder: List[Dict[str, Any]], option_type: str) -> Dict[str, Any]:
@@ -1605,22 +1841,211 @@ def _sb_new_campaign_decision(row: Dict[str, Any], packet: Dict[str, Any]) -> Di
     }
 
 
-def _sb_campaign_final_decisions(packet: Dict[str, Any], trade: Dict[str, Any], setup: Dict[str, Any], analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Decisive final-scan management for active sold-option legs.
+def _sb_campaign_name(trade: Dict[str, Any], setup: Dict[str, Any]) -> str:
+    tmd = _sb_json((trade or {}).get("metadata_json", ""))
+    smd = _sb_setup_md(setup or {})
+    return str(
+        smd.get("setup_name")
+        or tmd.get("origin_setup_name")
+        or (trade or {}).get("strategy_type")
+        or ""
+    ).upper().strip()
 
-    ODME does not independently create a management action. A roll must first be
-    justified by current TV/level management state (for example L3 TV protection
-    is required, or the strike has become under-protected as levels migrate).
-    Once such a trigger exists, current ODME may refine the exact safe target.
-    Strong supportive ODME may permit an inward roll only when TV itself allows L2.
+
+def _sb_origin_fp_metadata(trade: Dict[str, Any], setup: Dict[str, Any]) -> Dict[str, Any]:
+    tmd = _sb_json((trade or {}).get("metadata_json", ""))
+    smd = _sb_setup_md(setup or {})
+    fp = smd.get("fp") if isinstance(smd.get("fp"), dict) else None
+    if not fp and isinstance(tmd.get("fp"), dict):
+        fp = tmd.get("fp")
+    return dict(fp or {})
+
+
+def _sb_same_fp_identity(current: Dict[str, Any], origin: Dict[str, Any]) -> bool:
+    if not current or not origin:
+        return False
+    cur_id = str(current.get("zone_id") or current.get("zoneId") or "").strip()
+    org_id = str(origin.get("zone_id") or origin.get("zoneId") or "").strip()
+    if cur_id and org_id and cur_id != org_id:
+        return False
+    cur_time = str(current.get("formation_time") or current.get("formationTime") or "").strip()
+    org_time = str(origin.get("formation_time") or origin.get("formationTime") or "").strip()
+    if cur_time and org_time and cur_time != org_time:
+        return False
+    return bool((cur_id and org_id) or (cur_time and org_time))
+
+
+def _sb_origin_fp_live_state(
+    packet: Dict[str, Any],
+    trade: Dict[str, Any],
+    setup: Dict[str, Any],
+    analysis: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Current status of the setup's immutable origin FP, using the live EDGE book."""
+    origin = _sb_origin_fp_metadata(trade, setup)
+    side = str(origin.get("side") or "").upper()
+    lo = _sb_num(origin.get("low"))
+    hi = _sb_num(origin.get("high"))
+    if lo is not None and hi is not None and lo > hi:
+        lo, hi = hi, lo
+
+    edge = _sb_authoritative_edge_context(packet)
+    price = _sb_num(edge.get("price"))
+    if price is None:
+        price = _sb_num((analysis or {}).get("price"))
+
+    matched = None
+    for h in edge.get("hurdles") or []:
+        if _sb_same_fp_identity(h, origin):
+            matched = h
+            break
+
+    if matched:
+        state = "PRESENT"
+    elif not origin or side not in {"DEMAND", "SUPPLY"}:
+        state = "UNKNOWN"
+    else:
+        state = "ABSENT"
+
+    return {
+        "state": state, "present": matched is not None, "current": matched or {},
+        "origin": origin, "side": side, "low": lo, "high": hi, "price": price,
+        "edge": edge,
+    }
+
+
+def _sb_break_thesis_state(
+    packet: Dict[str, Any], trade: Dict[str, Any], setup: Dict[str, Any], analysis: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Is the original FP break still intact, retesting, or reclaimed?"""
+    name = _sb_campaign_name(trade, setup)
+    ctx = _sb_origin_fp_live_state(packet, trade, setup, analysis)
+    price, lo, hi = ctx.get("price"), ctx.get("low"), ctx.get("high")
+
+    if name == "SHORT_CE_AFTER_DEMAND_BREAK":
+        if ctx.get("present"):
+            state = "FAILED_RECLAIMED"
+            reason = "the original broken demand FP is active again"
+        elif price is not None and lo is not None and hi is not None:
+            if price < lo:
+                state = "INTACT"
+                reason = "price remains accepted below the original broken demand"
+            elif price > hi:
+                state = "FAILED_RECLAIMED"
+                reason = "price has reclaimed above the original demand zone"
+            else:
+                state = "RETEST"
+                reason = "price is retesting the original broken demand zone"
+        else:
+            state = "UNKNOWN"
+            reason = "the original demand-break geometry cannot be resolved"
+        expected = "BEARISH"
+        opt = "CE"
+    elif name == "SHORT_PE_AFTER_SUPPLY_BREAK":
+        if ctx.get("present"):
+            state = "FAILED_RECLAIMED"
+            reason = "the original broken supply FP is active again"
+        elif price is not None and lo is not None and hi is not None:
+            if price > hi:
+                state = "INTACT"
+                reason = "price remains accepted above the original broken supply"
+            elif price < lo:
+                state = "FAILED_RECLAIMED"
+                reason = "price has fallen back below the original supply zone"
+            else:
+                state = "RETEST"
+                reason = "price is retesting the original broken supply zone"
+        else:
+            state = "UNKNOWN"
+            reason = "the original supply-break geometry cannot be resolved"
+        expected = "BULLISH"
+        opt = "PE"
+    else:
+        return {**ctx, "state": "NOT_BREAK_CAMPAIGN", "reason": "", "expected": "", "option_type": ""}
+
+    return {**ctx, "state": state, "reason": reason, "expected": expected, "option_type": opt}
+
+
+def _sb_rank_target(
+    packet: Dict[str, Any], ladder: List[Dict[str, Any]], option_type: str, rank: int
+) -> Dict[str, Any]:
+    group = ladder[rank - 1] if len(ladder) >= rank else None
+    boundary = float(group["far"]) if group else None
+    strike = _sb_exact_tradable_strike(packet, option_type, boundary) if boundary is not None else None
+    if strike is None:
+        strike = boundary
+    return {"rank": rank, "group": group, "boundary": boundary, "strike": strike}
+
+
+def _sb_campaign_companion_action(
+    packet: Dict[str, Any], trade: Dict[str, Any], setup: Dict[str, Any], analysis: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Locked opposite-side management action for a failed primary demand/supply setup."""
+    name = _sb_campaign_name(trade, setup)
+    if name in {"SHORT_CE_AFTER_DEMAND_BREAK", "SHORT_PE_AFTER_SUPPLY_BREAK"}:
+        return None
+
+    origin = _sb_origin_fp_live_state(packet, trade, setup, analysis)
+    if origin.get("state") != "ABSENT":
+        return None
+
+    ladder_map = _sb_combined_level_ladder(packet, analysis)
+    if not ladder_map.get("level_rank_reliable"):
+        return None
+
+    direction = str(
+        _sb_setup_md(setup).get("direction")
+        or _sb_json((trade or {}).get("metadata_json", "")).get("origin_setup_direction")
+        or (trade or {}).get("direction")
+        or ""
+    ).upper()
+    side = str(origin.get("side") or "").upper()
+
+    if side == "DEMAND" and ("LONG" in direction or direction == "BULLISH"):
+        opt, ladder, event = "CE", ladder_map.get("above") or [], "ACTIVE_DEMAND_FAILED"
+        rule = "Locked long-campaign demand failure: keep the campaign active and sell the opposite-side CE at the current L2 level."
+    elif side == "SUPPLY" and ("SHORT" in direction or direction == "BEARISH"):
+        opt, ladder, event = "PE", ladder_map.get("below") or [], "ACTIVE_SUPPLY_FAILED"
+        rule = "Locked short-campaign supply failure: keep the campaign active and sell the opposite-side PE at the current L2 level."
+    else:
+        return None
+
+    target = _sb_rank_target(packet, ladder, opt, 2)
+    if not target.get("group"):
+        return {
+            "action": "WATCH", "option_type": opt, "rank": 2, "strike": None,
+            "event": event, "reason": rule + " Current L2 is not available, so do not invent a strike.",
+            "level": None,
+        }
+    return {
+        "action": "ADD", "option_type": opt, "rank": 2, "strike": target.get("strike"),
+        "boundary": target.get("boundary"), "event": event, "reason": rule,
+        "level": target.get("group"),
+    }
+
+
+def _sb_campaign_final_decisions(packet: Dict[str, Any], trade: Dict[str, Any], setup: Dict[str, Any], analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Decisive active-campaign management using the locked campaign event first.
+
+    Critical ordering:
+      1) Build the factual L1/L2/L3 map.
+      2) Decide whether a LOCKED management event is actually active.
+      3) Only then use L2/L3 and ODME to choose the target.
+
+    A changed level map or opposing ODME never creates an outward roll by itself.
     """
     ladder_map = _sb_combined_level_ladder(packet, analysis)
-    rank_reliable = bool(ladder_map.get("fp_rank_reliable"))
+    rank_reliable = bool(ladder_map.get("level_rank_reliable"))
     odme_a = _sb_odme_assessment(packet)
     odme_dir = str(odme_a.get("direction") or "NEUTRAL").upper()
     odme_strength = str(odme_a.get("strength") or "NONE").upper()
     odme_control = str(odme_a.get("control_quality") or "UNKNOWN").upper()
     odme = _sb_odme_data(packet)
+    name = _sb_campaign_name(trade, setup)
+    break_ctx = _sb_break_thesis_state(packet, trade, setup, analysis)
+    origin_ctx = _sb_origin_fp_live_state(packet, trade, setup, analysis)
+    exec_of = str((analysis or {}).get("exec_of") or "NEUTRAL").upper()
+    aura = str(((analysis or {}).get("aurora") or {}).get("state") or "UNKNOWN").upper()
     decisions: List[Dict[str, Any]] = []
 
     for row in _sb_active_leg_rows(trade):
@@ -1631,137 +2056,154 @@ def _sb_campaign_final_decisions(packet: Dict[str, Any], trade: Dict[str, Any], 
         if side != "SELL" or opt not in {"CE", "PE"} or strike is None:
             continue
 
-        ladder = ladder_map["above"] if opt == "CE" else ladder_map["below"]
+        ladder = ladder_map.get("above", []) if opt == "CE" else ladder_map.get("below", [])
+        relation = _sb_strike_relation(strike, ladder, opt) if ladder else {"text": "outside the mapped ladder", "passed": 0}
+        l1 = ladder[0] if len(ladder) >= 1 else None
+        l2 = ladder[1] if len(ladder) >= 2 else None
+        l3 = ladder[2] if len(ladder) >= 3 else None
         expected_odme = "BEARISH" if opt == "CE" else "BULLISH"
         same_direction = odme_dir == expected_odme
         opposing = odme_dir in {"BULLISH", "BEARISH"} and odme_dir != expected_odme
         safer = _sb_num(
-            _sb_first(odme, "safer_sell_ce", "safe_ce")
-            if opt == "CE"
+            _sb_first(odme, "safer_sell_ce", "safe_ce") if opt == "CE"
             else _sb_first(odme, "safer_sell_pe", "safe_pe")
         )
-        tv_req = _sb_live_tv_required_rank(analysis, opt)
         odme_req = _sb_odme_required_rank(opt, odme_a)
         posture = str(odme_req.get("state") or "NEUTRAL")
 
-        # Without a ranked FP ladder, never let ODME opposition alone manufacture
-        # a roll. Only an adverse TV management state may justify using the safer
-        # ODME boundary as the conservative fallback target.
-        if not rank_reliable:
+        # ------------------------------------------------------------
+        # FP BREAK OPTION CAMPAIGNS
+        # ------------------------------------------------------------
+        if name in {"SHORT_CE_AFTER_DEMAND_BREAK", "SHORT_PE_AFTER_SUPPLY_BREAK"}:
+            expected = str(break_ctx.get("expected") or expected_odme)
+            supports = ("BEARISH" in exec_of) if expected == "BEARISH" else ("BULLISH" in exec_of)
+            hard_danger = aura == ("GREEN" if expected == "BEARISH" else "RED")
+            break_state = str(break_ctx.get("state") or "UNKNOWN")
+
+            # Only an actual break failure/reclaim, or a retest accompanied by a
+            # full hard TV reversal, is an outward management trigger.
+            adverse_trigger = break_state == "FAILED_RECLAIMED" or (
+                break_state == "RETEST" and (not supports) and hard_danger
+            )
+            recovery_state = break_state == "INTACT" and supports and not hard_danger
+
             action = "HOLD"
             target = None
             target_label = ""
-            relation_text = "FP hurdle rank is unavailable on this scan"
-            tv_triggered = int(tv_req.get("rank") or 3) >= 3
-            if tv_triggered and safer is not None:
-                target = safer
-                target_label = f"ODME safer {opt}"
-                underprotected = (opt == "CE" and strike < safer - 1e-9) or (opt == "PE" and strike > safer + 1e-9)
-                if underprotected:
-                    action = "ROLL FARTHER"
+            management_trigger = "NONE"
+            required_rank = 2 if recovery_state else 3 if adverse_trigger else None
+
+            if adverse_trigger:
+                management_trigger = "BREAK_FAILED_OR_HARD_REVERSAL"
+                t = _sb_rank_target(packet, ladder, opt, 3) if rank_reliable else {"group": None, "strike": None}
+                target = t.get("strike")
+                target_label = "L3" if t.get("group") else ""
+
+                # When the current L3 is unavailable, the ODME safer boundary is
+                # the conservative fallback. Opposing ODME may also push a valid
+                # L3 farther out, but only because the adverse trigger already exists.
+                if safer is not None:
+                    if target is None:
+                        target, target_label = safer, f"ODME safer {opt}"
+                    elif opposing and ((opt == "CE" and safer > target) or (opt == "PE" and safer < target)):
+                        target, target_label = safer, f"ODME safer {opt} beyond L3"
+
+                if target is not None:
+                    underprotected = (opt == "CE" and strike < target - 1e-9) or (opt == "PE" and strike > target + 1e-9)
+                    if underprotected:
+                        action = "ROLL FARTHER"
+                        reason = (
+                            f"Adverse break-management event: {break_ctx.get('reason')}. "
+                            f"Roll outward to {target_label or 'the safe outer level'}."
+                        )
+                    else:
+                        reason = (
+                            f"Adverse break-management event: {break_ctx.get('reason')}, but the current {opt} "
+                            "already satisfies the outer protection target. Hold."
+                        )
+                else:
                     reason = (
-                        f"TV is in an adverse/L3 management state and the FP ladder is unavailable; "
-                        f"use the current safer {opt} boundary as the conservative roll target."
+                        f"Adverse break-management event: {break_ctx.get('reason')}, but no current L3/safer "
+                        "strike is available. Hold rather than inventing a target."
+                    )
+
+            elif recovery_state:
+                management_trigger = "RECOVERY_ON_PLAN"
+                t = _sb_rank_target(packet, ladder, opt, 2) if rank_reliable else {"group": None, "strike": None}
+                # Recovery permits an inward roll from >=L3 to L2 only when ODME
+                # strongly supports the campaign. It never forces an outward roll
+                # merely because today's L2 moved beyond the current strike.
+                if same_direction and odme_strength == "STRONG" and relation.get("passed", 0) >= 3 and t.get("strike") is not None:
+                    action = "ROLL IN"
+                    target = t.get("strike")
+                    target_label = "L2"
+                    reason = (
+                        f"Break thesis is on plan: {break_ctx.get('reason')}; OF and ODME support the campaign. "
+                        "Recovery permits an inward roll from >=L3 to the current L2."
                     )
                 else:
                     reason = (
-                        f"TV is in an adverse/L3 management state, but the current {opt} already sits beyond the safer ODME boundary. Hold."
+                        f"Break thesis is on plan: {break_ctx.get('reason')}; current OF is supportive"
+                        + (" and ODME is strongly supportive." if same_direction and odme_strength == "STRONG" else ".")
+                        + " No adverse management trigger exists, so do not roll outward just because the level map changed."
                     )
-            elif tv_triggered:
-                reason = "TV is in an adverse/L3 management state, but no reliable hurdle or safer ODME boundary is available; hold and check the chart before adjusting."
-            elif same_direction and odme_strength == "STRONG":
-                reason = "TV does not require an outward roll and ODME is supportive. Hold because the FP ladder is unavailable; do not roll inward without a ranked hurdle sequence."
-            elif opposing:
-                reason = "ODME opposes the campaign, but ODME opposition alone is not a management trigger. Hold unless a TV/level management event requires adjustment."
+
             else:
-                reason = "No TV/level management trigger requires a roll. Hold while the FP ladder is unavailable."
+                if break_state == "RETEST":
+                    management_trigger = "BREAK_RETEST_WATCH"
+                reason = (
+                    f"No locked outward-management trigger is confirmed. {break_ctx.get('reason')}. "
+                    "Hold and watch the original break/reclaim state; ODME alone does not create a roll."
+                )
 
             decisions.append({
                 "leg_id": row.get("leg_id"), "option_type": opt, "strike": strike,
                 "action": action, "target": target, "target_label": target_label,
-                "relation": relation_text, "required_rank": int(tv_req.get("rank") or 3),
-                "tv_required_rank": tv_req.get("rank"), "odme_required_rank": odme_req.get("rank"),
-                "management_trigger": "TV_L3_ADVERSE" if tv_triggered else "NONE",
-                "posture": posture, "reason": reason,
+                "relation": relation.get("text"), "required_rank": required_rank,
+                "tv_required_rank": required_rank, "odme_required_rank": odme_req.get("rank"),
+                "management_trigger": management_trigger, "posture": posture, "reason": reason,
+                "campaign_state": break_state, "campaign_state_reason": break_ctx.get("reason"),
                 "odme_direction": odme_dir, "odme_strength": odme_strength, "odme_control": odme_control,
-                "l2": None, "l3": None, "ladder": ladder, "rank_reliable": False,
-                "level_warning": ladder_map.get("level_warning", "") or "FP hurdle ranking is unavailable on this scan — check chart for levels.",
+                "l1": l1, "l2": l2, "l3": l3, "ladder": ladder, "rank_reliable": rank_reliable,
+                "level_warning": ladder_map.get("level_warning", ""),
             })
             continue
 
-        # ACTIVE campaign tier is driven by current TV/level management state.
-        # ODME may refine the safe target only after that state creates a reason
-        # to manage; it does not independently turn a TV-L2 hold into an L3 roll.
-        required_rank = int(tv_req["rank"])
-        target_group = ladder[required_rank - 1] if len(ladder) >= required_rank else (ladder[-1] if ladder else None)
-        relation = _sb_strike_relation(strike, ladder, opt)
-        boundary = float(target_group["far"]) if target_group else None
-        base_target = _sb_exact_tradable_strike(packet, opt, boundary) if boundary is not None else None
-        if base_target is None:
-            base_target = boundary
-        target = base_target
-        target_label = f"L{required_rank}" if target_group and len(ladder) >= required_rank else (f"L{target_group.get('rank')}" if target_group else "")
-
-        underprotected_base = False
-        if target is not None:
-            underprotected_base = (opt == "CE" and strike < target - 1e-9) or (opt == "PE" and strike > target + 1e-9)
-        tv_adverse_trigger = required_rank >= 3
-        level_migration_trigger = bool(underprotected_base)
-        outward_trigger = tv_adverse_trigger or level_migration_trigger
-
-        # Only after a genuine TV/level outward trigger exists may opposing ODME
-        # push the exact target farther to its safer strike.
-        if outward_trigger and opposing and safer is not None:
-            if target is None:
-                target = safer
-                target_label = f"ODME safer {opt}"
-            elif opt == "CE" and safer > target:
-                target = safer
-                target_label = "ODME safer CE beyond TV level"
-            elif opt == "PE" and safer < target:
-                target = safer
-                target_label = "ODME safer PE beyond TV level"
-
-        action = "HOLD"
-        if target is None:
-            reason = "No valid structural management target is available on this scan; hold rather than inventing a roll."
+        # ------------------------------------------------------------
+        # PRIMARY / OTHER CAMPAIGNS
+        # ------------------------------------------------------------
+        # Primary management is event-driven. A missing/broken origin demand or
+        # supply activates the locked opposite-side L2 response; the existing sold
+        # leg is not rolled merely because OF/AURORA or the numeric ladder changed.
+        origin_failed = origin_ctx.get("state") == "ABSENT" and origin_ctx.get("side") in {"DEMAND", "SUPPLY"}
+        if origin_failed:
+            reason = (
+                f"The originating {str(origin_ctx.get('side')).lower()} FP is no longer active. "
+                "This is a locked structural management event; manage it with the opposite-side L2 action shown below. "
+                f"Hold the existing {opt} unless a separate same-leg recovery rule is explicitly triggered."
+            )
+            trigger = f"ORIGIN_{str(origin_ctx.get('side')).upper()}_FAILED"
         else:
-            underprotected_final = (opt == "CE" and strike < target - 1e-9) or (opt == "PE" and strike > target + 1e-9)
-            if outward_trigger and underprotected_final:
-                action = "ROLL FARTHER"
-                trigger_text = "TV requires L3 protection" if tv_adverse_trigger else "the level ladder has migrated beyond the current strike"
-                odme_text = " Opposing ODME refines the target to the safer boundary." if opposing and target != base_target else ""
-                reason = f"Management trigger: {trigger_text}. Current {opt} is under-protected.{odme_text}"
-            elif required_rank == 2 and same_direction and odme_strength == "STRONG" and relation.get("passed", 0) >= 3:
-                action = "ROLL IN"
-                target = base_target
-                target_label = "L2"
-                reason = "TV allows L2 and ODME is strongly supportive; the current strike is at least one full hurdle farther out, so recovery permits an inward roll to L2."
-            elif opposing:
-                reason = "ODME opposes the campaign, but there is no unmet TV/level management trigger requiring an outward roll. Hold the current strike."
-            elif required_rank >= 3:
-                reason = f"TV currently requires L3 protection and the existing {opt} already satisfies it. Hold."
-            else:
-                reason = f"Current {opt} satisfies TV L2 protection. No management trigger requires a roll."
+            reason = (
+                "No locked structural management event is active for this campaign. "
+                "Hold the current leg; ODME/OF/AURORA context may warn, but does not independently manufacture a roll."
+            )
+            trigger = "NONE"
 
-        l2 = ladder[1] if len(ladder) >= 2 else None
-        l3 = ladder[2] if len(ladder) >= 3 else None
-        trigger_code = "TV_L3_ADVERSE" if tv_adverse_trigger else "LEVEL_MIGRATION" if level_migration_trigger else "RECOVERY_L2" if action == "ROLL IN" else "NONE"
         decisions.append({
             "leg_id": row.get("leg_id"), "option_type": opt, "strike": strike,
-            "action": action, "target": target, "target_label": target_label,
-            "relation": relation.get("text"), "required_rank": required_rank,
-            "tv_required_rank": tv_req.get("rank"), "odme_required_rank": odme_req.get("rank"),
-            "tv_rank_reason": tv_req.get("reason"), "odme_rank_reason": odme_req.get("reason"),
-            "management_trigger": trigger_code,
-            "posture": posture, "reason": reason,
+            "action": "HOLD", "target": None, "target_label": "",
+            "relation": relation.get("text"), "required_rank": None,
+            "tv_required_rank": None, "odme_required_rank": odme_req.get("rank"),
+            "management_trigger": trigger, "posture": posture, "reason": reason,
+            "campaign_state": "ORIGIN_FP_FAILED" if origin_failed else "ON_WATCH",
+            "campaign_state_reason": reason,
             "odme_direction": odme_dir, "odme_strength": odme_strength, "odme_control": odme_control,
-            "l2": l2, "l3": l3, "ladder": ladder, "rank_reliable": True,
+            "l1": l1, "l2": l2, "l3": l3, "ladder": ladder, "rank_reliable": rank_reliable,
             "level_warning": ladder_map.get("level_warning", ""),
         })
 
     return decisions
-
 
 def _sb_campaign_decision_line(decision: Dict[str, Any]) -> str:
     action = str(decision.get("action") or "HOLD").upper()
@@ -2512,8 +2954,17 @@ def render_public_superbrain() -> None:
     if not active:
         st.markdown("### Market now")
         st.write(_sb_current_market_line(analysis))
-        st.caption(_sb_location_line(analysis))
+        st.caption(_sb_location_line(analysis, packet))
         st.caption(_sb_hidden_line(analysis))
+        final_level_map = _sb_combined_level_ladder(packet, analysis)
+        if final_level_map.get("level_rank_reliable"):
+            st.caption(_sb_level_map_summary(final_level_map))
+        else:
+            st.caption("Final level map — authoritative L1/L2/L3 ranking is unavailable on this scan.")
+        if final_level_map.get("context_note"):
+            st.caption(final_level_map.get("context_note"))
+        if final_level_map.get("level_warning"):
+            st.warning(final_level_map.get("level_warning"))
 
         st.markdown("### Next likely event")
         if pending:
@@ -2550,19 +3001,18 @@ def render_public_superbrain() -> None:
         st.markdown("### Active campaign")
         st.caption(_sb_current_market_line(analysis))
         final_level_map = _sb_combined_level_ladder(packet, analysis)
-        above_l2 = final_level_map.get("above", [])[1] if len(final_level_map.get("above", [])) >= 2 else None
-        above_l3 = final_level_map.get("above", [])[2] if len(final_level_map.get("above", [])) >= 3 else None
-        below_l2 = final_level_map.get("below", [])[1] if len(final_level_map.get("below", [])) >= 2 else None
-        below_l3 = final_level_map.get("below", [])[2] if len(final_level_map.get("below", [])) >= 3 else None
-        if final_level_map.get("fp_rank_reliable"):
-            st.caption(
-                "Final level map — Above: L2 " + _sb_level_group_text(above_l2, with_rank=False)
-                + " | L3 " + _sb_level_group_text(above_l3, with_rank=False)
-                + " · Below: L2 " + _sb_level_group_text(below_l2, with_rank=False)
-                + " | L3 " + _sb_level_group_text(below_l3, with_rank=False)
-            )
+        above_levels = final_level_map.get("above", [])
+        below_levels = final_level_map.get("below", [])
+        above_l1 = above_levels[0] if len(above_levels) >= 1 else None
+        above_l2 = above_levels[1] if len(above_levels) >= 2 else None
+        above_l3 = above_levels[2] if len(above_levels) >= 3 else None
+        below_l1 = below_levels[0] if len(below_levels) >= 1 else None
+        below_l2 = below_levels[1] if len(below_levels) >= 2 else None
+        below_l3 = below_levels[2] if len(below_levels) >= 3 else None
+        if final_level_map.get("level_rank_reliable"):
+            st.caption(_sb_level_map_summary(final_level_map))
         else:
-            st.caption("Final level map — FP hurdle ranking unavailable; decisions use reliable Defender/Challenger + ODME levels only.")
+            st.caption("Final level map — authoritative level ranking is unavailable on this scan; no L1/L2/L3 target will be invented.")
         if final_level_map.get("context_note"):
             st.caption(final_level_map.get("context_note"))
         if final_level_map.get("level_warning"):
@@ -2608,22 +3058,49 @@ def render_public_superbrain() -> None:
                         f"{decision.get('odme_control')} control. {decision.get('reason')}"
                     )
                     if decision.get("rank_reliable"):
+                        required = decision.get("tv_required_rank")
+                        protection_text = f"L{required}" if required in {2, 3} else "event-driven / no forced tier"
                         st.caption(
-                            f"TV management protection: L{decision.get('tv_required_rank')} · "
+                            f"Management state: {decision.get('campaign_state') or 'WATCH'} · "
+                            f"Protection requirement: {protection_text} · "
                             f"ODME posture: {decision.get('posture')} · "
-                            f"Trigger: {decision.get('management_trigger')}. "
-                            "ODME does not independently trigger a roll; it refines the target after a TV/level management trigger."
+                            f"Trigger: {decision.get('management_trigger')}."
                         )
+                        l1_text = _sb_level_group_text(decision.get("l1"))
                         l2_text = _sb_level_group_text(decision.get("l2"))
                         l3_text = _sb_level_group_text(decision.get("l3"))
                         side_word = "above" if str(decision.get("option_type")).upper() == "CE" else "below"
-                        st.caption(f"Protection ladder {side_word} price: L2 {l2_text.replace('L2 ', '', 1)} | L3 {l3_text.replace('L3 ', '', 1)}")
+                        st.caption(
+                            f"Protection ladder {side_word} price: "
+                            f"L1 {l1_text.replace('L1 ', '', 1)} | "
+                            f"L2 {l2_text.replace('L2 ', '', 1)} | "
+                            f"L3 {l3_text.replace('L3 ', '', 1)}"
+                        )
                     else:
-                        st.caption("FP hurdle ladder not ranked on this scan; decision uses reliable strategic/ODME protection only.")
+                        st.caption("Authoritative L1/L2/L3 ladder is unavailable on this scan; no strike adjustment is invented.")
             else:
                 st.info("Campaign decision: HOLD — no active sold CE/PE leg with a valid strike requires strike-ladder management on this scan.")
 
-            _sb_render_management_confirmation(store, packet, trade, setup, analysis, final_decisions=final_decisions)
+            companion_action = _sb_campaign_companion_action(packet, trade, setup, analysis)
+            if companion_action:
+                c_action = str(companion_action.get("action") or "WATCH").upper()
+                c_opt = str(companion_action.get("option_type") or "").upper()
+                c_rank = companion_action.get("rank")
+                c_strike = companion_action.get("strike")
+                if c_action == "ADD" and c_strike is not None:
+                    st.warning(
+                        f"**Locked management action: ADD / SELL {_sb_fmt_level(c_strike)} {c_opt} at L{c_rank}.**"
+                    )
+                else:
+                    st.warning(f"**Locked management action: {c_action} {c_opt} at L{c_rank}.**")
+                st.write(companion_action.get("reason"))
+                if companion_action.get("level"):
+                    st.caption(f"L{c_rank}: {_sb_level_group_text(companion_action.get('level'), with_rank=False)}")
+
+            _sb_render_management_confirmation(
+                store, packet, trade, setup, analysis,
+                final_decisions=final_decisions, companion_action=companion_action
+            )
             if i < len(active) - 1:
                 st.markdown("---")
 
