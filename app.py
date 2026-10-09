@@ -701,19 +701,10 @@ def _sb_render_management_confirmation(
     final_decisions: Optional[List[Dict[str, Any]]] = None,
     companion_action: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """User confirmation layer for rolls/adds/closes/resizes on an active campaign."""
+    """User confirmation layer for same-campaign roll/close/resize actions."""
     trade_id = str(trade.get("trade_id") or trade.get("record_id") or "campaign").strip()
     active_legs = _sb_active_leg_rows(trade)
     decision_lines = [_sb_campaign_decision_line(x) for x in (final_decisions or [])]
-    if companion_action:
-        c_action = str(companion_action.get("action") or "WATCH").upper()
-        c_opt = str(companion_action.get("option_type") or "").upper()
-        c_rank = companion_action.get("rank")
-        c_strike = companion_action.get("strike")
-        if c_action == "ADD" and c_strike is not None:
-            decision_lines.append(f"ADD / SELL {_sb_fmt_level(c_strike)} {c_opt} at L{c_rank}.")
-        else:
-            decision_lines.append(f"{c_action} {c_opt} at L{c_rank}.")
     recommendation = " ".join(decision_lines) if decision_lines else "No strike-ladder adjustment is recommended on this scan."
 
     with st.expander("I did a management adjustment", expanded=False):
@@ -725,11 +716,10 @@ def _sb_render_management_confirmation(
             st.write(f"**Current management context:** {recommendation}")
         st.caption(f"Current exposure: {_sb_exposure_text(trade)}")
 
-        action_labels = ["Add a new management leg"]
+        action_labels = ["Roll / replace an active leg"]
         if active_legs:
             action_labels = [
                 "Roll / replace an active leg",
-                "Add a new management leg",
                 "Close an active leg",
                 "Change size of an active leg",
             ]
@@ -741,7 +731,6 @@ def _sb_render_management_confirmation(
         )
         action_map = {
             "Roll / replace an active leg": "ROLL",
-            "Add a new management leg": "ADD",
             "Close an active leg": "CLOSE",
             "Change size of an active leg": "RESIZE",
         }
@@ -777,14 +766,15 @@ def _sb_render_management_confirmation(
                 or ""
             )
 
-            if action_code in {"ROLL", "ADD"}:
-                side = st.selectbox("Side", side_options, key=f"sb_mgmt_side_{trade_id}_{action_code}")
-                contract_type = st.selectbox(
-                    "Contract type", type_options, key=f"sb_mgmt_type_{trade_id}_{action_code}"
-                )
+            if action_code == "ROLL":
+                # A roll manages the SAME campaign leg. Side/option type are locked;
+                # an opposite-side opportunity must be recorded as a separate new campaign.
+                st.caption(f"Rolling same leg: {base_side} {base_type}")
+                side = base_side
+                contract_type = base_type
                 strike = st.text_input(
                     "New strike / contract level",
-                    value=strike if action_code == "ROLL" else "",
+                    value=strike,
                     key=f"sb_mgmt_strike_{trade_id}_{action_code}",
                     help="Required for CE/PE. Leave blank for a non-option leg if no strike applies.",
                 )
@@ -819,7 +809,7 @@ def _sb_render_management_confirmation(
 
         if submitted:
             try:
-                if action_code in {"ROLL", "ADD"} and str(contract_type).upper() in {"CE", "PE"} and not str(strike).strip():
+                if action_code == "ROLL" and str(contract_type).upper() in {"CE", "PE"} and not str(strike).strip():
                     raise ValueError("Enter the executed option strike.")
 
                 updated_trade = _sb_record_management_adjustment(
@@ -975,9 +965,9 @@ def _sb_campaign_management(trade: Dict[str, Any], setup: Dict[str, Any]) -> str
         return "Adverse move: roll outward to the applicable 3rd-level short option and size only enough to recover accumulated loss. Recovery: roll inward again as the valid level improves."
     direction = str(smd.get("direction") or tmd.get("origin_setup_direction") or trade.get("direction") or "").upper()
     if "LONG" in direction or direction == "BULLISH":
-        return "Watch for accepted loss of the locked demand/Defender/location. Location failure activates same-direction roll-out/recovery; active demand break activates the opposite-side CE at the 2nd level."
+        return "Watch the locked demand/Defender/location. If it fails, roll the existing PE outward; if the campaign recovers with strong support, roll it inward. Any opposite-side setup is a separate new campaign."
     if "SHORT" in direction or direction == "BEARISH":
-        return "Watch for accepted loss of the locked supply/Challenger/location. Location failure activates same-direction roll-out/recovery; active supply break activates the opposite-side PE at the 2nd level."
+        return "Watch the locked supply/Challenger/location. If it fails, roll the existing CE outward; if the campaign recovers with strong support, roll it inward. Any opposite-side setup is a separate new campaign."
     return "Watch the campaign's locked invalidation/location event; use current ODME before any roll or new leg."
 
 
@@ -1363,6 +1353,71 @@ def _sb_authoritative_edge_context(packet: Dict[str, Any]) -> Dict[str, Any]:
         "context_note": context_note,
     }
 
+
+
+def _sb_action_data_guard(packet: Dict[str, Any]) -> Dict[str, Any]:
+    """Hard gate for any action that changes exposure.
+
+    HOLD commentary may still be shown when data are incomplete, but a fresh
+    entry, roll, resize/add companion leg, or exact strike instruction must not
+    be generated unless the four TV feeds are synchronized on the authoritative
+    execution TF and, for ODME-enabled instruments, the current scan refreshed
+    ODME successfully.
+    """
+    edge_ctx = _sb_authoritative_edge_context(packet)
+    if not edge_ctx.get("available"):
+        return {"ok": False, "reason": "authoritative EDGE state is unavailable"}
+
+    edge_row = edge_ctx.get("row") or {}
+    tracking = str(edge_row.get("edge_tracking_state") or "").upper().strip()
+    edge_tf = _sb_tf_key(edge_row.get("tf"))
+    req_tf = _sb_tf_key(edge_row.get("edge_required_exec_tf") or edge_row.get("exec_tf") or edge_tf)
+    if tracking and tracking != "ACTIVE":
+        return {"ok": False, "reason": f"EDGE tracking is {tracking}, not ACTIVE"}
+    if edge_tf and req_tf and edge_tf != req_tf:
+        return {"ok": False, "reason": f"EDGE alert TF {edge_tf} does not match required TF {req_tf}"}
+
+    tv = packet.get("tv_rows")
+    try:
+        rows = tv.to_dict("records") if hasattr(tv, "to_dict") else list(tv or [])
+    except Exception:
+        rows = []
+    wanted = ["EDGE", "AURORA", "STRUCTURE", "LIQUIDITY"]
+    chosen = {}
+    for source in wanted:
+        candidates = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("source") or "").upper().strip() != source:
+                continue
+            if req_tf and _sb_tf_key(row.get("tf")) != req_tf:
+                continue
+            dt = _sb_tv_close_dt(source, row)
+            if dt is not None:
+                candidates.append((dt, row))
+        if candidates:
+            chosen[source] = max(candidates, key=lambda x: x[0])
+
+    missing = [x for x in wanted if x not in chosen]
+    if missing:
+        return {"ok": False, "reason": "TV feeds missing on authoritative TF: " + ", ".join(missing)}
+
+    dts = [chosen[x][0] for x in wanted]
+    spread = (max(dts) - min(dts)).total_seconds()
+    if spread > 90:
+        return {"ok": False, "reason": f"TV feeds are not synchronized (normalized spread {int(spread)}s)"}
+
+    mapping = packet.get("mapping") or {}
+    if bool(mapping.get("odme_scan_enabled")):
+        if not bool(packet.get("odme_live")):
+            err = str(packet.get("odme_error") or "").strip()
+            reason = "live ODME refresh did not complete"
+            if err:
+                reason += f" ({err})"
+            return {"ok": False, "reason": reason}
+
+    return {"ok": True, "reason": "TV synchronized and current ODME refreshed"}
 
 def _sb_authoritative_edge_hurdle_book(packet: Dict[str, Any]) -> Dict[str, Any]:
     """Compatibility wrapper used by the final level ladder."""
@@ -1827,6 +1882,14 @@ def _sb_new_campaign_decision(row: Dict[str, Any], packet: Dict[str, Any]) -> Di
     if evaluation.get("status") != "ENTRY READY" or opt not in {"CE", "PE"}:
         return {"status": evaluation.get("status", "WAIT"), "option_type": opt, "evaluation": evaluation}
 
+    data_guard = _sb_action_data_guard(packet)
+    if not data_guard.get("ok"):
+        return {
+            "status": "WAIT", "option_type": opt, "evaluation": evaluation,
+            "reason": "NO TRADE / WAIT — " + str(data_guard.get("reason") or "live decision data are incomplete") + ".",
+            "data_guard": data_guard,
+        }
+
     assessment = _sb_odme_assessment(packet)
     odme_req = _sb_odme_required_rank(opt, assessment)
     expected_odme = "BEARISH" if opt == "CE" else "BULLISH"
@@ -1895,6 +1958,14 @@ def _sb_new_campaign_decision(row: Dict[str, Any], packet: Dict[str, Any]) -> Di
         safer = _sb_num(_sb_first(odme, "safer_sell_ce", "safe_ce") if opt == "CE" else _sb_first(odme, "safer_sell_pe", "safe_pe"))
         if safer is not None and ((opt == "CE" and safer >= boundary - 1e-9) or (opt == "PE" and safer <= boundary + 1e-9)):
             strike = safer
+    if strike is None:
+        return {
+            "status": "WAIT", "option_type": opt, "evaluation": evaluation,
+            "required_rank": required_rank, "tv_rank": tv_req["rank"], "odme_rank": odme_req["rank"],
+            "boundary": boundary, "level": group,
+            "reason": f"{tier_reason} No actual listed {opt} strike beyond the required boundary is available in the fresh option chain; do not invent a strike.",
+        }
+
     return {
         "status": "ENTRY READY",
         "option_type": opt,
@@ -2064,73 +2135,51 @@ def _sb_break_thesis_state(
 def _sb_rank_target(
     packet: Dict[str, Any], ladder: List[Dict[str, Any]], option_type: str, rank: int
 ) -> Dict[str, Any]:
+    """Resolve a structural rank to an ACTUAL listed option strike.
+
+    The structural boundary remains useful for explanation, but management must
+    never tell the user to trade a non-listed Defender/FP price as though it were
+    an option strike. If the live chain does not contain a tradable strike beyond
+    the boundary, ``strike`` stays None and the app HOLDs rather than inventing one.
+    """
     group = ladder[rank - 1] if len(ladder) >= rank else None
     boundary = float(group["far"]) if group else None
     strike = _sb_exact_tradable_strike(packet, option_type, boundary) if boundary is not None else None
-    if strike is None:
-        strike = boundary
-    return {"rank": rank, "group": group, "boundary": boundary, "strike": strike}
-
+    return {
+        "rank": rank,
+        "group": group,
+        "boundary": boundary,
+        "strike": strike,
+        "tradable": strike is not None,
+    }
 
 def _sb_campaign_companion_action(
     packet: Dict[str, Any], trade: Dict[str, Any], setup: Dict[str, Any], analysis: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
-    """Locked opposite-side management action for a failed primary demand/supply setup."""
-    name = _sb_campaign_name(trade, setup)
-    if name in {"SHORT_CE_AFTER_DEMAND_BREAK", "SHORT_PE_AFTER_SUPPLY_BREAK"}:
-        return None
+    """Deprecated management path.
 
-    origin = _sb_origin_fp_live_state(packet, trade, setup, analysis)
-    if origin.get("state") != "FAILED_BY_PRICE":
-        return None
-
-    ladder_map = _sb_combined_level_ladder(packet, analysis)
-    if not ladder_map.get("level_rank_reliable"):
-        return None
-
-    direction = str(
-        _sb_setup_md(setup).get("direction")
-        or _sb_json((trade or {}).get("metadata_json", "")).get("origin_setup_direction")
-        or (trade or {}).get("direction")
-        or ""
-    ).upper()
-    side = str(origin.get("side") or "").upper()
-
-    if side == "DEMAND" and ("LONG" in direction or direction == "BULLISH"):
-        opt, ladder, event = "CE", ladder_map.get("above") or [], "ACTIVE_DEMAND_FAILED"
-        rule = "Locked long-campaign demand failure: keep the campaign active and sell the opposite-side CE at the current L2 level."
-    elif side == "SUPPLY" and ("SHORT" in direction or direction == "BEARISH"):
-        opt, ladder, event = "PE", ladder_map.get("below") or [], "ACTIVE_SUPPLY_FAILED"
-        rule = "Locked short-campaign supply failure: keep the campaign active and sell the opposite-side PE at the current L2 level."
-    else:
-        return None
-
-    target = _sb_rank_target(packet, ladder, opt, 2)
-    if not target.get("group"):
-        return {
-            "action": "WATCH", "option_type": opt, "rank": 2, "strike": None,
-            "event": event, "reason": rule + " Current L2 is not available, so do not invent a strike.",
-            "level": None,
-        }
-    return {
-        "action": "ADD", "option_type": opt, "rank": 2, "strike": target.get("strike"),
-        "boundary": target.get("boundary"), "event": event, "reason": rule,
-        "level": target.get("group"),
-    }
-
+    Active-campaign management is deliberately limited to HOLD / ROLL IN /
+    ROLL OUT on the existing sold option leg. Opposite-side opportunities are
+    handled only as independent new campaigns through the normal setup engine.
+    """
+    return None
 
 def _sb_campaign_final_decisions(packet: Dict[str, Any], trade: Dict[str, Any], setup: Dict[str, Any], analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Decisive active-campaign management using the locked campaign event first.
+    """Simple, event-first active-campaign management.
 
-    Critical ordering:
-      1) Build the factual L1/L2/L3 map.
-      2) Decide whether a LOCKED management event is actually active.
-      3) Only then use L2/L3 and ODME to choose the target.
+    Active campaigns have only three recommendations: HOLD, ROLL IN, ROLL OUT.
+    The existing sold option side is preserved. No opposite-side leg is added by
+    management; any opposite-side opportunity must arrive independently as a new
+    Level-2/Level-3 campaign.
 
-    A changed level map or opposing ODME never creates an outward roll by itself.
+    Exposure-changing advice is hard-gated by synchronized TV data and a fresh
+    ODME refresh for ODME-enabled instruments. Stale ODME may be displayed as
+    context, but can never authorize a roll.
     """
     ladder_map = _sb_combined_level_ladder(packet, analysis)
     rank_reliable = bool(ladder_map.get("level_rank_reliable"))
+    data_guard = _sb_action_data_guard(packet)
+
     odme_a = _sb_odme_assessment(packet)
     odme_dir = str(odme_a.get("direction") or "NEUTRAL").upper()
     odme_strength = str(odme_a.get("strength") or "NONE").upper()
@@ -2166,137 +2215,202 @@ def _sb_campaign_final_decisions(packet: Dict[str, Any], trade: Dict[str, Any], 
         odme_req = _sb_odme_required_rank(opt, odme_a)
         posture = str(odme_req.get("state") or "NEUTRAL")
 
-        # ------------------------------------------------------------
-        # FP BREAK OPTION CAMPAIGNS
-        # ------------------------------------------------------------
-        if name in {"SHORT_CE_AFTER_DEMAND_BREAK", "SHORT_PE_AFTER_SUPPLY_BREAK"}:
-            expected = str(break_ctx.get("expected") or expected_odme)
-            supports = ("BEARISH" in exec_of) if expected == "BEARISH" else ("BULLISH" in exec_of)
-            hard_danger = aura == ("GREEN" if expected == "BEARISH" else "RED")
-            break_state = str(break_ctx.get("state") or "UNKNOWN")
-
-            # Only an actual break failure/reclaim, or a retest accompanied by a
-            # full hard TV reversal, is an outward management trigger.
-            adverse_trigger = break_state == "FAILED_RECLAIMED" or (
-                break_state == "RETEST" and (not supports) and hard_danger
-            )
-            recovery_state = break_state == "INTACT" and supports and not hard_danger
-
-            action = "HOLD"
-            target = None
-            target_label = ""
-            management_trigger = "NONE"
-            required_rank = 2 if recovery_state else 3 if adverse_trigger else None
-
-            if adverse_trigger:
-                management_trigger = "BREAK_FAILED_OR_HARD_REVERSAL"
-                t = _sb_rank_target(packet, ladder, opt, 3) if rank_reliable else {"group": None, "strike": None}
-                target = t.get("strike")
-                target_label = "L3" if t.get("group") else ""
-
-                # When the current L3 is unavailable, the ODME safer boundary is
-                # the conservative fallback. Opposing ODME may also push a valid
-                # L3 farther out, but only because the adverse trigger already exists.
-                if safer is not None:
-                    if target is None:
-                        target, target_label = safer, f"ODME safer {opt}"
-                    elif opposing and ((opt == "CE" and safer > target) or (opt == "PE" and safer < target)):
-                        target, target_label = safer, f"ODME safer {opt} beyond L3"
-
-                if target is not None:
-                    underprotected = (opt == "CE" and strike < target - 1e-9) or (opt == "PE" and strike > target + 1e-9)
-                    if underprotected:
-                        action = "ROLL FARTHER"
-                        reason = (
-                            f"Adverse break-management event: {break_ctx.get('reason')}. "
-                            f"Roll outward to {target_label or 'the safe outer level'}."
-                        )
-                    else:
-                        reason = (
-                            f"Adverse break-management event: {break_ctx.get('reason')}, but the current {opt} "
-                            "already satisfies the outer protection target. Hold."
-                        )
-                else:
-                    reason = (
-                        f"Adverse break-management event: {break_ctx.get('reason')}, but no current L3/safer "
-                        "strike is available. Hold rather than inventing a target."
-                    )
-
-            elif recovery_state:
-                management_trigger = "RECOVERY_ON_PLAN"
-                t = _sb_rank_target(packet, ladder, opt, 2) if rank_reliable else {"group": None, "strike": None}
-                # Recovery permits an inward roll from >=L3 to L2 only when ODME
-                # strongly supports the campaign. It never forces an outward roll
-                # merely because today's L2 moved beyond the current strike.
-                if same_direction and odme_strength == "STRONG" and relation.get("passed", 0) >= 3 and t.get("strike") is not None:
-                    action = "ROLL IN"
-                    target = t.get("strike")
-                    target_label = "L2"
-                    reason = (
-                        f"Break thesis is on plan: {break_ctx.get('reason')}; OF and ODME support the campaign. "
-                        "Recovery permits an inward roll from >=L3 to the current L2."
-                    )
-                else:
-                    reason = (
-                        f"Break thesis is on plan: {break_ctx.get('reason')}; current OF is supportive"
-                        + (" and ODME is strongly supportive." if same_direction and odme_strength == "STRONG" else ".")
-                        + " No adverse management trigger exists, so do not roll outward just because the level map changed."
-                    )
-
-            else:
-                if break_state == "RETEST":
-                    management_trigger = "BREAK_RETEST_WATCH"
-                reason = (
-                    f"No locked outward-management trigger is confirmed. {break_ctx.get('reason')}. "
-                    "Hold and watch the original break/reclaim state; ODME alone does not create a roll."
-                )
-
+        def append_decision(action: str, reason: str, *, target: Optional[float] = None,
+                            target_label: str = "", required_rank: Optional[int] = None,
+                            trigger: str = "NONE", campaign_state: str = "ON_WATCH",
+                            campaign_reason: str = "") -> None:
             decisions.append({
                 "leg_id": row.get("leg_id"), "option_type": opt, "strike": strike,
                 "action": action, "target": target, "target_label": target_label,
                 "relation": relation.get("text"), "required_rank": required_rank,
                 "tv_required_rank": required_rank, "odme_required_rank": odme_req.get("rank"),
-                "management_trigger": management_trigger, "posture": posture, "reason": reason,
-                "campaign_state": break_state, "campaign_state_reason": break_ctx.get("reason"),
+                "management_trigger": trigger, "posture": posture, "reason": reason,
+                "campaign_state": campaign_state, "campaign_state_reason": campaign_reason or reason,
                 "odme_direction": odme_dir, "odme_strength": odme_strength, "odme_control": odme_control,
                 "l1": l1, "l2": l2, "l3": l3, "ladder": ladder, "rank_reliable": rank_reliable,
                 "level_warning": ladder_map.get("level_warning", ""),
+                "data_guard_ok": bool(data_guard.get("ok")),
+                "data_guard_reason": str(data_guard.get("reason") or ""),
             })
+
+        # Never generate an exposure-changing recommendation from stale/incomplete data.
+        if not data_guard.get("ok"):
+            append_decision(
+                "HOLD",
+                "No roll is authorized because the current action data are incomplete: "
+                + str(data_guard.get("reason") or "live data guard failed") + ". Refresh and scan again.",
+                trigger="DATA_GUARD_BLOCK",
+                campaign_state="DATA_WAIT",
+            )
+            continue
+
+        if not rank_reliable:
+            append_decision(
+                "HOLD",
+                "The authoritative L1/L2/L3 ladder is unavailable on this scan. Hold rather than inventing a roll target.",
+                trigger="LEVEL_MAP_UNAVAILABLE",
+                campaign_state="LEVEL_WAIT",
+            )
             continue
 
         # ------------------------------------------------------------
-        # PRIMARY / OTHER CAMPAIGNS
+        # FP BREAK OPTION CAMPAIGNS
         # ------------------------------------------------------------
-        # Primary management is event-driven. A missing/broken origin demand or
-        # supply activates the locked opposite-side L2 response; the existing sold
-        # leg is not rolled merely because OF/AURORA or the numeric ladder changed.
-        origin_failed = origin_ctx.get("state") == "FAILED_BY_PRICE" and origin_ctx.get("side") in {"DEMAND", "SUPPLY"}
-        if origin_failed:
-            reason = (
-                f"The originating {str(origin_ctx.get('side')).lower()} FP is no longer active. "
-                "This is a locked structural management event; manage it with the opposite-side L2 action shown below. "
-                f"Hold the existing {opt} unless a separate same-leg recovery rule is explicitly triggered."
-            )
-            trigger = f"ORIGIN_{str(origin_ctx.get('side')).upper()}_FAILED"
-        else:
-            reason = (
-                "No locked structural management event is active for this campaign. "
-                "Hold the current leg; ODME/OF/AURORA context may warn, but does not independently manufacture a roll."
-            )
-            trigger = "NONE"
+        if name in {"SHORT_CE_AFTER_DEMAND_BREAK", "SHORT_PE_AFTER_SUPPLY_BREAK"}:
+            expected = str(break_ctx.get("expected") or expected_odme)
+            tv_supports = ("BEARISH" in exec_of) if expected == "BEARISH" else ("BULLISH" in exec_of)
+            hard_danger = aura == ("GREEN" if expected == "BEARISH" else "RED")
+            break_state = str(break_ctx.get("state") or "UNKNOWN")
 
-        decisions.append({
-            "leg_id": row.get("leg_id"), "option_type": opt, "strike": strike,
-            "action": "HOLD", "target": None, "target_label": "",
-            "relation": relation.get("text"), "required_rank": None,
-            "tv_required_rank": None, "odme_required_rank": odme_req.get("rank"),
-            "management_trigger": trigger, "posture": posture, "reason": reason,
-            "campaign_state": "ORIGIN_FP_FAILED" if origin_failed else "ON_WATCH",
-            "campaign_state_reason": reason,
-            "odme_direction": odme_dir, "odme_strength": odme_strength, "odme_control": odme_control,
-            "l1": l1, "l2": l2, "l3": l3, "ladder": ladder, "rank_reliable": rank_reliable,
-            "level_warning": ladder_map.get("level_warning", ""),
-        })
+            adverse_trigger = break_state == "FAILED_RECLAIMED" or (
+                break_state == "RETEST" and (not tv_supports) and hard_danger
+            )
+            recovery_state = break_state == "INTACT" and tv_supports and not hard_danger
+
+            if adverse_trigger:
+                t = _sb_rank_target(packet, ladder, opt, 3)
+                target = t.get("strike")
+                target_label = "L3" if t.get("group") and target is not None else ""
+
+                # Once a genuine adverse trigger exists, opposing ODME may demand
+                # the farther fresh safer strike. It never creates the trigger.
+                if safer is not None and opposing:
+                    farther = target is None or (opt == "CE" and safer > target) or (opt == "PE" and safer < target)
+                    if farther:
+                        target, target_label = safer, f"ODME safer {opt}"
+
+                if target is None:
+                    append_decision(
+                        "HOLD",
+                        f"Adverse break event is confirmed ({break_ctx.get('reason')}), but no actual listed L3/safer strike is available. Hold until a tradable roll target exists.",
+                        required_rank=3, trigger="BREAK_FAILED_OR_HARD_REVERSAL",
+                        campaign_state=break_state, campaign_reason=str(break_ctx.get("reason") or ""),
+                    )
+                else:
+                    underprotected = (opt == "CE" and strike < target - 1e-9) or (opt == "PE" and strike > target + 1e-9)
+                    if underprotected:
+                        append_decision(
+                            "ROLL OUT",
+                            f"The original break has failed/adversely reversed ({break_ctx.get('reason')}). Roll the existing {opt} outward to the current safe target.",
+                            target=target, target_label=target_label or "L3", required_rank=3,
+                            trigger="BREAK_FAILED_OR_HARD_REVERSAL", campaign_state=break_state,
+                            campaign_reason=str(break_ctx.get("reason") or ""),
+                        )
+                    else:
+                        append_decision(
+                            "HOLD",
+                            f"The original break has failed/adversely reversed ({break_ctx.get('reason')}), but the existing {opt} is already at/beyond the current safe outer target.",
+                            target=target, target_label=target_label or "L3", required_rank=3,
+                            trigger="BREAK_FAILED_OR_HARD_REVERSAL", campaign_state=break_state,
+                            campaign_reason=str(break_ctx.get("reason") or ""),
+                        )
+                continue
+
+            if recovery_state:
+                t = _sb_rank_target(packet, ladder, opt, 2)
+                if same_direction and odme_strength == "STRONG" and relation.get("passed", 0) >= 3 and t.get("strike") is not None:
+                    append_decision(
+                        "ROLL IN",
+                        f"Break remains intact ({break_ctx.get('reason')}); execution OF and strong ODME support the campaign. Roll the existing {opt} inward to current L2.",
+                        target=t.get("strike"), target_label="L2", required_rank=2,
+                        trigger="RECOVERY_ON_PLAN", campaign_state=break_state,
+                        campaign_reason=str(break_ctx.get("reason") or ""),
+                    )
+                else:
+                    append_decision(
+                        "HOLD",
+                        f"Break remains intact ({break_ctx.get('reason')}). No adverse trigger exists, and the conditions for an inward L2 roll are not all satisfied.",
+                        required_rank=2, trigger="RECOVERY_ON_PLAN", campaign_state=break_state,
+                        campaign_reason=str(break_ctx.get("reason") or ""),
+                    )
+                continue
+
+            trigger = "BREAK_RETEST_WATCH" if break_state == "RETEST" else "NONE"
+            append_decision(
+                "HOLD",
+                f"No roll trigger is confirmed. {break_ctx.get('reason')}. Hold the existing {opt}; ODME alone does not create a roll.",
+                trigger=trigger, campaign_state=break_state,
+                campaign_reason=str(break_ctx.get("reason") or ""),
+            )
+            continue
+
+        # ------------------------------------------------------------
+        # PRIMARY / OTHER CAMPAIGNS — SAME-LEG ROLL ONLY
+        # ------------------------------------------------------------
+        origin_side = str(origin_ctx.get("side") or "").upper()
+        price = _sb_num(origin_ctx.get("price"))
+        lo = _sb_num(origin_ctx.get("low"))
+        hi = _sb_num(origin_ctx.get("high"))
+        origin_failed = origin_ctx.get("state") == "FAILED_BY_PRICE" and origin_side in {"DEMAND", "SUPPLY"}
+
+        if opt == "PE":
+            tv_supports = "BULLISH" in exec_of
+            hard_danger = aura == "RED"
+            separated_on_plan = bool(origin_side == "DEMAND" and price is not None and hi is not None and price > hi)
+        else:
+            tv_supports = "BEARISH" in exec_of
+            hard_danger = aura == "GREEN"
+            separated_on_plan = bool(origin_side == "SUPPLY" and price is not None and lo is not None and price < lo)
+
+        if origin_failed:
+            t = _sb_rank_target(packet, ladder, opt, 3)
+            target = t.get("strike")
+            target_label = "L3" if t.get("group") and target is not None else ""
+            if safer is not None and opposing:
+                farther = target is None or (opt == "CE" and safer > target) or (opt == "PE" and safer < target)
+                if farther:
+                    target, target_label = safer, f"ODME safer {opt}"
+
+            if target is None:
+                append_decision(
+                    "HOLD",
+                    f"The originating {origin_side.lower()} structure has failed, but no actual listed L3/safer {opt} strike is available. Hold until a tradable roll-out target exists.",
+                    required_rank=3, trigger=f"ORIGIN_{origin_side}_FAILED", campaign_state="ORIGIN_FP_FAILED",
+                )
+            else:
+                underprotected = (opt == "CE" and strike < target - 1e-9) or (opt == "PE" and strike > target + 1e-9)
+                if underprotected:
+                    append_decision(
+                        "ROLL OUT",
+                        f"The originating {origin_side.lower()} structure has failed. Roll the existing {opt} outward; do not add an opposite-side management leg.",
+                        target=target, target_label=target_label or "L3", required_rank=3,
+                        trigger=f"ORIGIN_{origin_side}_FAILED", campaign_state="ORIGIN_FP_FAILED",
+                    )
+                else:
+                    append_decision(
+                        "HOLD",
+                        f"The originating {origin_side.lower()} structure has failed, but the existing {opt} is already at/beyond the current safe outer target.",
+                        target=target, target_label=target_label or "L3", required_rank=3,
+                        trigger=f"ORIGIN_{origin_side}_FAILED", campaign_state="ORIGIN_FP_FAILED",
+                    )
+            continue
+
+        # Inward roll is deliberately stricter: origin geometry has separated in
+        # the expected direction, TV supports the campaign, AURORA is not in hard
+        # danger, ODME is strongly supportive, and the current strike is >=L3.
+        recovery_state = separated_on_plan and tv_supports and not hard_danger
+        if recovery_state:
+            t = _sb_rank_target(packet, ladder, opt, 2)
+            if same_direction and odme_strength == "STRONG" and relation.get("passed", 0) >= 3 and t.get("strike") is not None:
+                append_decision(
+                    "ROLL IN",
+                    f"The original structure is behaving on plan; TV and strong ODME support the campaign. Roll the existing {opt} inward to current L2.",
+                    target=t.get("strike"), target_label="L2", required_rank=2,
+                    trigger="RECOVERY_ON_PLAN", campaign_state="ON_PLAN",
+                )
+            else:
+                append_decision(
+                    "HOLD",
+                    "The campaign is behaving on plan, but all conditions for an inward L2 roll are not satisfied. Hold the existing leg.",
+                    required_rank=2, trigger="RECOVERY_ON_PLAN", campaign_state="ON_PLAN",
+                )
+            continue
+
+        append_decision(
+            "HOLD",
+            "No same-leg roll trigger is active. Hold the current option. A separate opposite-side opportunity, if it qualifies, will appear only under Next new campaign.",
+            trigger="NONE", campaign_state="ON_WATCH",
+        )
 
     return decisions
 
@@ -2305,10 +2419,10 @@ def _sb_campaign_decision_line(decision: Dict[str, Any]) -> str:
     strike = _sb_fmt_level(decision.get("strike"))
     opt = str(decision.get("option_type") or "").upper()
     target = decision.get("target")
-    if action in {"ROLL IN", "ROLL FARTHER"} and target is not None:
-        return f"{action} — move {strike} {opt} to {decision.get('target_label')} {_sb_fmt_level(target)}."
+    if action in {"ROLL IN", "ROLL OUT"} and target is not None:
+        label = str(decision.get("target_label") or "target")
+        return f"{action} — move {strike} {opt} to {label} {_sb_fmt_level(target)}."
     return f"HOLD {strike} {opt}."
-
 
 def _sb_campaign_odme_phrase(decision: Dict[str, Any]) -> str:
     direction = str(decision.get("odme_direction") or "NEUTRAL").upper()
@@ -3201,12 +3315,12 @@ def render_public_superbrain() -> None:
                 for decision in final_decisions:
                     action = str(decision.get("action") or "HOLD").upper()
                     decision_line = _sb_campaign_decision_line(decision)
-                    if action == "ROLL FARTHER":
-                        st.error(f"**Campaign decision: {decision_line}**")
+                    if action == "ROLL OUT":
+                        st.error(f"**ACTION NOW: {decision_line}**")
                     elif action == "ROLL IN":
-                        st.success(f"**Campaign decision: {decision_line}**")
+                        st.success(f"**ACTION NOW: {decision_line}**")
                     else:
-                        st.info(f"**Campaign decision: {decision_line}**")
+                        st.info(f"**ACTION NOW: {decision_line}**")
 
                     st.write(
                         f"Current {_sb_fmt_level(decision.get('strike'))} {decision.get('option_type')} is "
@@ -3235,27 +3349,11 @@ def render_public_superbrain() -> None:
                     else:
                         st.caption("Authoritative L1/L2/L3 ladder is unavailable on this scan; no strike adjustment is invented.")
             else:
-                st.info("Campaign decision: HOLD — no active sold CE/PE leg with a valid strike requires strike-ladder management on this scan.")
-
-            companion_action = _sb_campaign_companion_action(packet, trade, setup, analysis)
-            if companion_action:
-                c_action = str(companion_action.get("action") or "WATCH").upper()
-                c_opt = str(companion_action.get("option_type") or "").upper()
-                c_rank = companion_action.get("rank")
-                c_strike = companion_action.get("strike")
-                if c_action == "ADD" and c_strike is not None:
-                    st.warning(
-                        f"**Locked management action: ADD / SELL {_sb_fmt_level(c_strike)} {c_opt} at L{c_rank}.**"
-                    )
-                else:
-                    st.warning(f"**Locked management action: {c_action} {c_opt} at L{c_rank}.**")
-                st.write(companion_action.get("reason"))
-                if companion_action.get("level"):
-                    st.caption(f"L{c_rank}: {_sb_level_group_text(companion_action.get('level'), with_rank=False)}")
+                st.info("**ACTION NOW: HOLD — no active sold CE/PE leg requires a same-leg roll on this scan.**")
 
             _sb_render_management_confirmation(
                 store, packet, trade, setup, analysis,
-                final_decisions=final_decisions, companion_action=companion_action
+                final_decisions=final_decisions, companion_action=None
             )
             if i < len(active) - 1:
                 st.markdown("---")
