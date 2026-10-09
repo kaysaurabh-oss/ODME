@@ -363,18 +363,56 @@ def _sb_setup_md(row: Dict[str, Any]) -> Dict[str, Any]:
     return _sb_json((row or {}).get("metadata_json", ""))
 
 
+def _sb_superbrain_setup_df(store: Any, instrument: str = "") -> pd.DataFrame:
+    """Read SETUP rows robustly without requiring a data_store.py upgrade.
+
+    Some deployed storage baselines expose list_superbrain_trades() but not
+    list_superbrain_setups(). The previous app swallowed that AttributeError and
+    therefore displayed "No immediate setup" even while superbrain_memory held a
+    live PENDING_ENTRY/BREAK_WATCH row. Prefer the public method when available,
+    then fall back to the store's durable superbrain_memory dataframe loader.
+    """
+    df = None
+    method = getattr(store, "list_superbrain_setups", None)
+    if callable(method):
+        try:
+            df = method(instrument=instrument)
+        except TypeError:
+            try:
+                df = method()
+            except Exception:
+                df = None
+        except Exception:
+            df = None
+
+    if df is None:
+        loader = getattr(store, "_load_superbrain_df", None)
+        if callable(loader):
+            try:
+                df = loader()
+            except Exception:
+                df = None
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "record_type" in out.columns:
+        out = out[out["record_type"].astype(str).str.upper().eq("SETUP")].copy()
+    if instrument and "instrument" in out.columns:
+        key = str(instrument).upper().strip()
+        out = out[out["instrument"].astype(str).str.upper().str.strip().eq(key)].copy()
+    return out.reset_index(drop=True)
+
+
 def _sb_setup_for_trade(store: Any, trade: Dict[str, Any]) -> Dict[str, Any]:
     md = _sb_json((trade or {}).get("metadata_json", ""))
     rid = str(md.get("parent_setup_id") or md.get("origin_setup_record_id") or "").strip()
     if not rid:
         return {}
-    try:
-        df = store.list_superbrain_setups(instrument=str(trade.get("instrument", "") or ""))
-    except Exception:
+    df = _sb_superbrain_setup_df(store, str(trade.get("instrument", "") or ""))
+    if df.empty or "record_id" not in df.columns:
         return {}
-    if df is None or df.empty:
-        return {}
-    hit = df[df["record_id"].astype(str).eq(rid)] if "record_id" in df.columns else pd.DataFrame()
+    hit = df[df["record_id"].astype(str).eq(rid)]
     return hit.iloc[-1].to_dict() if not hit.empty else {}
 
 
@@ -817,7 +855,7 @@ def _sb_render_management_confirmation(
                 st.error(f"Adjustment could not be recorded: {type(exc).__name__}: {exc}")
 
 
-def _sb_current_market_line(analysis: Dict[str, Any]) -> str:
+def _sb_current_market_line(analysis: Dict[str, Any], packet: Optional[Dict[str, Any]] = None) -> str:
     price = analysis.get("price")
     macro = str(analysis.get("macro", "") or "NEUTRAL")
     of = str(analysis.get("exec_of", "") or "NEUTRAL")
@@ -827,7 +865,23 @@ def _sb_current_market_line(analysis: Dict[str, Any]) -> str:
     pf = "—"
     if fork.get("valid"):
         pf = f"{str(fork.get('slope','')).upper()} / {str(fork.get('position','')).replace('_',' ')}"
+
+    # Battlefield label must come from the same authoritative EDGE row used by
+    # the final level ladder. The old analysis.battlefield_half field can say
+    # UNAVAILABLE even when a valid one-sided Defender is currently present.
     half = str(analysis.get("battlefield_half", "") or "—").replace("_", " ")
+    if packet:
+        try:
+            edge = _sb_authoritative_edge_context(packet)
+            if edge.get("paired") is True:
+                if half in {"—", "", "UNAVAILABLE", "UNKNOWN"}:
+                    half = "PAIRED"
+            elif edge.get("one_sided_side") in {"DEMAND", "SUPPLY"}:
+                half = f"ONE-SIDED {edge.get('one_sided_side')}"
+            elif edge.get("available"):
+                half = "UNAVAILABLE"
+        except Exception:
+            pass
     return f"Price {_sb_fmt_level(price)} | Macro {macro} | OF {of} | AURORA {aura} | Pitchfork {pf} | Battlefield {half}"
 
 
@@ -947,14 +1001,22 @@ def _sb_campaign_option_question(trade: Dict[str, Any], setup: Dict[str, Any]) -
 
 
 def _sb_pending_setups(store: Any, instrument: str) -> List[Dict[str, Any]]:
-    try:
-        df = store.list_superbrain_setups(instrument=instrument, statuses=["PENDING_ENTRY", "BREAK_WATCH"])
-    except Exception:
+    df = _sb_superbrain_setup_df(store, instrument)
+    if df.empty:
         return []
-    if df is None or df.empty:
+    if "status" in df.columns:
+        wanted = {"PENDING_ENTRY", "BREAK_WATCH"}
+        df = df[df["status"].astype(str).str.upper().isin(wanted)].copy()
+    if df.empty:
         return []
     rows = df.to_dict("records")
-    rows.sort(key=lambda x: (1 if str(x.get("status", "")).upper() == "PENDING_ENTRY" else 0, str(x.get("updated_at", "") or x.get("created_at", ""))), reverse=True)
+    rows.sort(
+        key=lambda x: (
+            1 if str(x.get("status", "")).upper() == "PENDING_ENTRY" else 0,
+            str(x.get("updated_at", "") or x.get("created_at", "")),
+        ),
+        reverse=True,
+    )
     return rows
 
 
@@ -1333,25 +1395,34 @@ def _sb_authoritative_edge_hurdle_book(packet: Dict[str, Any]) -> Dict[str, Any]
 
 
 def _sb_directional_level_item(item: Dict[str, Any], price: float, direction: str) -> Optional[Dict[str, Any]]:
-    """Project one source hurdle into ABOVE or BELOW price.
+    """Project one source hurdle into the correct forward ladder.
 
-    If price is inside an FP zone, DEMAND remains the current below-price support
-    hurdle and SUPPLY remains the current above-price resistance hurdle. Thus an
-    interacting zone is still visible as L1 instead of disappearing from ranking.
+    Side-specific market structure is never allowed to switch meaning merely
+    because spot crossed it. DEMAND/PE levels belong only to the BELOW/support
+    ladder; SUPPLY/CE levels belong only to the ABOVE/resistance ladder. If such
+    a level has already been crossed to the wrong side of spot, it is historical
+    context, not a future hurdle, and is excluded from both forward ladders.
+
+    Neutral levels such as POC are ranked geometrically. If price is currently
+    inside an FP zone, its semantic side keeps it visible as the current L1.
     """
     lo, hi = float(item["low"]), float(item["high"])
     semantic = str(item.get("semantic_side") or "").upper()
     d = str(direction or "").upper()
 
-    if lo > price:
-        actual = "ABOVE"
-    elif hi < price:
+    if semantic == "DEMAND":
+        if d != "BELOW" or lo > price:
+            return None
         actual = "BELOW"
+    elif semantic == "SUPPLY":
+        if d != "ABOVE" or hi < price:
+            return None
+        actual = "ABOVE"
     else:
-        if semantic == "DEMAND":
-            actual = "BELOW"
-        elif semantic == "SUPPLY":
+        if lo > price:
             actual = "ABOVE"
+        elif hi < price:
+            actual = "BELOW"
         else:
             actual = d
 
@@ -1375,7 +1446,6 @@ def _sb_directional_level_item(item: Dict[str, Any], price: float, direction: st
         out["far"] = lo
     out["side"] = d
     return out
-
 
 def _sb_directional_levels_confluent(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     """Merge true confluence without letting a broad zone swallow interior levels."""
@@ -1881,7 +1951,14 @@ def _sb_origin_fp_live_state(
     setup: Dict[str, Any],
     analysis: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Current status of the setup's immutable origin FP, using the live EDGE book."""
+    """Resolve the immutable origin FP without mistaking a TF handoff for failure.
+
+    The live EDGE hurdle book contains only the CURRENT execution-TF FP book. An
+    older campaign may have originated on a different execution TF, so absence of
+    its zone ID from today's book is not a break signal. A primary demand/supply
+    origin is failed only when current confirmed price has crossed its distal
+    invalidation boundary (demand: below low; supply: above high).
+    """
     origin = _sb_origin_fp_metadata(trade, setup)
     side = str(origin.get("side") or "").upper()
     lo = _sb_num(origin.get("low"))
@@ -1889,30 +1966,48 @@ def _sb_origin_fp_live_state(
     if lo is not None and hi is not None and lo > hi:
         lo, hi = hi, lo
 
+    smd = _sb_setup_md(setup or {})
+    tmd = _sb_json((trade or {}).get("metadata_json", ""))
+    origin_tf = _sb_tf_key(smd.get("trigger_tf") or tmd.get("trigger_tf") or "")
+
     edge = _sb_authoritative_edge_context(packet)
+    current_tf = _sb_tf_key(edge.get("exec_tf") or "")
+    same_tf = bool(origin_tf and current_tf and origin_tf == current_tf)
     price = _sb_num(edge.get("price"))
     if price is None:
         price = _sb_num((analysis or {}).get("price"))
 
     matched = None
-    for h in edge.get("hurdles") or []:
-        if _sb_same_fp_identity(h, origin):
-            matched = h
-            break
+    # Zone IDs are local to an execution-TF book. Never match an old 60m zone ID
+    # against a current 3m zone that happens to reuse the same numeric ID.
+    if same_tf:
+        for h in edge.get("hurdles") or []:
+            if _sb_same_fp_identity(h, origin):
+                matched = h
+                break
+
+    failed_by_price = False
+    if side == "DEMAND" and price is not None and lo is not None:
+        failed_by_price = price < lo
+    elif side == "SUPPLY" and price is not None and hi is not None:
+        failed_by_price = price > hi
 
     if matched:
         state = "PRESENT"
-    elif not origin or side not in {"DEMAND", "SUPPLY"}:
+    elif not origin or side not in {"DEMAND", "SUPPLY"} or lo is None or hi is None:
         state = "UNKNOWN"
+    elif failed_by_price:
+        state = "FAILED_BY_PRICE"
     else:
-        state = "ABSENT"
+        state = "NOT_IN_CURRENT_BOOK"
 
     return {
         "state": state, "present": matched is not None, "current": matched or {},
         "origin": origin, "side": side, "low": lo, "high": hi, "price": price,
+        "origin_tf": origin_tf, "current_tf": current_tf, "same_tf": same_tf,
+        "failed_by_price": failed_by_price, "geometry_intact": not failed_by_price,
         "edge": edge,
     }
-
 
 def _sb_break_thesis_state(
     packet: Dict[str, Any], trade: Dict[str, Any], setup: Dict[str, Any], analysis: Dict[str, Any]
@@ -1986,7 +2081,7 @@ def _sb_campaign_companion_action(
         return None
 
     origin = _sb_origin_fp_live_state(packet, trade, setup, analysis)
-    if origin.get("state") != "ABSENT":
+    if origin.get("state") != "FAILED_BY_PRICE":
         return None
 
     ladder_map = _sb_combined_level_ladder(packet, analysis)
@@ -2175,7 +2270,7 @@ def _sb_campaign_final_decisions(packet: Dict[str, Any], trade: Dict[str, Any], 
         # Primary management is event-driven. A missing/broken origin demand or
         # supply activates the locked opposite-side L2 response; the existing sold
         # leg is not rolled merely because OF/AURORA or the numeric ladder changed.
-        origin_failed = origin_ctx.get("state") == "ABSENT" and origin_ctx.get("side") in {"DEMAND", "SUPPLY"}
+        origin_failed = origin_ctx.get("state") == "FAILED_BY_PRICE" and origin_ctx.get("side") in {"DEMAND", "SUPPLY"}
         if origin_failed:
             reason = (
                 f"The originating {str(origin_ctx.get('side')).lower()} FP is no longer active. "
@@ -2213,6 +2308,71 @@ def _sb_campaign_decision_line(decision: Dict[str, Any]) -> str:
     if action in {"ROLL IN", "ROLL FARTHER"} and target is not None:
         return f"{action} — move {strike} {opt} to {decision.get('target_label')} {_sb_fmt_level(target)}."
     return f"HOLD {strike} {opt}."
+
+
+def _sb_campaign_odme_phrase(decision: Dict[str, Any]) -> str:
+    direction = str(decision.get("odme_direction") or "NEUTRAL").upper()
+    strength = str(decision.get("odme_strength") or "NONE").upper()
+    control = str(decision.get("odme_control") or "UNKNOWN").upper()
+    posture = str(decision.get("posture") or "NEUTRAL").upper()
+    if posture == "OPPOSING":
+        relation = "OPPOSING this campaign"
+    elif posture in {"STRONG_SUPPORT", "WEAK_SUPPORT"}:
+        relation = "SUPPORTIVE of this campaign"
+    else:
+        relation = "NEUTRAL to this campaign"
+    strength_txt = f"{strength} directional read" if strength in {"STRONG", "WEAK"} else "directional read"
+    return f"ODME {direction} · {strength_txt} · {relation} · {control} control"
+
+
+def _sb_campaign_behavior_text(
+    packet: Dict[str, Any], trade: Dict[str, Any], setup: Dict[str, Any], analysis: Dict[str, Any], health: str = ""
+) -> str:
+    """Campaign-specific behavior; do not lead with generic liquidity chatter."""
+    name = _sb_campaign_name(trade, setup)
+    of_now = str((analysis or {}).get("exec_of") or "NEUTRAL").upper()
+    aura = str(((analysis or {}).get("aurora") or {}).get("state") or "UNKNOWN").upper()
+    odme = _sb_odme_assessment(packet)
+    odme_dir = str(odme.get("direction") or "NEUTRAL").upper()
+
+    if name in {"SHORT_CE_AFTER_DEMAND_BREAK", "SHORT_PE_AFTER_SUPPLY_BREAK"}:
+        ctx = _sb_break_thesis_state(packet, trade, setup, analysis)
+        state = str(ctx.get("state") or "UNKNOWN")
+        if state == "INTACT":
+            lead = "On Plan"
+        elif state == "FAILED_RECLAIMED":
+            lead = "Adverse"
+        elif state == "RETEST":
+            lead = "Retest Watch"
+        else:
+            lead = health or "Watch"
+        expected = str(ctx.get("expected") or "")
+        odme_rel = "supportive" if odme_dir == expected else "opposing" if odme_dir in {"BULLISH", "BEARISH"} else "neutral"
+        return f"{lead}. {str(ctx.get('reason') or 'Break state unresolved').capitalize()}; OF {of_now}; AURORA {aura}; ODME {odme_dir} ({odme_rel})."
+
+    origin = _sb_origin_fp_live_state(packet, trade, setup, analysis)
+    side = str(origin.get("side") or "").upper()
+    price, lo, hi = origin.get("price"), origin.get("low"), origin.get("high")
+    if side in {"DEMAND", "SUPPLY"} and lo is not None and hi is not None and price is not None:
+        if origin.get("state") == "FAILED_BY_PRICE":
+            loc = f"origin {side.lower()} has failed by price"
+            lead = "Adverse"
+        elif lo <= price <= hi:
+            loc = f"price remains inside the origin {side.lower()} zone {_sb_fmt_level(lo)}–{_sb_fmt_level(hi)}"
+            lead = "Demand Test" if side == "DEMAND" else "Supply Test"
+        elif side == "DEMAND" and price > hi:
+            loc = f"price remains above the origin demand zone {_sb_fmt_level(lo)}–{_sb_fmt_level(hi)}"
+            lead = health or "On Plan"
+        elif side == "SUPPLY" and price < lo:
+            loc = f"price remains below the origin supply zone {_sb_fmt_level(lo)}–{_sb_fmt_level(hi)}"
+            lead = health or "On Plan"
+        else:
+            loc = f"origin {side.lower()} geometry is still under watch"
+            lead = health or "Watch"
+        return f"{lead}. {loc}; OF {of_now}; AURORA {aura}; ODME {odme_dir}."
+
+    base = _sb_hidden_line(analysis)
+    return (f"{health}. {base}" if health else base)
 
 
 def _sb_odme_bias(packet: Dict[str, Any]) -> str:
@@ -2953,7 +3113,7 @@ def render_public_superbrain() -> None:
 
     if not active:
         st.markdown("### Market now")
-        st.write(_sb_current_market_line(analysis))
+        st.write(_sb_current_market_line(analysis, packet))
         st.caption(_sb_location_line(analysis, packet))
         st.caption(_sb_hidden_line(analysis))
         final_level_map = _sb_combined_level_ladder(packet, analysis)
@@ -2999,7 +3159,7 @@ def render_public_superbrain() -> None:
             st.write(nxt["look"])
     else:
         st.markdown("### Active campaign")
-        st.caption(_sb_current_market_line(analysis))
+        st.caption(_sb_current_market_line(analysis, packet))
         final_level_map = _sb_combined_level_ladder(packet, analysis)
         above_levels = final_level_map.get("above", [])
         below_levels = final_level_map.get("below", [])
@@ -3032,11 +3192,8 @@ def render_public_superbrain() -> None:
                 st.write(f"**{title}**")
             st.write(f"Exposure: {_sb_exposure_text(trade)}")
             expected = _sb_campaign_expected(trade, setup)
-            now = _sb_hidden_line(analysis)
-            if health:
-                st.write(f"**Behavior now:** {health}. {now}")
-            else:
-                st.write(f"**Behavior now:** {now}")
+            now = _sb_campaign_behavior_text(packet, trade, setup, analysis, health)
+            st.write(f"**Behavior now:** {now}")
             st.caption(f"Expected: {expected}")
 
             final_decisions = _sb_campaign_final_decisions(packet, trade, setup, analysis)
@@ -3054,8 +3211,7 @@ def render_public_superbrain() -> None:
                     st.write(
                         f"Current {_sb_fmt_level(decision.get('strike'))} {decision.get('option_type')} is "
                         f"{decision.get('relation')}. "
-                        f"ODME is {decision.get('odme_direction')} · {decision.get('odme_strength')} support · "
-                        f"{decision.get('odme_control')} control. {decision.get('reason')}"
+                        f"{_sb_campaign_odme_phrase(decision)}. {decision.get('reason')}"
                     )
                     if decision.get("rank_reliable"):
                         required = decision.get("tv_required_rank")
