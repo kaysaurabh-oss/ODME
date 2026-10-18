@@ -4323,13 +4323,30 @@ def _active_expiries(option_rows: pd.DataFrame) -> List[str]:
     return temp["expiry"].dropna().astype(str).unique().tolist()
 
 
-def _instrument_options(settings: pd.DataFrame) -> List[str]:
-    if settings is None or settings.empty or "instrument" not in settings.columns:
+def _instrument_options(settings: pd.DataFrame, tv_current: pd.DataFrame) -> List[str]:
+    """Use only instruments discovered by the NEW EDGE feed after the reset.
+
+    instrument_settings retains saved ODME expiry/scan configuration, but cannot
+    pre-populate the chart dropdown.  Never map a disabled MINI contract into
+    a different full-size futures contract (e.g. NATGASMINI != NATURALGAS).
+    """
+    if tv_current is None or tv_current.empty or not {"instrument", "source"}.issubset(tv_current.columns):
         return []
-    active = [str(x).upper().strip() for x in settings["instrument"].tolist() if str(x).strip()]
-    active_set = set(active)
-    defaults = [x for x in SUPPORTED_INSTRUMENTS if x in active_set]
-    customs = sorted(x for x in active_set if x not in set(SUPPORTED_INSTRUMENTS))
+    disabled: set[str] = set()
+    if settings is not None and not settings.empty and {"instrument", "active"}.issubset(settings.columns):
+        for _, cfg in settings.iterrows():
+            if not _as_bool(cfg.get("active")):
+                disabled.add(str(cfg.get("instrument") or "").strip().upper())
+    edge_rows = tv_current[
+        tv_current["source"].astype(str).str.upper().str.strip().eq("EDGE")
+    ]
+    names = {
+        str(x).upper().strip()
+        for x in edge_rows["instrument"]
+        if str(x).strip() and str(x).upper().strip() not in disabled
+    }
+    defaults = [x for x in SUPPORTED_INSTRUMENTS if x in names]
+    customs = sorted(x for x in names if x not in set(SUPPORTED_INSTRUMENTS))
     return defaults + customs
 
 
@@ -4614,14 +4631,19 @@ def main_page() -> None:
         st.header("Instrument")
 
         try:
-            settings_df = store.list_instrument_settings(active_only=True)
+            all_settings_df = store.list_instrument_settings(active_only=False)
+            if all_settings_df is not None and not all_settings_df.empty and "active" in all_settings_df.columns:
+                settings_df = all_settings_df[all_settings_df["active"].apply(_as_bool)].copy()
+            else:
+                settings_df = all_settings_df
+            tv_instruments = store.load_tv_current()
         except Exception as exc:
-            st.error(f"Could not load persistent instrument list: {exc}")
+            st.error(f"Could not load instrument/EDGE source list: {exc}")
             st.stop()
 
-        instrument_options = _instrument_options(settings_df)
+        instrument_options = _instrument_options(all_settings_df, tv_instruments)
         if not instrument_options:
-            st.warning("No active instruments. Add one below.")
+            st.warning("Awaiting the first new EDGE feed after reset. Existing ODME settings are preserved but do not pre-populate this list.")
 
         with st.expander("Manage instruments", expanded=not bool(instrument_options)):
             new_instrument = st.text_input(
