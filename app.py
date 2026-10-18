@@ -18,6 +18,7 @@ from superbrain_edge_policy import (
     direction as _edge_direction, adverse_expansion as _edge_adverse_expansion,
     entry_matrix as _edge_entry_matrix, protection_broken as _edge_protection_broken,
     campaign_decision as _edge_campaign_decision, option_direction as _edge_option_direction,
+    cash_entry_signal as _edge_cash_entry_signal,
 )
 from superbrain_bridge import (
     build_instrument_map,
@@ -203,6 +204,12 @@ def _sb_tv_freshness(packet: Dict[str, Any]) -> List[str]:
 
     if not feeds:
         return []
+
+    # There is now only one TV authority (EDGE), not four synchronized feeds.
+    if len(feeds) == 1:
+        source, dt, tf = feeds[0]
+        stamp = dt.astimezone(ZoneInfo("Asia/Singapore")).strftime("%d %b %H:%M") if dt else "—"
+        return [f"{source} {stamp}" + (f" · {tf}m" if tf else "")]
 
     # When the synchronized sources refer to the same confirmed candle, show one
     # authoritative TV timestamp instead of four visually different raw times.
@@ -616,18 +623,14 @@ def _sb_record_management_adjustment(
         levels=_sb_combined_level_ladder(packet,packet.get("analysis") or {})
         new_opt=str(new_leg.get("option_type") or "").upper()
         new_ladder=(levels.get("below") if new_opt=="PE" else levels.get("above")) or []
-        if new_opt in {"CE","PE"} and len(new_ladder)>=3 and levels.get("level_rank_reliable") and packet.get("odme_live"):
-            tmd["locked_protection"]={
-                "option_type":new_opt,"locked_at":now,"source_exec_tf":_sb_authoritative_edge_context(packet).get("exec_tf"),
-                "l1":{"boundary":float(new_ladder[0]["far"]),"labels":list(new_ladder[0].get("labels") or [])},
-                "l2":{"boundary":float(new_ladder[1]["far"]),"labels":list(new_ladder[1].get("labels") or [])},
-                "l3":{"boundary":float(new_ladder[2]["far"]),"labels":list(new_ladder[2].get("labels") or [])},
-                "protective_rank":sum(1 for group in new_ladder[:3] if
-                    ((float(group["far"])>float(new_leg["strike"])) if new_opt=="PE"
-                     else (float(group["far"])<float(new_leg["strike"])))),
-            }
-            event["prior_locked_protection"]=old_locked
-            event["new_locked_protection"]=tmd["locked_protection"]
+        new_lock=(_sb_lock_actual_protection(new_ladder,new_opt,new_leg.get('strike'),now,
+                     _sb_authoritative_edge_context(packet).get('exec_tf'))
+                  if levels.get('level_rank_reliable') and packet.get('odme_live')
+                     and _edge_live_ok(packet) else None)
+        if new_lock:
+            tmd['locked_protection']=new_lock
+            event['prior_locked_protection']=old_locked
+            event['new_locked_protection']=new_lock
         else:
             # Fail closed: cannot pretend the rolled leg inherited verified levels.
             tmd.pop("locked_protection",None)
@@ -1667,18 +1670,73 @@ def _sb_level_group_text(group: Optional[Dict[str, Any]], with_rank: bool = True
 
 
 def _sb_level_map_summary(level_map: Dict[str, Any]) -> str:
-    above = level_map.get("above") or []
-    below = level_map.get("below") or []
-    def pick(seq: List[Dict[str, Any]], idx: int) -> Optional[Dict[str, Any]]:
-        return seq[idx] if len(seq) > idx else None
-    return (
-        "Final level map — Above: L1 " + _sb_level_group_text(pick(above, 0), with_rank=False)
-        + " | L2 " + _sb_level_group_text(pick(above, 1), with_rank=False)
-        + " | L3 " + _sb_level_group_text(pick(above, 2), with_rank=False)
-        + " · Below: L1 " + _sb_level_group_text(pick(below, 0), with_rank=False)
-        + " | L2 " + _sb_level_group_text(pick(below, 1), with_rank=False)
-        + " | L3 " + _sb_level_group_text(pick(below, 2), with_rank=False)
-    )
+    """Compact factual map: list only levels that actually exist.
+
+    In particular, never print an unavailable rank or an L3 placeholder.
+    """
+    parts=[]
+    for side,levels in (("Above",level_map.get("above") or []),("Below",level_map.get("below") or [])):
+        available=[f"L{i} {_sb_fmt_level(g.get('far'))}" for i,g in enumerate(levels[:3],start=1)
+                   if _sb_num(g.get('far')) is not None]
+        if available: parts.append(f"{side}: "+" · ".join(available))
+    return "  |  ".join(parts)
+
+
+def _sb_compact_manual_choices(matrix: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Group only actual executable options by rank and strike.
+
+    A missing map rank/strike must disappear from the presentation. We never
+    render a 'missing L3' choice as an entry instruction or explanatory warning.
+    """
+    grouped: Dict[tuple, Dict[str, Any]]={}
+    for aur,choice in (matrix.get('choices') or {}).items():
+        if choice.get('status')!='ENTRY READY':continue
+        rank=choice.get('rank');strike=_sb_num(choice.get('strike'))
+        if not isinstance(rank,int) or not 1<=rank<=3 or strike is None:continue
+        group=grouped.setdefault((rank,strike),{'auroras':[], 'rank':rank,'strike':strike})
+        group['auroras'].append(aur.title())
+    return sorted(grouped.values(),key=lambda g:g['rank'])
+
+
+def _sb_short_fp_context(ctx: Dict[str, Any]) -> str:
+    """At most one current EDGE footprint observation; Telegram carries history."""
+    row=ctx.get('row') or {}
+    active=[]
+    for code,side in (("d","Demand"),("s","Supply")):
+        pre=f'fp_{code}_'
+        event=str(row.get(pre+'event_type') or '').strip()
+        state=str(row.get(pre+'context_state') or row.get(pre+'status') or '').strip()
+        interacting=str(row.get(pre+'interacting') or '').lower() in {'1','true'}
+        if not (event or interacting):continue
+        if not event and not state:continue
+        delta=_sb_num(row.get(pre+'session_delta'))
+        parts=[f"{side} FP",event.replace('_',' ').title() if event else state.replace('_',' ').title()]
+        if delta is not None:parts.append(f"Δ {delta:+,.0f}")
+        active.append(' · '.join(parts))
+    return active[0] if active else "Awaiting next FP event"
+
+
+def _sb_lock_actual_protection(ladder: List[Dict[str, Any]], option_type: str,
+                               strike: Any, recorded_at: str, exec_tf: Any) -> Optional[Dict[str, Any]]:
+    """Lock only available L1/L2/L3 barriers ahead of an actually sold strike.
+
+    A 2-level map is still useful and MUST NOT require a fabricated L3.
+    Later management uses the deepest available barrier that still protects
+    that particular executed option, not a fictitious third level.
+    """
+    opt=str(option_type or '').upper()
+    value=_sb_num(str(strike).replace(',',''))
+    if opt not in {'PE','CE'} or value is None:return None
+    lock={'option_type':opt,'locked_at':recorded_at,'source_exec_tf':exec_tf}
+    count=0
+    for rank,group in enumerate((ladder or [])[:3],1):
+        boundary=_sb_num(group.get('far'))
+        if boundary is None:break
+        lock[f'l{rank}']={'boundary':float(boundary),'labels':list(group.get('labels') or [])}
+        if (boundary>value if opt=='PE' else boundary<value):count+=1
+    if count==0:return None
+    lock['protective_rank']=count
+    return lock
 
 
 def _sb_strike_relation(strike: float, ladder: List[Dict[str, Any]], option_type: str) -> Dict[str, Any]:
@@ -2808,17 +2866,10 @@ def _sb_record_selected_pending_entry(
     lm = _sb_combined_level_ladder(packet, packet.get("analysis") or {})
     opt = ctype
     ladder = (lm.get("below") if opt == "PE" else lm.get("above")) or []
-    if opt in {"CE", "PE"} and _sb_num(str(strike).replace(",", "")) is not None and len(ladder) >= 3 and lm.get("level_rank_reliable") and packet.get("odme_live") and _edge_live_ok(packet):
-        tmd["locked_protection"] = {
-            "option_type":opt,
-            "locked_at":now,
-            "source_exec_tf":_sb_authoritative_edge_context(packet).get("exec_tf"),
-            "l1":{"boundary":float(ladder[0]["far"]),"labels":list(ladder[0].get("labels") or [])},
-            "l2":{"boundary":float(ladder[1]["far"]),"labels":list(ladder[1].get("labels") or [])},
-            "l3":{"boundary":float(ladder[2]["far"]),"labels":list(ladder[2].get("labels") or [])},
-            "protective_rank":sum(1 for group in ladder[:3] if
-                ((float(group["far"])>float(str(strike).replace(",",""))) if opt=="PE" else (float(group["far"])<float(str(strike).replace(",",""))))),
-        }
+    if opt in {'CE','PE'} and lm.get('level_rank_reliable') and packet.get('odme_live') and _edge_live_ok(packet):
+        protection=_sb_lock_actual_protection(ladder,opt,strike,now,
+                      _sb_authoritative_edge_context(packet).get('exec_tf'))
+        if protection:tmd['locked_protection']=protection
     tmd["manual_aurora_at_entry"] = str(st.session_state.get(f"manual_aurora_{rid}") or "NOT_CHECKED")
     analysis = packet.get("analysis", {}) or {}
     memory = packet.get("memory", {}) or {}
@@ -2970,9 +3021,9 @@ def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str,
             if _nd_strike is not None:
                 st.success(f"Selected setup is ENTRY READY — recommended SELL {_sb_fmt_level(_nd_strike)} {_nd_opt} at L{_nd_rank} protection.")
             else:
-                st.success(f"Selected setup is ENTRY READY — L{_nd_rank} {_nd_opt} protection is required; exact listed strike is not available in the live chain packet.")
+                st.warning("No qualifying protected strike is available for that selection.")
         else:
-            st.warning(f"TV/ODME entry is ready, but final strike selection is not complete: {new_decision.get('reason','')}")
+            st.warning("Check AURORA: no qualifying protected strike for that selection.")
     else:
         st.warning(
             "Selected setup is still WAIT in SuperBrain. If you took it anyway, record the exact exposure you actually executed."
@@ -3261,7 +3312,7 @@ def _edge_manage_trade(packet:Dict[str,Any], trade:Dict[str,Any]) -> List[Dict[s
             continue
         if not _edge_live_ok(packet) or not locked or locked.get("option_type")!=opt:
             results.append({"action":"REVIEW","option_type":opt,"strike":strike,
-                "reason":"No verified current EDGE/locked L2/L3 references. Reconfirm protection; no inferred break or invented roll.","leg_id":item["leg_id"]})
+                "reason":"No verified current EDGE/locked protective levels. Reconfirm protection; no inferred break or invented roll.","leg_id":item["leg_id"]})
             continue
         protected_rank=int(locked.get("protective_rank") or 0)
         if protected_rank<=0:
@@ -3304,9 +3355,109 @@ def _edge_manage_trade(packet:Dict[str,Any], trade:Dict[str,Any]) -> List[Dict[s
     return results
 
 
+def _sb_render_edge_cash_terminal(store: Any, instrument: str, packet: Dict[str, Any]) -> None:
+    """Public SuperBrain only. Never scan or display ODME in EDGE-only mode."""
+    ctx = _sb_authoritative_edge_context(packet)
+    row = ctx.get("row") or {}
+    healthy = _edge_live_ok(packet)
+    _sb_render_freshness(packet)
+    st.caption("EDGE ONLY · no ODME scan · check Renko AURORA manually")
+    st.markdown(f"**Price {_sb_fmt_level(ctx.get('price'))} · OF {row.get('exec_of') or 'UNKNOWN'} · {_sb_short_fp_context(ctx)}**")
+    _sb_show_optional_context(packet)
+    if not healthy:
+        st.error("**WAIT** — EDGE data is stale or not on its active execution TF.")
+        return
+    pending = [s for s in _sb_pending_setups(store, instrument) if
+               str(s.get('status') or '').upper() == 'PENDING_ENTRY']
+    if not pending:
+        st.warning("**WAIT** — No current EDGE Level 2 defence or confirmed FP-break entry setup. FP touch alone is not an entry.")
+        return
+    st.markdown('### Direct trade decision — no ODME')
+    emitted=0
+    for setup in pending:
+        md=_sb_setup_md(setup)
+        fp=md.get('fp') if isinstance(md.get('fp'),dict) else {}
+        name=str(md.get('setup_name') or setup.get('strategy_type') or '')
+        # A previously saved READY setup is not by itself a fresh FP signal.
+        # Match it with the current EDGE FP book by zone ID and side.
+        same=[]
+        zone_id=str(fp.get('zoneId') or fp.get('zone_id') or '').strip()
+        zone_side=str(fp.get('side') or '').upper()
+        for z in ctx.get('hurdles') or []:
+            zid=str(z.get('zone_id') or z.get('zoneId') or '').strip()
+            zside=str(z.get('side') or '').upper()
+            if zid and zone_id and zid==zone_id and zside==zone_side:
+                same.append(z)
+        for suffix,side in (('d','DEMAND'),('s','SUPPLY'),('','')):
+            zid=str(row.get(f'fp_{suffix}_zone_id' if suffix else 'fp_zone_id') or '').strip()
+            if zid and zone_id and zid==zone_id:
+                if suffix=='' and str(row.get('fp_side') or '').upper()!=zone_side:continue
+                pfx=f'fp_{suffix}_' if suffix else 'fp_'
+                same.append({'side':zone_side,'zone_id':zid,
+                    'event_type':row.get(pfx+'event_type'),'status':row.get(pfx+'status'),
+                    'context_state':row.get(pfx+'context_state'),
+                    'bars_since_event':row.get(pfx+'bars_since_event'),
+                    'low':row.get(pfx+'low'),'high':row.get(pfx+'high')})
+        if not same and 'AFTER_' not in name.upper():
+            continue  # Previous FP is no longer in current EDGE: no stale recommendations.
+        is_break='AFTER_' in name.upper() and 'BREAK' in name.upper()
+        if same:
+            # Prefer the typed current FP event over an older hurdle snapshot.
+            now_fp=next((z for z in same if z.get('event_type')), same[0])
+            values=dict(fp)
+            for dst,keys in {'eventType':('event_type','eventType'),
+                             'status':('status',),'contextState':('context_state','context','contextState'),
+                             'barsSinceEvent':('bars_since_event','barsSinceEvent')}.items():
+                new_val=next((now_fp.get(k) for k in keys if now_fp.get(k) not in (None,'')),None)
+                if new_val is not None:values[dst]=new_val
+        else:
+            values=dict(fp)
+        # For stored accepted-break alerts, do not require the failed FP still in
+        # the current book. However, require a recent trigger and continued
+        # acceptance beyond the original boundary.
+        if is_break:
+            ms=_sb_num(md.get('trigger_ref_close_ms'))
+            now_ms=_sb_num(row.get('bar_time'))
+            tf=_sb_num(row.get('tf')) or 15.0
+            if ms is None or now_ms is None or not (0<=now_ms-ms<=tf*60000*3):
+                continue
+        key=str(setup.get('record_id') or name)
+        aur=st.selectbox('Renko AURORA (manual)', ['CHECK','BULLISH','NEUTRAL','BEARISH'],
+                         format_func=lambda a: 'Check AURORA' if a=='CHECK' else a.title(),
+                         key=f'cash_aurora_{instrument}_{key}')
+        dec=_edge_cash_entry_signal(name,values,ctx.get('price'),healthy,aur)
+        if dec.get('status')=='WAIT':
+            st.warning(f"**WAIT** — {dec['reason']}")
+        elif dec.get('status')=='ENTRY READY':
+            st.success(f"**{dec['direction']} — ENTRY READY** · {dec['reason']}")
+        else:
+            st.info(f"**{dec.get('direction') or 'WAIT'} if AURORA {dec.get('required_aurora') or 'agrees'}** · {dec['reason']}")
+        if dec.get('direction'):
+            emitted += 1
+    if not emitted:
+        st.warning('**WAIT** — No current, verified FP defence or accepted break qualifies as a cash entry. Await a fresh EDGE Level 2 event.')
+    # Option campaign recording and ODME panels are deliberately not called here.
+
+
+def _sb_show_optional_context(packet: Dict[str, Any]) -> None:
+    """One or two materially relevant notes only; no stale/missing-feed warnings.
+
+    The extra feeds cannot change the EDGE or ODME entry/management policy.
+    Candle AURORA WHITE is a high-priority CHOP caution, not Renko AURORA.
+    """
+    notes=((packet.get("analysis") or {}).get("optional_context") or [])[:2]
+    for item in notes:
+        message=str(item.get("text") or "").strip()
+        if not message:continue
+        if item.get("severity") == "caution":
+            st.warning(message)
+        else:
+            st.caption(message)
+
+
 def render_public_superbrain() -> None:
     """One-screen EDGE + ODME terminal. Existing recording functions remain in place."""
-    st.subheader("SuperBrain — EDGE + ODME")
+    st.subheader("SuperBrain")
     msg=str(st.session_state.pop("superbrain_notice", "") or "")
     if msg: st.success(msg)
     err=str(st.session_state.pop("superbrain_error_notice", "") or "")
@@ -3322,8 +3473,11 @@ def render_public_superbrain() -> None:
         st.info("No active EDGE instruments in TV_TEST_CURRENT.")
         return
     instrument=st.selectbox("Instrument",instruments["instrument"].astype(str).tolist(),key="public_superbrain_instrument")
-    if st.button("Scan now",type="primary",use_container_width=True,key="scan_superbrain_public"):
-        with st.spinner("Reading EDGE and scanning ODME..."):
+    chosen=instruments[instruments['instrument'].astype(str).eq(instrument)].iloc[0]
+    option_enabled=bool(chosen.get('odme_scan_enabled'))
+    st.caption('EDGE + ODME' if option_enabled else 'EDGE-only · direct BUY/SELL')
+    if st.button("Scan now" if option_enabled else "Analyse EDGE",type="primary",use_container_width=True,key="scan_superbrain_public"):
+        with st.spinner("Reading EDGE and scanning ODME..." if option_enabled else "Reading EDGE — no ODME scan..."):
             try:
                 st.session_state.public_superbrain_last=prepare_superbrain_scan(store,instrument)
             except Exception as exc:
@@ -3331,51 +3485,52 @@ def render_public_superbrain() -> None:
                 return
     packet=st.session_state.get("public_superbrain_last")
     if not packet or str(packet.get("instrument"))!=instrument:return
+    if not option_enabled:
+        _sb_render_edge_cash_terminal(store,instrument,packet)
+        return
     _sb_render_freshness(packet)
     ctx=_sb_authoritative_edge_context(packet)
     if not _edge_live_ok(packet):
         st.error("EDGE is stale, not ACTIVE, on the wrong execution timeframe, or lacks a current FP map. Entry and automated risk decisions are suspended; existing trades may still be recorded manually.")
     row=ctx.get("row") or {}
     analysis=packet.get("analysis") or {}
-    st.markdown(f"**Price {_sb_fmt_level(ctx.get('price'))} · EDGE OF {row.get('exec_of') or 'UNKNOWN'} · Execution TF {ctx.get('exec_tf') or '?'}**")
-    lm=_sb_combined_level_ladder(packet,analysis)
-    st.caption(_sb_level_map_summary(lm))
-    if lm.get("level_warning"):st.warning(lm["level_warning"])
-    if packet.get("odme_live"):st.caption("ODME freshly scanned; option levels are from this scan.")
-    else:st.warning("Fresh ODME unavailable. Saved levels are shown for reference only—not valid for new entry or live roll recommendation.")
-    st.markdown("### Market interpretation")
-    for line in list(analysis.get("lines") or [])[:4]:
-        st.write(line)
-    hurdles=ctx.get("hurdles") or []
-    nearby=sorted([h for h in hurdles if isinstance(h,dict) and _sb_num(h.get("low")) is not None],
-        key=lambda h:abs((_sb_num(h.get("low")) or 0)-float(ctx.get("price") or 0)))[:2]
-    if nearby:
-        for z in nearby:
-            st.write(f"{str(z.get('side') or 'FP').upper()} FP {_sb_fmt_level(z.get('low'))}–{_sb_fmt_level(z.get('high'))} · {z.get('status') or z.get('context') or 'active'} · {z.get('strength') or 'strength unspecified'}")
-    else: st.write("No nearby FP hurdles available in the current EDGE book.")
     odmea=_sb_odme_assessment(packet)
-    st.write(f"ODME: {odmea.get('direction')} · {odmea.get('regime')} · expansion {odmea.get('expansion_direction')} ({odmea.get('expansion_risk')})")
+    st.markdown(f"**Price {_sb_fmt_level(ctx.get('price'))} · EDGE OF {row.get('exec_of') or 'UNKNOWN'} · ODME {odmea.get('direction') or 'UNKNOWN'}**")
+    fp_note=_sb_short_fp_context(ctx)
+    if fp_note!='Awaiting next FP event':st.caption(fp_note)
+    _sb_show_optional_context(packet)
+    lm=_sb_combined_level_ladder(packet,analysis)
+    if not packet.get("odme_live"):
+        st.warning("**WAIT** — Fresh ODME unavailable; no new trade recommendation.")
+    if lm.get("level_warning"):st.warning(lm["level_warning"])
     active=[t for t in (packet.get("open_trades") or []) if str(t.get("status","ACTIVE") or "ACTIVE").upper() not in {"CLOSED","EXIT","TARGET","INVALIDATED","EXPIRED","CANCELLED"}]
     pending=_sb_pending_setups(store,instrument)
     if pending:
-        st.markdown("### New entry candidates")
+        st.markdown("### New entry")
         active_setup_ids={str(_sb_json(t.get('metadata_json','')).get('parent_setup_id') or '') for t in active}
         for setup in pending:
-            if str(setup.get('record_id') or '') in active_setup_ids: continue
-            if str(setup.get('status') or '').upper()!='PENDING_ENTRY': continue
+            if str(setup.get('record_id') or '') in active_setup_ids:continue
+            if str(setup.get('status') or '').upper()!='PENDING_ENTRY':continue
             md=_sb_setup_md(setup)
-            st.write(f"**{md.get('setup_name') or setup.get('strategy_type')} · {md.get('fp',{}).get('side','FP')} {_sb_fmt_level(md.get('fp',{}).get('low'))}–{_sb_fmt_level(md.get('fp',{}).get('high'))}**")
             matrix=_edge_entry_matrix_for(setup,packet)
-            if matrix.get('status') not in {'ENTRY READY'}:
-                st.warning(f"{matrix.get('status') or 'WAIT'} — {matrix.get('reason')}")
-                continue
-            st.write("**Check Renko AURORA manually:**")
-            for aur,choice in matrix.get('choices',{}).items():
-                if choice.get('status')=='ENTRY READY':
-                    st.write(f"AURORA {aur}: **SELL {_sb_fmt_level(choice['strike'])} {matrix['option_type']} — L{choice['rank']}**")
+            ready=_sb_compact_manual_choices(matrix)
+            opt=matrix.get('option_type') or _edge_option_for_setup(setup)
+            if ready:
+                st.success(f"**SELL {opt} — ENTRY READY** · Check Renko AURORA:")
+                for choice in ready:
+                    st.write(f"**{' / '.join(choice['auroras'])} → SELL {_sb_fmt_level(choice['strike'])} {opt} · L{choice['rank']}**")
+            else:
+                # Avoid repeating the missing rank in warnings (including L3).
+                status=str(matrix.get('status') or 'WAIT').upper()
+                if status=='AVOID':st.error("**AVOID** — Adverse ODME expansion risk.")
                 else:
-                    st.caption(f"AURORA {aur}: WAIT — {choice.get('reason')}")
-            st.caption("AURORA is never inferred from EDGE or the discontinued AURORA feed.")
+                    current_fp=_sb_short_fp_context(ctx)
+                    if current_fp=='Awaiting next FP event':
+                        st.warning("**WAIT** — No current EDGE defence/break confirmation or qualified protected strike.")
+                    else:
+                        st.warning("**WAIT** — FP event is developing, but a sufficiently protected entry is not established.")
+    elif not active:
+        st.info("**WAIT** — No new EDGE FP entry setup.")
     if active:
         st.markdown("### Active campaigns")
         for trade in active:
@@ -3383,30 +3538,28 @@ def render_public_superbrain() -> None:
             st.write(f"**{trade.get('trade_id') or 'Campaign'} · {_sb_exposure_text(trade)}**")
             md=_sb_json(trade.get("metadata_json", ""))
             if not md.get("locked_protection"):
-                st.warning("This older campaign has no frozen protection map. Review and explicitly lock levels before using automatic L2/L3 exits.")
+                st.warning("No locked protective levels. Confirm the current available barriers before automatic exits.")
                 legs=[x for x in _sb_active_leg_rows(trade) if str(x['leg'].get('side') or '').upper()=='SELL' and
                       str(x['leg'].get('option_type') or '').upper() in {'CE','PE'}]
                 if len(legs)==1 and _edge_live_ok(packet) and packet.get('odme_live') and lm.get('level_rank_reliable'):
                     leg=legs[0]['leg'];op=str(leg.get('option_type') or '').upper();sp=_sb_num(leg.get('strike'))
                     ladder=(lm.get('below') if op=='PE' else lm.get('above')) or []
-                    if len(ladder)>=3 and sp is not None:
-                        protection=sum(1 for g in ladder[:3] if (float(g['far'])>sp if op=='PE' else float(g['far'])<sp))
-                        with st.expander('Confirm protection map for existing campaign'):
-                            st.write(' · '.join(f"L{i+1}: {_sb_fmt_level(g['far'])}" for i,g in enumerate(ladder[:3])))
-                            st.caption(f"Protective barriers ahead of strike: {protection}. Levels will remain locked until you confirm a roll.")
-                            if st.button('I confirm — lock these campaign levels',key=f"lock_old_{trade.get('trade_id')}"):
-                                lock={"option_type":op,"locked_at":datetime.now(timezone.utc).isoformat(),
-                                      "source_exec_tf":ctx.get('exec_tf'),"protective_rank":protection}
-                                for rank,g in enumerate(ladder[:3],1):
-                                    lock[f"l{rank}"]={"boundary":float(g['far']),"labels":list(g.get('labels') or [])}
-                                md['locked_protection']=lock
-                                md['management_revision']=int(md.get('management_revision') or 0)+1
-                                updated=dict(trade)
-                                updated['metadata_json']=json.dumps(md,default=str,separators=(',',':'))
-                                updated['updated_at']=datetime.now(timezone.utc).isoformat()
-                                store.upsert_superbrain_trade(updated)
-                                st.success('Protection levels recorded. Reopen/scan to apply the new lock.')
-                                st.rerun()
+                    if ladder and sp is not None:
+                        lock=_sb_lock_actual_protection(ladder,op,sp,
+                            datetime.now(timezone.utc).isoformat(),ctx.get('exec_tf'))
+                        if lock:
+                            with st.expander('Confirm protection map for existing campaign'):
+                                st.write(' · '.join(f"L{i}: {_sb_fmt_level(g['far'])}" for i,g in enumerate(ladder[:3],1)))
+                                st.caption('Lock these actual protective barriers for this leg until a confirmed roll.')
+                                if st.button('I confirm — lock these campaign levels',key=f"lock_old_{trade.get('trade_id')}"):
+                                    md['locked_protection']=lock
+                                    md['management_revision']=int(md.get('management_revision') or 0)+1
+                                    updated=dict(trade)
+                                    updated['metadata_json']=json.dumps(md,default=str,separators=(',',':'))
+                                    updated['updated_at']=datetime.now(timezone.utc).isoformat()
+                                    store.upsert_superbrain_trade(updated)
+                                    st.success('Protection levels recorded. Reopen/scan to apply the new lock.')
+                                    st.rerun()
             decisions=_edge_manage_trade(packet,trade)
             for d in decisions:
                 action=d['action'];rank=d.get('required_rank')
@@ -3415,11 +3568,16 @@ def render_public_superbrain() -> None:
                 if action in {'CLOSE','ROLL OUT','EXIT REVIEW'}:st.error(msg)
                 elif action=='REVIEW':st.warning(msg)
                 else:st.info(msg)
-                st.caption(d.get('reason',''))
-                if rank:st.caption(f"Locked L2: {_sb_fmt_level(d.get('locked_l2'))} · Locked L3: {_sb_fmt_level(d.get('locked_l3'))} · EDGE OF: {d.get('of_control')}")
-            _sb_render_management_confirmation(store,packet,trade,setup,analysis,final_decisions=decisions,companion_action=None)
-    _sb_render_odme(packet)
-    _sb_render_trade_confirmation(store,instrument,packet)
+                reason=str(d.get('reason') or '').split('.')[0].strip()
+                if reason:st.caption(reason+'.')
+            with st.expander("Record management action",expanded=False):
+                _sb_render_management_confirmation(store,packet,trade,setup,analysis,final_decisions=decisions,companion_action=None)
+    with st.expander("View ODME levels and full structural map",expanded=False):
+        summary=_sb_level_map_summary(lm)
+        if summary:st.caption(summary)
+        _sb_render_odme(packet)
+    with st.expander("Record executed entry",expanded=False):
+        _sb_render_trade_confirmation(store,instrument,packet)
 
 def _run_expired_cleanup_once(store: Any, show_notice: bool = True) -> None:
     """Automatically remove finished-expiry ODME snapshots once per India date."""

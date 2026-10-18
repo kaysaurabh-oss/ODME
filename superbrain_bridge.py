@@ -13,7 +13,7 @@ from data_store import BaseStore
 from scan_service import run_odme_scan
 from superbrain_reasoner import analyze_market, REASONER_VERSION
 
-SUPERBRAIN_BRIDGE_VERSION = "SB_EDGE_ODME_20261018"
+SUPERBRAIN_BRIDGE_VERSION = "SB_EDGE_ODME_OPTIONAL_CONTEXT_20261018"
 
 
 def _norm(value: Any) -> str:
@@ -49,12 +49,18 @@ def _latest_tv_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
     work = df.copy().fillna("")
     if "source" not in work.columns:
         return []
-    work = work[work["source"].astype(str).str.upper().str.strip().eq("EDGE")].copy()
+    # Only EDGE authorizes decisions. AURORA and LIQUIDITY may add fresh
+    # interpretation; STRUCTURE is neither required nor consumed here.
+    work = work[work["source"].astype(str).str.upper().str.strip().isin({"EDGE", "AURORA", "LIQUIDITY"})].copy()
 
     common = ["updated_at", "source", "tf", "bar_time", "close", "schema_version"]
     source_fields = {
         "AURORA": [
-            "aurora_state", "aurora_prev", "aurora_change", "eta_up_level",
+            "aurora_state", "aurora_prev", "aurora_change",
+            "htf_box_active", "htf_box_low", "htf_box_high", "htf_box_state",
+            "htf_box_breakout", "htf_box_break_confirmed",
+            "htf_range_active", "htf_range_low", "htf_range_high",
+            "eta_up_level",
             "eta_up_regime", "eta_up_locked_remaining_bars", "eta_down_level",
             "eta_down_regime", "eta_down_locked_remaining_bars", "eta_current_atr",
             "eta_up_model_bars", "eta_up_model_distance", "eta_up_model_atr",
@@ -78,6 +84,8 @@ def _latest_tv_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
             "liq_event2_type", "liq_event2_side", "liq_event2_level",
             "liq_event2_confirm_time", "liq_event3_type", "liq_event3_side",
             "liq_event3_level", "liq_event3_confirm_time",
+            "liq_event4_type", "liq_event4_side", "liq_event4_level", "liq_event4_confirm_time",
+            "liq_event5_type", "liq_event5_side", "liq_event5_level", "liq_event5_confirm_time",
         ],
         "EDGE": [
             "macro", "macro_tf", "macro_score", "battlefield_paired",
@@ -131,6 +139,30 @@ def _latest_tv_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
                     # make persistence fail.
                     value = str(value)[:12000]
             compact[key] = value
+        if source == "AURORA":
+            # Future AURORA HTF box fields may arrive only in the existing JSON
+            # envelope. Do not infer a box when no explicit box fields exist.
+            raw = _load_json_object(row.get("raw_json", ""))
+            box = raw.get("htf_box") if isinstance(raw.get("htf_box"), dict) else {}
+            for key in ("htf_box_active", "htf_box_low", "htf_box_high",
+                        "htf_box_state", "htf_box_breakout", "htf_box_break_confirmed",
+                        "htf_range_active", "htf_range_low", "htf_range_high"):
+                if key not in compact and key in raw and raw[key] not in (None, ""):
+                    compact[key] = raw[key]
+            if box:
+                for dst, aliases in {
+                    "htf_box_active": ("active", "valid"),
+                    "htf_box_low": ("low", "bottom"),
+                    "htf_box_high": ("high", "top"),
+                    "htf_box_state": ("state",),
+                    "htf_box_breakout": ("breakout",),
+                    "htf_box_break_confirmed": ("break_confirmed",),
+                }.items():
+                    if dst not in compact:
+                        for alias in aliases:
+                            if box.get(alias) not in (None, ""):
+                                compact[dst] = box[alias]
+                                break
         out.append(compact)
     return out
 
@@ -344,7 +376,10 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
         stage = "LOAD_TV_CURRENT"
         tv_rows = store.load_tv_current(instrument)
         if tv_rows is not None and not tv_rows.empty and "source" in tv_rows.columns:
-            tv_rows = tv_rows[tv_rows["source"].astype(str).str.upper().str.strip().eq("EDGE")].copy()
+            # EDGE is mandatory for decisions. Other source rows are optional
+            # context only: stale or missing ones are silently ignored.
+            tv_rows = tv_rows[tv_rows["source"].astype(str).str.upper().str.strip().isin(
+                {"EDGE", "AURORA", "LIQUIDITY"})].copy()
         odme_outcome: Dict[str, Any] = {}
         odme_error = ""
         odme_live = False
@@ -370,7 +405,9 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
                 odme_error = f"{type(exc).__name__}: {exc}"
 
         stage = "LOAD_MATCHED_ODME_HISTORY"
-        latest_odme = store.load_latest_odme_for_instrument(instrument)
+        # In EDGE-only mode, do not read ANY ODME snapshots (even stale ones).
+        latest_odme = (store.load_latest_odme_for_instrument(instrument)
+                       if bool(map_row.get("odme_scan_enabled")) else {})
         sources = []
         if tv_rows is not None and not tv_rows.empty and "source" in tv_rows.columns:
             sources = sorted({str(x).strip() for x in tv_rows["source"] if str(x).strip()})

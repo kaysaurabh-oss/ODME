@@ -1,13 +1,14 @@
-"""WISH SuperBrain EDGE-only context engine. All values read from EDGE, not re-calculated.
+"""WISH SuperBrain context engine.
 
-No AURORA, STRUCTURE, LIQUIDITY or unverified broker inputs. ODME direction is
-optional scan context; option actions belong exclusively to Level 3 app policy.
+EDGE is the sole market authority. Fresh candle AURORA and LIQUIDITY are
+optional explanatory observations, never substitutes for manual Renko AURORA.
 """
 from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-REASONER_VERSION='SB_EDGE_ONLY_20261018_V1'
+REASONER_VERSION='SB_EDGE_OPTIONAL_CONTEXT_20261018_V2'
+from superbrain_optional_context import relevant_optional_context
 
 
 def _num(v):
@@ -116,10 +117,11 @@ def analyze_market(evidence:Dict[str,Any],previous_evidence:Dict[str,Any],open_t
                 interactions.append(f"Nearest {z.get('side','FP')} {_fmt(_num(z.get('low')))}–{_fmt(_num(z.get('high')))}; state {z.get('status') or z.get('context') or 'active'}; strength {z.get('strength') or 'not reported'}.")
     lines.extend(interactions[:2])
     if not interactions:lines.append('No material FP interaction currently reported. Wait for the next confirmed EDGE event.')
+    optional = relevant_optional_context(evidence.get('tv') or [], current) if valid else []
     odme=evidence.get('odme') or {}
     if odme:
         lines.append(f"ODME reference: POC {_fmt(_num(odme.get('option_poc')))}, CE wall {_fmt(_num(odme.get('ce_wall')))}, PE wall {_fmt(_num(odme.get('pe_wall')))}, safer CE {_fmt(_num(odme.get('safer_sell_ce')))}, safer PE {_fmt(_num(odme.get('safer_sell_pe')))}. Use only after fresh ODME scan.")
-    return {'reasoner_version':REASONER_VERSION,'price':price,'macro':macro,'exec_of':of,
+    return {'optional_context': optional,'reasoner_version':REASONER_VERSION,'price':price,'macro':macro,'exec_of':of,
       'edge_active':valid,'posture':'EDGE_ONLY_SCAN_ODME' if valid else 'NO_ENTRY_STALE_EDGE',
       'lines':lines,'defender':{'side':current.get('defender_side'),'low':_num(current.get('defender_low')),'high':_num(current.get('defender_high'))},
       'challenger':{'side':current.get('challenger_side'),'low':_num(current.get('challenger_low')),'high':_num(current.get('challenger_high'))},

@@ -133,3 +133,81 @@ def campaign_decision(option_type: str, of_control: str, broken_l2: bool,
     return {'action':'CLOSE','trigger':f'ADVERSE_L{exit_rank}' if not odme_adverse else 'ODME_EXPANSION',
             'required_rank':exit_rank,'target':None,
             'reason':reason+' No verified safer same-direction strike is available.'}
+
+
+# ---------------------------------------------------------------------------
+# Non-optionable / ODME-disabled market action. This ONLY reads EDGE facts and
+# manual Renko AURORA bias; it never calls ODME and does not invent stock orders.
+# ---------------------------------------------------------------------------
+def cash_entry_signal(setup_name: str, fp: Dict[str, Any], price: Optional[float],
+                      active: bool, manual_aurora: str = "CHECK",
+                      max_event_age: int = 2) -> Dict[str, Any]:
+    """A conditional spot/futures direction from an actual FP defence or break.
+
+    The setup is first confirmed PENDING_ENTRY by the EDGE Level-2 service.
+    Merely TOUCHING or BREACH_PENDING is not HOLD and cannot authorize entry.
+    'BREAK' setups require prior accepted break on EDGE and remain beyond the
+    distal. 'DEFENCE' setups require a recent explicit defence/rejection event.
+    """
+    wait = lambda reason: {"status": "WAIT", "reason": reason, "direction": "", "stage": ""}
+    if not active:
+        return wait("EDGE execution feed is not fresh/active; no new action.")
+    name = str(setup_name or "").upper()
+    side = str(fp.get("side") or "").upper()
+    event = str(fp.get("eventType") or fp.get("event_type") or "").upper()
+    status = str(fp.get("status") or "").upper()
+    context = str(fp.get("contextState") or fp.get("context_state") or fp.get("context") or "").upper()
+    try:
+        lo,hi,px = float(fp.get("low")),float(fp.get("high")),float(price)
+    except (ValueError,TypeError):
+        return wait("Confirmed FP zone/price is missing.")
+    if not all(v==v and abs(v)!=float('inf') for v in (lo,hi,px)) or lo>hi:
+        return wait("Invalid FP zone/price.")
+    if side not in {"DEMAND","SUPPLY"}:
+        return wait("Unknown FP side.")
+    breaking = name in {"SHORT_CE_AFTER_DEMAND_BREAK", "SHORT_PE_AFTER_SUPPLY_BREAK"}
+    if breaking:
+        if (side == "DEMAND" and name != "SHORT_CE_AFTER_DEMAND_BREAK") or (side == "SUPPLY" and name != "SHORT_PE_AFTER_SUPPLY_BREAK"):
+            return wait("Break setup does not match its originating FP.")
+        if not (px<lo if side=="DEMAND" else px>hi):
+            return wait("Broken FP is no longer accepted beyond its distal level.")
+        action = "SELL" if side=="DEMAND" else "BUY"
+        stage = "ACCEPTED_BREAK"
+        explanation = f"{side.title()} FP {lo:g}–{hi:g} broken; price remains beyond the distal."
+    else:
+        if name not in {"LONG_FROM_DEMAND","LONG_REVERSAL_FROM_DEMAND","LONG_FROM_DEMAND_UNRESOLVED",
+                        "SHORT_FROM_SUPPLY","SHORT_REVERSAL_FROM_SUPPLY","SHORT_FROM_SUPPLY_UNRESOLVED"}:
+            return wait("No recognized current EDGE defence setup.")
+        if (side=="DEMAND" and not name.startswith('LONG')) or (side=="SUPPLY" and not name.startswith('SHORT')):
+            return wait("Setup and FP sides do not agree.")
+        if status == "RUN" or event == "RUN" or "BREACH_PENDING" in context:
+            return wait("FP defence is breached/pending; do not treat a touch as a hold.")
+        defence = any(word in event for word in ("DEFENCE","DEFENSE","HOLD","REJECT")) or \
+                  status in {"HELD","HOLD","DEFENDED","DEFENDED_CONFIRMED","REJECTED"}
+        if not defence:
+            return wait("FP touched, but no explicit EDGE defence/rejection event yet.")
+        age = fp.get("barsSinceEvent",fp.get("bars_since_event"))
+        if age not in (None,""):
+            try:
+                if int(float(age))>max_event_age:
+                    return wait("Latest FP defence event is no longer recent; wait for a new confirmed interaction.")
+            except (TypeError,ValueError):
+                return wait("FP event age cannot be verified.")
+        if not (px>=lo if side=="DEMAND" else px<=hi):
+            return wait("Price has moved through the FP; defence no longer supports entry.")
+        action = "BUY" if side=="DEMAND" else "SELL"
+        stage = "EARLY_DEFENCE" if "ABSORPTION" in event or "AGGRESSIVE" in event or "WAITING" in context else "FP_HOLD"
+        explanation = f"{side.title()} FP {lo:g}–{hi:g} shows {stage.replace('_',' ').lower()}."
+    aur = str(manual_aurora or "CHECK").upper()
+    required = "BULLISH" if action=="BUY" else "BEARISH"
+    invalidation = lo if action=="BUY" else hi
+    out = {"status":"CHECK AURORA","direction":action,"stage":stage,
+           "reason":explanation, "required_aurora":required,"invalidation_reference":invalidation,
+           "confirmed_action":f"{action} only when manual Renko AURORA is {required}."}
+    if aur == required:
+        out["status"] = "ENTRY READY"
+        out["reason"] = explanation+f" Manual Renko AURORA {aur} agrees."
+    elif aur in {"BULLISH","NEUTRAL","BEARISH"}:
+        out["status"] = "WAIT"
+        out["reason"] = explanation+f" Manual Renko AURORA {aur} does not permit {action}."
+    return out
