@@ -9,11 +9,11 @@ from typing import Any, Dict, List
 import pandas as pd
 
 from angel_connector import AngelConnector, load_angel_credentials
-from data_store import BaseStore, make_key
+from data_store import BaseStore
 from scan_service import run_odme_scan
 from superbrain_reasoner import analyze_market, REASONER_VERSION
 
-SUPERBRAIN_BRIDGE_VERSION = "SB3.6_FINAL_CONTEXT_LIQUIDITY_WATCH"
+SUPERBRAIN_BRIDGE_VERSION = "SB_EDGE_ODME_20261018"
 
 
 def _norm(value: Any) -> str:
@@ -26,125 +26,6 @@ def _as_bool(value: Any) -> bool:
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
-
-
-def _compact_path_for_memory(path: Any) -> Dict[str, Any]:
-    """Bounded Non-Arrival route summary that survives Sheet cell guards.
-
-    Detailed route evidence remains in the live scan.  This sidecar keeps only
-    the fields needed to recover the actionable ETA/safe-through decision when
-    market_state_json is too large for a single Google Sheets cell.
-    """
-    if not isinstance(path, dict):
-        return {}
-    keys = (
-        "available", "fastest_hours", "expected_hours",
-        "fastest_arrival", "expected_arrival", "safe_through",
-        "protected_through_expiry", "expiry", "hurdle_count",
-        "structural_friction", "oi_friction", "path_multiplier",
-    )
-    out = {k: path.get(k) for k in keys if path.get(k) not in (None, "", [], {})}
-
-    hurdles: List[Dict[str, Any]] = []
-    for row in (path.get("hurdles") or [])[:6]:
-        if not isinstance(row, dict):
-            continue
-        slim_keys = (
-            "side", "level", "low", "high", "tf", "source",
-            "status", "strength", "strength_score", "weight", "distance",
-        )
-        slim = {k: row.get(k) for k in slim_keys if row.get(k) not in (None, "", [], {})}
-        if slim:
-            hurdles.append(slim)
-    if hurdles:
-        out["hurdles"] = hurdles
-
-    clusters: List[Dict[str, Any]] = []
-    for row in (path.get("oi_clusters") or [])[:4]:
-        if not isinstance(row, dict):
-            continue
-        slim_keys = ("strike", "oi", "combined_oi", "distance", "weight", "option")
-        slim = {k: row.get(k) for k in slim_keys if row.get(k) not in (None, "", [], {})}
-        if slim:
-            clusters.append(slim)
-    if clusters:
-        out["oi_clusters"] = clusters
-    return out
-
-
-def _compact_na_candidate_for_memory(candidate: Any, evidence: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(candidate, dict) or not candidate.get("strike"):
-        return {}
-    odme = evidence.get("odme", {}) or {}
-    option = _norm(candidate.get("option"))
-    safer = odme.get("safer_sell_pe") if option == "PE" else odme.get("safer_sell_ce") if option == "CE" else ""
-    strike = candidate.get("strike")
-    boundary_eligible = None
-    try:
-        strike_f = float(strike)
-        safer_f = float(safer)
-        boundary_eligible = strike_f <= safer_f if option == "PE" else strike_f >= safer_f if option == "CE" else None
-    except Exception:
-        pass
-
-    keys = (
-        "option", "strike", "premium", "ltp", "bid", "ask", "mark",
-        "lot_size", "estimated_iv", "delta", "gamma", "theta_day", "vega",
-        "reward", "stress_risk", "rr", "stress_spot", "stress_time",
-        "stress_iv", "score", "tactical_score", "oi", "volume", "setup_class",
-        "setup_freshness", "tactical_theta", "planned_holding_hours",
-        "planned_holding_window", "safe_through_trade_window",
-        "window_protection_ratio", "theta_capture_est", "inside_safer_reference",
-        "odme_side_sale_preferred",
-    )
-    out = {k: candidate.get(k) for k in keys if candidate.get(k) not in (None, "", [], {})}
-    if safer not in (None, ""):
-        out["odme_safer_boundary"] = safer
-    if boundary_eligible is not None:
-        out["boundary_eligible"] = bool(boundary_eligible)
-    path = _compact_path_for_memory(candidate.get("path", {}) or {})
-    if path:
-        out["path"] = path
-    return out
-
-
-def _compact_nonarrival_for_memory(analysis: Dict[str, Any], evidence: Dict[str, Any]) -> Dict[str, Any]:
-    """Compact actionable NA sidecar written inside existing metadata_json.
-
-    No extra Sheet call, tab, column, webhook payload, or lock is introduced.
-    """
-    na = analysis.get("nonarrival_assessment", {}) or {}
-    plan = analysis.get("trade_plan", {}) or {}
-    odme = evidence.get("odme", {}) or {}
-    if not na and not odme:
-        return {}
-
-    out: Dict[str, Any] = {
-        "schema": "SBNA1_COMPACT",
-        "decision": na.get("decision", ""),
-        "compact_line": na.get("compact_line") or na.get("text") or analysis.get("compact_nonarrival", ""),
-        "strategy_type": plan.get("strategy_type", ""),
-        "setup_class": na.get("setup_class") or plan.get("nonarrival_class") or plan.get("setup_class") or "",
-        "spot": odme.get("spot", ""),
-        "expiry": odme.get("expiry", ""),
-        "safer_sell_pe": odme.get("safer_sell_pe", ""),
-        "safer_sell_ce": odme.get("safer_sell_ce", ""),
-        "planned_holding_window": na.get("planned_holding_window") or plan.get("planned_holding_window") or "",
-        "generated_at": evidence.get("scanned_at", ""),
-    }
-    for name in ("candidate", "pe", "ce"):
-        compact = _compact_na_candidate_for_memory(na.get(name), evidence)
-        if compact:
-            out[name] = compact
-
-    # Future reasoner versions may keep the selected candidate only in the trade
-    # plan. Preserve it without changing the current reasoner's calculations.
-    if "candidate" not in out:
-        compact = _compact_na_candidate_for_memory(plan.get("nonarrival_snapshot"), evidence)
-        if compact:
-            out["candidate"] = compact
-
-    return {k: v for k, v in out.items() if v not in (None, "", [], {})}
 
 
 def _safe_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -168,6 +49,7 @@ def _latest_tv_rows(df: pd.DataFrame) -> List[Dict[str, Any]]:
     work = df.copy().fillna("")
     if "source" not in work.columns:
         return []
+    work = work[work["source"].astype(str).str.upper().str.strip().eq("EDGE")].copy()
 
     common = ["updated_at", "source", "tf", "bar_time", "close", "schema_version"]
     source_fields = {
@@ -263,111 +145,9 @@ def _compact_odme(row: Dict[str, Any]) -> Dict[str, Any]:
         "ce_wall_shift", "pe_wall_shift", "poc_shift", "range_shift",
         "bullish_score", "bearish_score", "range_score", "expansion_score",
         "odme_tilt", "safer_sell_ce", "active_ce_wall", "safer_sell_pe",
-        "active_pe_wall", "usable_oi_count", "source", "commentary",
+        "active_pe_wall", "usable_oi_count", "source",
     ]
     return {k: row.get(k) for k in fields if row.get(k) not in (None, "")}
-
-
-def _compact_live_odme(result: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
-    if not result:
-        return {}
-    scores = result.get("scores", {}) or {}
-    out: Dict[str, Any] = {
-        "snapshot_id": meta.get("snapshot_id", ""),
-        "ts": result.get("ts") or meta.get("ts", ""),
-        "instrument": meta.get("instrument", ""),
-        "exchange": meta.get("exchange", ""),
-        "expiry": meta.get("expiry", ""),
-        "spot": result.get("spot") or result.get("future_ltp", ""),
-        "option_poc": result.get("poc", ""),
-        "value_area_low": result.get("value_area_low", ""),
-        "value_area_high": result.get("value_area_high", ""),
-        "ce_wall": result.get("ce_wall", ""),
-        "pe_wall": result.get("pe_wall", ""),
-        "active_ce_wall": result.get("ce_wall", ""),
-        "active_pe_wall": result.get("pe_wall", ""),
-        "safer_sell_ce": result.get("safer_sell_ce", ""),
-        "safer_sell_pe": result.get("safer_sell_pe", ""),
-        "ce_wall_shift": result.get("ce_wall_move", ""),
-        "pe_wall_shift": result.get("pe_wall_move", ""),
-        "poc_shift": result.get("poc_move", ""),
-        "range_shift": result.get("range_move", ""),
-        "bullish_score": scores.get("Bullish", 0),
-        "bearish_score": scores.get("Bearish", 0),
-        "range_score": scores.get("Range", 0),
-        "expansion_score": scores.get("Expansion", 0),
-        "odme_tilt": result.get("tilt", ""),
-        "commentary": result.get("commentary", ""),
-        "premium_alert": result.get("premium_alert", ""),
-        "final_action": result.get("final_action", ""),
-        "hero_action": result.get("hero_action", ""),
-        "ce_action": result.get("ce_action", ""),
-        "pe_action": result.get("pe_action", ""),
-        "path_risk": result.get("path_risk", {}) or {},
-        "usable_oi_count": meta.get("usable_oi_count", ""),
-        "source": meta.get("source", ""),
-    }
-    keys = result.get("key_strikes", {}) or {}
-    premiums: Dict[str, Any] = {}
-    for name in ("ce_wall", "pe_wall", "safer_sell_ce", "safer_sell_pe"):
-        level = result.get(name)
-        try:
-            k = str(int(round(float(level))))
-        except Exception:
-            continue
-        row = keys.get(k, {}) if isinstance(keys, dict) else {}
-        if row:
-            premiums[k] = {"strike": row.get("strike", level), "ce_ltp": row.get("ce_ltp", 0), "pe_ltp": row.get("pe_ltp", 0)}
-    if premiums:
-        out["key_premiums"] = premiums
-    return {k: v for k, v in out.items() if v not in (None, "")}
-
-
-def _apply_trade_plan(store: BaseStore, instrument: str, mode: str, scan_id: str, analysis: Dict[str, Any], open_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    plan = analysis.get("trade_plan", {}) or {}
-    kind = str(plan.get("kind", "") or "").upper()
-    if kind not in {"NEW", "MANAGE"}:
-        return {}
-    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    if kind == "NEW":
-        trade = {
-            "instrument": instrument,
-            "status": "ACTIVE",
-            "strategy_type": plan.get("strategy_type", ""),
-            "direction": plan.get("direction", ""),
-            "scan_id": scan_id,
-            "mode": mode,
-            "action": "ENTER",
-            "thesis": plan.get("reason", ""),
-            "entry_reference": plan.get("entry_reference", ""),
-            "target": plan.get("target", ""),
-            "invalidation": plan.get("invalidation", ""),
-            "expected_eta": plan.get("expected_eta", ""),
-            "risk": plan.get("risk", ""),
-            "reward": plan.get("reward", ""),
-            "rr": plan.get("rr", ""),
-            "legs_json": _json_dumps(plan.get("legs", []) or []),
-            "market_state_json": _json_dumps({"entry_scan_id": scan_id, "entry_price": plan.get("entry_reference", ""), "entry_quality": plan.get("entry_quality", ""), "posture": analysis.get("posture", "")}),
-            "metadata_json": _json_dumps({"entry_quality": plan.get("entry_quality", ""), "late": bool(plan.get("late")), "pullback_low": plan.get("pullback_low", ""), "pullback_high": plan.get("pullback_high", ""), "reasoner_version": analysis.get("reasoner_version", "")}),
-            "created_at": now,
-            "updated_at": now,
-        }
-        saved = store.upsert_superbrain_trade(trade)
-    else:
-        trade_id = str(plan.get("trade_id", "") or "")
-        existing = next((dict(x) for x in open_trades if str(x.get("trade_id", "")) == trade_id), {})
-        if not existing:
-            return {}
-        trade = dict(existing)
-        action = str(plan.get("action", "HOLD") or "HOLD").upper()
-        status = str(plan.get("status", "ACTIVE") or "ACTIVE").upper()
-        trade.update({"instrument": instrument, "trade_id": trade_id, "status": status, "scan_id": scan_id, "mode": mode, "action": action, "thesis": plan.get("reason", trade.get("thesis", "")), "updated_at": now})
-        if action == "EXIT":
-            trade["close_reason"] = plan.get("reason", "")
-        saved = store.upsert_superbrain_trade(trade)
-    analysis["recorded_exposure"] = {"trade_id": saved.get("trade_id", ""), "status": saved.get("status", ""), "strategy_type": saved.get("strategy_type", ""), "direction": saved.get("direction", ""), "action": saved.get("action", "")}
-    plan["trade_id"] = saved.get("trade_id", "")
-    return saved
 
 
 def _load_json_object(value: Any) -> Dict[str, Any]:
@@ -403,6 +183,7 @@ def build_instrument_map(store: BaseStore) -> pd.DataFrame:
         )
 
     tv = tv.copy().astype(str).fillna("")
+    tv = tv[tv["source"].str.upper().str.strip().eq("EDGE")].copy()
     tv["_instrument"] = tv["instrument"].map(_norm)
     tv = tv[tv["_instrument"].ne("")]
 
@@ -456,8 +237,6 @@ def _persist_scan_memory(
     mapping: Dict[str, Any],
     tv_rows: pd.DataFrame,
     latest_odme: Dict[str, Any],
-    live_odme_result: Dict[str, Any],
-    live_odme_meta: Dict[str, Any],
     odme_live: bool,
     odme_error: str,
     open_trades: List[Dict[str, Any]],
@@ -475,7 +254,7 @@ def _persist_scan_memory(
     # Persistent memory stores a compact comparison state only. Detailed live
     # truth remains in TV_TEST_CURRENT / odme_snapshots and is reread each scan.
     tv_compact = _latest_tv_rows(tv_rows)
-    odme_compact = _compact_live_odme(live_odme_result or {}, live_odme_meta or {}) if odme_live and live_odme_result else _compact_odme(latest_odme or {})
+    odme_compact = _compact_odme(latest_odme or {})
     mapping_compact = {
         "instrument": mapping.get("instrument", instrument),
         "odme_scan_enabled": bool(mapping.get("odme_scan_enabled")),
@@ -498,16 +277,6 @@ def _persist_scan_memory(
 
     previous_compact = _load_json_object(previous.get("market_state_json", ""))
     analysis = analyze_market(evidence, previous_compact, open_trades=open_trades)
-    saved_trade = _apply_trade_plan(store, instrument, mode, scan_id, analysis, open_trades)
-    active_ids = [str(x.get("trade_id", "")) for x in open_trades if str(x.get("trade_id", "")).strip()]
-    if saved_trade:
-        tid = str(saved_trade.get("trade_id", "") or "")
-        terminal = {"CLOSED", "EXIT", "TARGET", "INVALIDATED", "EXPIRED", "CANCELLED"}
-        if str(saved_trade.get("status", "")).upper() in terminal:
-            active_ids = [x for x in active_ids if x != tid]
-        elif tid and tid not in active_ids:
-            active_ids.append(tid)
-    evidence["open_trade_ids"] = active_ids
     evidence["analysis"] = analysis
 
     # Fingerprint the exact inputs in memory, but do not write that huge payload
@@ -532,13 +301,11 @@ def _persist_scan_memory(
         "market_state_json": _json_dumps(evidence),
         "previous_state_json": _json_dumps(previous_compact) if previous_compact else "",
         "metadata_json": _json_dumps({
-            "open_trade_count": len(evidence.get("open_trade_ids", [])),
+            "open_trade_count": len(open_trades),
             "memory_schema": "SBMEM2_COMPACT",
             "bridge_version": SUPERBRAIN_BRIDGE_VERSION,
             "reasoner_version": REASONER_VERSION,
             "tv_source_count": len(tv_compact),
-            "nonarrival_schema": "SBNA1_COMPACT",
-            "nonarrival": _compact_nonarrival_for_memory(analysis, evidence),
         }),
         "updated_at": now,
     }
@@ -555,7 +322,7 @@ def _persist_scan_memory(
 
 
 def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]:
-    """Ask SuperBrain orchestration packet with explicit stage diagnostics.
+    """Phase-2 orchestration packet for Ask SuperBrain with explicit stage diagnostics.
 
     No trade decisions are invented here. BTCUSD and any other instrument without
     ODME remain on the TV-only path. Each failure reports the exact orchestration
@@ -576,14 +343,16 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
 
         stage = "LOAD_TV_CURRENT"
         tv_rows = store.load_tv_current(instrument)
+        if tv_rows is not None and not tv_rows.empty and "source" in tv_rows.columns:
+            tv_rows = tv_rows[tv_rows["source"].astype(str).str.upper().str.strip().eq("EDGE")].copy()
         odme_outcome: Dict[str, Any] = {}
         odme_error = ""
         odme_live = False
 
         # Exact-match ODME is optional. TV-only instruments never call Angel/ODME.
-        expiry = str(map_row.get("selected_expiry", "") or "").strip()
-        if expiry:
+        if bool(map_row.get("odme_scan_enabled")):
             stage = "OPTIONAL_ODME_REFRESH"
+            expiry = str(map_row.get("selected_expiry", "") or "").strip()
             try:
                 angel = AngelConnector(load_angel_credentials())
                 angel.login_automatic()
@@ -615,8 +384,6 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
             mapping=map_row,
             tv_rows=tv_rows,
             latest_odme=latest_odme,
-            live_odme_result=(odme_outcome.get("result", {}) if odme_outcome else {}),
-            live_odme_meta=(odme_outcome.get("meta", {}) if odme_outcome else {}),
             odme_live=odme_live,
             odme_error=odme_error,
             open_trades=open_trades,
@@ -638,783 +405,7 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
             "superbrain_build": SUPERBRAIN_BRIDGE_VERSION,
         }
     except Exception as exc:
-        raise RuntimeError(str(exc)) from exc
+        raise RuntimeError(
+            f"{SUPERBRAIN_BRIDGE_VERSION} [{stage}] {type(exc).__name__}: {exc}"
+        ) from exc
 
-
-# ============================================================================
-# SB3.7 campaign / expression management overrides
-# ============================================================================
-SUPERBRAIN_BRIDGE_VERSION = "SB3.7_CAMPAIGN_EXPRESSION_MANAGER"
-
-_compact_live_odme_sb36 = _compact_live_odme
-_apply_trade_plan_sb36 = _apply_trade_plan
-
-
-def _load_json_list(value: Any) -> List[Dict[str, Any]]:
-    if isinstance(value, list):
-        return [dict(x) for x in value if isinstance(x, dict)]
-    try:
-        parsed = json.loads(str(value or ""))
-        return [dict(x) for x in parsed if isinstance(x, dict)] if isinstance(parsed, list) else []
-    except Exception:
-        return []
-
-
-def _compact_live_odme(result: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
-    """SB3.7: retain the exact nearest live option strike for defined-risk expression.
-
-    This does not change ODME or its Sheet schema.  It only carries a tiny live
-    ATM snapshot into the SuperBrain evidence packet when ODME already returned
-    the option-chain key_strikes map.
-    """
-    out = dict(_compact_live_odme_sb36(result, meta) or {})
-    try:
-        spot = float(result.get("spot") or result.get("future_ltp"))
-    except Exception:
-        spot = None
-    keys = result.get("key_strikes", {}) or {}
-    if spot is not None and isinstance(keys, dict) and keys:
-        candidates: List[Dict[str, Any]] = []
-        for raw_key, raw_row in keys.items():
-            row = raw_row if isinstance(raw_row, dict) else {}
-            try:
-                strike = float(row.get("strike", raw_key))
-            except Exception:
-                continue
-            candidates.append({"strike": strike, "row": row})
-        if candidates:
-            nearest = min(candidates, key=lambda x: abs(x["strike"] - spot))
-            row = nearest["row"]
-            out["atm_strike"] = nearest["strike"]
-            for src, dst in (("ce_ltp", "atm_ce_ltp"), ("pe_ltp", "atm_pe_ltp")):
-                try:
-                    value = float(row.get(src, 0) or 0)
-                except Exception:
-                    value = 0.0
-                if value > 0:
-                    out[dst] = value
-    return out
-
-
-def _campaign_leg_label(leg: Dict[str, Any]) -> str:
-    side = str(leg.get("side", "") or "").upper()
-    option = str(leg.get("option", "") or "").upper()
-    kind = str(leg.get("instrument_type", "") or "").upper()
-    strike = leg.get("strike", "")
-    if option in {"CE", "PE"}:
-        try:
-            strike_text = str(int(round(float(strike))))
-        except Exception:
-            strike_text = str(strike or "ATM")
-        return f"{side} {strike_text} {option}".strip()
-    if kind == "FUTURES" or str(leg.get("contract", "") or "").upper() == "FUTURES":
-        return f"{side} FUTURES".strip()
-    return f"{side} {kind}".strip()
-
-
-def _normalise_campaign_legs(trade: Dict[str, Any], now: str) -> List[Dict[str, Any]]:
-    trade_id = str(trade.get("trade_id", "") or "")
-    legs = _load_json_list(trade.get("legs_json"))
-    strategy = str(trade.get("strategy_type", "") or "").upper()
-    direction = str(trade.get("direction", "") or "").upper()
-    if not legs and strategy in {"FUTURES_LONG", "FUTURES_SHORT"}:
-        legs = [{
-            "side": "BUY" if strategy == "FUTURES_LONG" else "SELL",
-            "instrument_type": "FUTURES",
-            "contract": "FUTURES",
-            "role": "PRIMARY",
-            "status": "ACTIVE",
-            "entry_reference": trade.get("entry_reference", ""),
-        }]
-    out: List[Dict[str, Any]] = []
-    for idx, raw in enumerate(legs):
-        leg = dict(raw)
-        if not leg.get("leg_id"):
-            suffix = hashlib.sha1(f"{trade_id}|{idx}|{_campaign_leg_label(leg)}".encode("utf-8")).hexdigest()[:8].upper()
-            leg["leg_id"] = f"LEG-{suffix}"
-        leg.setdefault("status", "ACTIVE")
-        leg.setdefault("role", "PRIMARY" if idx == 0 else "INCOME")
-        if not leg.get("instrument_type"):
-            leg["instrument_type"] = "OPTION" if str(leg.get("option", "") or "").upper() in {"CE", "PE"} else "FUTURES"
-        leg.setdefault("opened_at", str(trade.get("created_at", "") or now))
-        leg.setdefault("entry_reference", trade.get("entry_reference", ""))
-        if direction:
-            leg.setdefault("campaign_direction", direction)
-        out.append(leg)
-    return out
-
-
-def _decorate_new_leg(raw: Dict[str, Any], now: str, entry_reference: Any, role: str = "PRIMARY") -> Dict[str, Any]:
-    leg = dict(raw or {})
-    leg.setdefault("leg_id", f"LEG-{uuid.uuid4().hex[:10].upper()}")
-    leg.setdefault("status", "ACTIVE")
-    leg.setdefault("role", role)
-    if not leg.get("instrument_type"):
-        leg["instrument_type"] = "OPTION" if str(leg.get("option", "") or "").upper() in {"CE", "PE"} else "FUTURES"
-    leg.setdefault("opened_at", now)
-    leg.setdefault("entry_reference", entry_reference)
-    return leg
-
-
-def _campaign_event(event_type: str, now: str, scan_id: str, reason: str, before: List[Dict[str, Any]], after: List[Dict[str, Any]], extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    before_active = [_campaign_leg_label(x) for x in before if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"]
-    after_active = [_campaign_leg_label(x) for x in after if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"]
-    event = {
-        "ts": now,
-        "scan_id": scan_id,
-        "event": event_type,
-        "reason": reason,
-        "before": before_active,
-        "after": after_active,
-        "closed_legs": [x for x in before_active if x not in after_active],
-        "opened_legs": [x for x in after_active if x not in before_active],
-    }
-    if extra:
-        event.update(extra)
-    return event
-
-
-def _apply_trade_plan(store: BaseStore, instrument: str, mode: str, scan_id: str, analysis: Dict[str, Any], open_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """SB3.7 campaign persistence.
-
-    One TRADE row is the campaign header.  Multiple coordinated expressions are
-    kept as legs in legs_json.  metadata_json contains a bounded campaign event
-    ledger.  No broker execution is performed here.
-    """
-    plan = analysis.get("trade_plan", {}) or {}
-    kind = str(plan.get("kind", "") or "").upper()
-    if kind not in {"NEW", "MANAGE"}:
-        return {}
-    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-    if kind == "NEW":
-        trade_id = str(plan.get("trade_id", "") or f"SB-{uuid.uuid4().hex[:12].upper()}")
-        strategy = str(plan.get("strategy_type", "") or "").upper()
-        raw_legs = [dict(x) for x in (plan.get("legs", []) or []) if isinstance(x, dict)]
-        if not raw_legs and strategy in {"FUTURES_LONG", "FUTURES_SHORT"}:
-            raw_legs = [{"side": "BUY" if strategy == "FUTURES_LONG" else "SELL", "instrument_type": "FUTURES", "contract": "FUTURES"}]
-        legs = [_decorate_new_leg(x, now, plan.get("entry_reference", ""), "PRIMARY" if i == 0 else "INCOME") for i, x in enumerate(raw_legs)]
-        event = _campaign_event("OPEN_CAMPAIGN", now, scan_id, str(plan.get("reason", "") or ""), [], legs, {"expression": strategy})
-        metadata = {
-            "campaign_schema": "SB_CAMPAIGN1",
-            "campaign_thesis": plan.get("reason", ""),
-            "current_expression": strategy,
-            "entry_quality": plan.get("entry_quality", ""),
-            "late": bool(plan.get("late")),
-            "pullback_low": plan.get("pullback_low", ""),
-            "pullback_high": plan.get("pullback_high", ""),
-            "reasoner_version": analysis.get("reasoner_version", ""),
-            "last_management_reason": plan.get("reason", ""),
-            "campaign_events": [event],
-        }
-        trade = {
-            "instrument": instrument,
-            "trade_id": trade_id,
-            "status": "ACTIVE",
-            "strategy_type": strategy,
-            "direction": plan.get("direction", ""),
-            "scan_id": scan_id,
-            "mode": mode,
-            "action": "ENTER",
-            "thesis": plan.get("reason", ""),
-            "entry_reference": plan.get("entry_reference", ""),
-            "target": plan.get("target", ""),
-            "invalidation": plan.get("invalidation", ""),
-            "expected_eta": plan.get("expected_eta", ""),
-            "risk": plan.get("risk", ""),
-            "reward": plan.get("reward", ""),
-            "rr": plan.get("rr", ""),
-            "legs_json": _json_dumps(legs),
-            "market_state_json": _json_dumps({"entry_scan_id": scan_id, "entry_price": plan.get("entry_reference", ""), "entry_quality": plan.get("entry_quality", ""), "posture": analysis.get("posture", "")}),
-            "metadata_json": _json_dumps(metadata),
-            "created_at": now,
-            "updated_at": now,
-        }
-        saved = store.upsert_superbrain_trade(trade)
-    else:
-        trade_id = str(plan.get("trade_id", "") or "")
-        existing = next((dict(x) for x in open_trades if str(x.get("trade_id", "")) == trade_id), {})
-        if not existing:
-            return {}
-        trade = dict(existing)
-        metadata = _load_json_object(trade.get("metadata_json", ""))
-        events = metadata.get("campaign_events") if isinstance(metadata.get("campaign_events"), list) else []
-        before = _normalise_campaign_legs(trade, now)
-        legs = [dict(x) for x in before]
-        operation = str(plan.get("campaign_operation", "") or "").upper()
-        action = str(plan.get("action", "HOLD") or "HOLD").upper()
-        status = str(plan.get("status", "ACTIVE") or "ACTIVE").upper()
-        reason = str(plan.get("reason", "") or "")
-
-        close_ids = {str(x) for x in (plan.get("close_leg_ids", []) or []) if str(x)}
-        close_options = {str(x).upper() for x in (plan.get("close_option_sides", []) or []) if str(x)}
-        if action == "EXIT" and not operation:
-            operation = "EXIT_CAMPAIGN"
-        if operation == "EXIT_CAMPAIGN":
-            close_ids.update(str(x.get("leg_id", "")) for x in legs if str(x.get("status", "ACTIVE")).upper() == "ACTIVE")
-        if operation == "ROTATE" and not close_ids:
-            close_ids.update(str(x.get("leg_id", "")) for x in legs if str(x.get("status", "ACTIVE")).upper() == "ACTIVE" and str(x.get("role", "PRIMARY")).upper() in {"PRIMARY", "EXPRESSION"})
-
-        for leg in legs:
-            active = str(leg.get("status", "ACTIVE")).upper() == "ACTIVE"
-            option = str(leg.get("option", "") or "").upper()
-            if active and (str(leg.get("leg_id", "")) in close_ids or (option and option in close_options)):
-                leg["status"] = "CLOSED"
-                leg["closed_at"] = now
-                leg["close_reason"] = reason
-
-        new_raw = plan.get("new_legs", []) or []
-        role = "ADD" if operation == "ADD_LEG" else "PRIMARY"
-        for raw in new_raw:
-            if isinstance(raw, dict):
-                legs.append(_decorate_new_leg(raw, now, plan.get("entry_reference", analysis.get("price", "")), role))
-
-        next_strategy = str(plan.get("next_strategy_type", "") or plan.get("strategy_type", "") or trade.get("strategy_type", "")).upper()
-        next_direction = str(plan.get("direction", "") or trade.get("direction", "")).upper()
-        if operation in {"ROTATE", "TRANSFORM", "ADD_LEG", "CLOSE_LEG"} and next_strategy:
-            trade["strategy_type"] = next_strategy
-        if next_direction:
-            trade["direction"] = next_direction
-
-        active_after = [x for x in legs if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"]
-        if not active_after and operation == "EXIT_CAMPAIGN":
-            status = str(plan.get("status", "CLOSED") or "CLOSED").upper()
-        elif active_after:
-            status = "ACTIVE"
-
-        event_type = operation or ({"HOLD": "HOLD_CAMPAIGN", "ADD": "ADD_EXPOSURE", "REDUCE": "REDUCE_EXPOSURE", "EXIT": "EXIT_CAMPAIGN"}.get(action, action or "MANAGE"))
-        material_event = event_type not in {"HOLD_CAMPAIGN", "ADOPT"} or metadata.get("campaign_schema") != "SB_CAMPAIGN1"
-        if material_event or event_type == "ADOPT":
-            events.append(_campaign_event(event_type, now, scan_id, reason, before, legs, {
-                "from_expression": str(existing.get("strategy_type", "") or "").upper(),
-                "to_expression": next_strategy,
-            }))
-            events = events[-40:]
-
-        # Bound leg history so long-lived campaigns stay below the existing
-        # per-cell persistence guard. The event ledger preserves the chronology.
-        active_kept = [x for x in legs if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"]
-        closed_kept = [x for x in legs if str(x.get("status", "ACTIVE")).upper() == "CLOSED"][-20:]
-        legs = active_kept + closed_kept
-
-        metadata.update({
-            "campaign_schema": "SB_CAMPAIGN1",
-            "campaign_thesis": metadata.get("campaign_thesis") or existing.get("thesis", ""),
-            "current_expression": next_strategy,
-            "last_management_reason": reason,
-            "last_campaign_operation": event_type,
-            "reasoner_version": analysis.get("reasoner_version", ""),
-            "campaign_events": events,
-        })
-        trade.update({
-            "instrument": instrument,
-            "trade_id": trade_id,
-            "status": status,
-            "scan_id": scan_id,
-            "mode": mode,
-            "action": action,
-            "updated_at": now,
-            "legs_json": _json_dumps(legs),
-            "metadata_json": _json_dumps(metadata),
-        })
-        # Preserve the campaign thesis.  Management reasons live in metadata/event ledger.
-        if not str(trade.get("thesis", "") or "").strip():
-            trade["thesis"] = metadata.get("campaign_thesis", "")
-        if action == "EXIT" or operation == "EXIT_CAMPAIGN":
-            trade["close_reason"] = reason
-        saved = store.upsert_superbrain_trade(trade)
-
-    saved_legs = _load_json_list(saved.get("legs_json", ""))
-    analysis["recorded_exposure"] = {
-        "trade_id": saved.get("trade_id", ""),
-        "status": saved.get("status", ""),
-        "strategy_type": saved.get("strategy_type", ""),
-        "direction": saved.get("direction", ""),
-        "action": saved.get("action", ""),
-        "campaign_operation": plan.get("campaign_operation", ""),
-        "active_legs": [_campaign_leg_label(x) for x in saved_legs if str(x.get("status", "ACTIVE")).upper() == "ACTIVE"],
-    }
-    plan["trade_id"] = saved.get("trade_id", "")
-    return saved
-
-
-# ============================================================================
-# SB3.8 relevance / path / non-arrival intelligence overrides
-# ============================================================================
-SUPERBRAIN_BRIDGE_VERSION = "SB4.6.2_FARTHEST_EXPIRY_ONLY"
-
-_compact_live_odme_sb37 = _compact_live_odme
-_apply_trade_plan_sb37 = _apply_trade_plan
-
-
-def _sb_expiry_date(value: Any):
-    s = str(value or "").strip().upper()
-    if not s:
-        return None
-    for fmt in ("%d%b%Y", "%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except Exception:
-            pass
-    parsed = pd.to_datetime(s, errors="coerce")
-    if pd.isna(parsed):
-        return None
-    try:
-        return parsed.date()
-    except Exception:
-        return None
-
-
-def _resolve_superbrain_expiry(store: BaseStore, instrument: str, selected_expiry: str) -> str:
-    """Use the farthest valid future expiry known for this instrument.
-
-    A blank selected expiry still means TV-only. When options are enabled by a
-    saved selected expiry, SuperBrain compares that saved expiry with any ODME
-    snapshot expiries already stored for the same instrument and chooses the
-    farthest non-expired date. The setting is rolled forward automatically.
-    """
-    selected = str(selected_expiry or "").strip()
-    if not selected:
-        return ""
-    today = pd.Timestamp.now(tz="Asia/Kolkata").date()
-    candidates = {}
-
-    def add(value: Any) -> None:
-        d = _sb_expiry_date(value)
-        if d is not None and d >= today:
-            candidates[d] = d.strftime("%d%b%Y").upper()
-
-    add(selected)
-    try:
-        hist = store.load_odme_history(limit=100000)
-        if hist is not None and not hist.empty and "instrument" in hist.columns and "expiry" in hist.columns:
-            key = _norm(instrument)
-            matched = hist[hist["instrument"].astype(str).str.upper().str.strip().eq(key)]
-            for value in matched["expiry"].tolist():
-                add(value)
-    except Exception:
-        pass
-
-    if not candidates:
-        return selected
-    chosen = candidates[max(candidates)]
-    if _norm(chosen) != _norm(selected):
-        store.upsert_instrument_setting(instrument, selected_expiry=chosen)
-    return chosen
-
-
-def _positive_float(value: Any) -> float:
-    try:
-        x = float(value)
-        return x if x > 0 else 0.0
-    except Exception:
-        return 0.0
-
-
-def _derive_lot_size_from_master(angel: Any, master: Any, instrument: str, expiry: str) -> int:
-    """Read the existing Angel master only; never change ODME or fetch another feed."""
-    try:
-        rows = angel.get_option_rows(master, instrument)
-        if rows is None or rows.empty:
-            return 1
-        work = rows.copy()
-        if "expiry" in work.columns:
-            matched = work[work["expiry"].astype(str).str.upper().str.strip().eq(str(expiry).upper().strip())]
-            if not matched.empty:
-                work = matched
-        lot_col = next((c for c in ("lotsize", "lot_size", "lotSize") if c in work.columns), None)
-        if not lot_col:
-            return 1
-        vals = pd.to_numeric(work[lot_col], errors="coerce").dropna()
-        vals = vals[vals > 0]
-        if vals.empty:
-            return 1
-        # Angel master should be constant by expiry; mode is robust to duplicate rows.
-        mode = vals.mode()
-        return max(1, int(round(float(mode.iloc[0] if not mode.empty else vals.iloc[0]))))
-    except Exception:
-        return 1
-
-
-def _select_chain_window(result: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Carry only decision-relevant chain rows into SuperBrain.
-
-    ODME itself and its compact Sheet schema are untouched.  The live SuperBrain
-    scan receives a bounded corridor: nearest strikes, safe-boundary candidates,
-    and the strongest OI obstacles between price and those boundaries.
-    """
-    table = result.get("strike_table")
-    if table is None or not hasattr(table, "empty") or table.empty or "strike" not in table.columns:
-        return []
-    work = table.copy()
-    for col in ("strike", "ce_ltp", "pe_ltp", "ce_oi", "pe_oi", "combined_oi", "ce_bid", "ce_ask", "pe_bid", "pe_ask", "ce_volume", "pe_volume"):
-        if col in work.columns:
-            work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
-    spot = _positive_float(result.get("spot") or result.get("future_ltp"))
-    if not spot:
-        return []
-    safe_ce = _positive_float(result.get("safer_sell_ce"))
-    safe_pe = _positive_float(result.get("safer_sell_pe"))
-    work = work[work["strike"] > 0].copy()
-    if work.empty:
-        return []
-
-    chosen = set()
-    nearest = work.assign(_d=(work["strike"] - spot).abs()).sort_values("_d").head(6)
-    chosen.update(nearest.index.tolist())
-
-    if safe_pe:
-        outside = work[work["strike"] <= safe_pe].sort_values("strike", ascending=False).head(4)
-        chosen.update(outside.index.tolist())
-        route = work[(work["strike"] >= safe_pe) & (work["strike"] <= spot)].sort_values("combined_oi", ascending=False).head(8)
-        chosen.update(route.index.tolist())
-    if safe_ce:
-        outside = work[work["strike"] >= safe_ce].sort_values("strike", ascending=True).head(4)
-        chosen.update(outside.index.tolist())
-        route = work[(work["strike"] >= spot) & (work["strike"] <= safe_ce)].sort_values("combined_oi", ascending=False).head(8)
-        chosen.update(route.index.tolist())
-
-    chosen.update(work.sort_values("combined_oi", ascending=False).head(4).index.tolist())
-    selected = work.loc[sorted(chosen)].sort_values("strike").head(32)
-    fields = [
-        "strike", "ce_ltp", "pe_ltp", "ce_oi", "pe_oi", "combined_oi",
-        "ce_bid", "ce_ask", "pe_bid", "pe_ask", "ce_volume", "pe_volume",
-    ]
-    out: List[Dict[str, Any]] = []
-    for _, row in selected.iterrows():
-        rec: Dict[str, Any] = {}
-        for field in fields:
-            if field in row.index:
-                try:
-                    val = float(row.get(field, 0) or 0)
-                except Exception:
-                    val = 0.0
-                if val:
-                    rec[field] = val
-        if rec.get("strike"):
-            out.append(rec)
-    return out
-
-
-def _odme_commentary_section(text: Any, heading: str) -> str:
-    raw = str(text or "")
-    if not raw:
-        return ""
-    target = heading.strip().lower() + ":"
-    lines = raw.splitlines()
-    capture: List[str] = []
-    active = False
-    known = {
-        "odme verdict:", "what changed:", "positioning:", "walls:",
-        "ce action:", "pe action:", "important:", "final action:", "risk note:"
-    }
-    for line in lines:
-        stripped = line.strip()
-        low = stripped.lower()
-        if low.startswith(target):
-            active = True
-            capture.append(stripped.split(":", 1)[1].strip())
-            continue
-        if active and any(low.startswith(k) for k in known):
-            break
-        if active and stripped:
-            capture.append(stripped)
-    return " ".join(x for x in capture if x).strip()
-
-
-def _compact_live_odme(result: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(_compact_live_odme_sb37(result, meta) or {})
-    commentary = result.get("commentary", "") or out.get("commentary", "")
-    if commentary:
-        out.setdefault("ce_action", _odme_commentary_section(commentary, "CE Action"))
-        out.setdefault("pe_action", _odme_commentary_section(commentary, "PE Action"))
-        out.setdefault("final_action", _odme_commentary_section(commentary, "Final Action"))
-        # setdefault keeps any explicit structured ODME fields authoritative.
-        out = {k: v for k, v in out.items() if v not in (None, "")}
-    chain = _select_chain_window(result)
-    if chain:
-        out["chain_window"] = chain
-        strikes = sorted({float(x.get("strike", 0) or 0) for x in chain if _positive_float(x.get("strike"))})
-        diffs = [b - a for a, b in zip(strikes, strikes[1:]) if b > a]
-        if diffs:
-            out["strike_step"] = min(diffs)
-    lot = int(_positive_float(meta.get("lot_size")) or _positive_float(result.get("lot_size")) or 1)
-    out["lot_size"] = max(1, lot)
-    for name in ("hvn", "lvn"):
-        rows = result.get(name)
-        if isinstance(rows, list) and rows:
-            out[name] = rows[:5]
-    return out
-
-
-def _apply_trade_plan(store: BaseStore, instrument: str, mode: str, scan_id: str, analysis: Dict[str, Any], open_trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Manual Level-3 scans are observational until the user confirms an execution.
-
-    NEW entries are persisted only through record_superbrain_trade_taken(). Existing
-    campaigns are read and explained but are never automatically closed, rolled,
-    reduced, added to, or otherwise mutated by a scan. This keeps campaign actions
-    tied to the locked management rules and explicit user execution.
-    """
-    plan = analysis.get("trade_plan", {}) or {}
-    kind = str(plan.get("kind", "") or "").upper()
-    if kind == "NEW":
-        analysis["trade_recording_required"] = True
-        analysis.pop("recorded_exposure", None)
-    elif open_trades:
-        analysis["campaign_scan_only"] = True
-    return {}
-
-
-def list_pending_entry_setups(store: BaseStore, instrument: str) -> List[Dict[str, Any]]:
-    """Return current Level-2 PENDING_ENTRY setup records for one instrument."""
-    try:
-        df = store.list_superbrain_setups(instrument=instrument, statuses=["PENDING_ENTRY"])
-    except Exception:
-        return []
-    rows = _safe_records(df)
-    rows.sort(key=lambda x: str(x.get("updated_at", "") or x.get("created_at", "")), reverse=True)
-    return rows
-
-
-def _setup_metadata(setup: Dict[str, Any]) -> Dict[str, Any]:
-    return _load_json_object((setup or {}).get("metadata_json", ""))
-
-
-def _setup_display_label(setup: Dict[str, Any]) -> str:
-    md = _setup_metadata(setup)
-    name = str(md.get("setup_name") or setup.get("strategy_type") or "SETUP")
-    fp = md.get("fp") if isinstance(md.get("fp"), dict) else {}
-    low = fp.get("low")
-    high = fp.get("high")
-    zone = ""
-    if low not in (None, "") and high not in (None, ""):
-        zone = f" | {low}-{high}"
-    rule_id = str(md.get("setup_id") or "")
-    odme = str(md.get("odme_requirement") or "")
-    return f"{name}{zone} | {rule_id} | ODME: {odme}"
-
-
-def pending_setup_choices(store: BaseStore, instrument: str) -> List[Dict[str, Any]]:
-    """UI-safe pending setup choices with raw records retained for execution handoff."""
-    out = []
-    for row in list_pending_entry_setups(store, instrument):
-        out.append({
-            "record_id": str(row.get("record_id", "") or ""),
-            "label": _setup_display_label(row),
-            "record": row,
-        })
-    return out
-
-
-def _persist_new_trade_after_user_confirmation(
-    store: BaseStore,
-    instrument: str,
-    mode: str,
-    scan_id: str,
-    analysis: Dict[str, Any],
-    open_trades: List[Dict[str, Any]],
-    setup: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Persist the current NEW plan only after the user confirms execution."""
-    plan = analysis.get("trade_plan", {}) or {}
-    if str(plan.get("kind", "") or "").upper() != "NEW":
-        raise ValueError("Current SuperBrain scan does not contain a NEW entry plan.")
-
-    # Use the mature SB3.7 campaign writer directly.  The normal scan-time
-    # wrapper intentionally suppresses NEW persistence in SB4.5.
-    saved = _apply_trade_plan_sb37(store, instrument, mode, scan_id, analysis, open_trades)
-    if not saved:
-        raise RuntimeError("Could not create the ACTIVE campaign record.")
-
-    setup_md = _setup_metadata(setup)
-    trade_meta = _load_json_object(saved.get("metadata_json", ""))
-    setup_name = str(setup_md.get("setup_name") or setup.get("strategy_type") or "")
-    setup_rule_id = str(setup_md.get("setup_id") or "")
-    management_family = (
-        "FP_BREAK_OPTION_CAMPAIGN_MANAGEMENT"
-        if setup_name in {"SHORT_CE_AFTER_DEMAND_BREAK", "SHORT_PE_AFTER_SUPPLY_BREAK"}
-        else "PRIMARY_FP_CAMPAIGN_MANAGEMENT"
-    )
-    trade_meta.update({
-        "parent_setup_id": str(setup.get("record_id", "") or ""),
-        "origin_setup_record_id": str(setup.get("record_id", "") or ""),
-        "origin_setup_id": setup_rule_id,
-        "origin_setup_name": setup_name,
-        "origin_setup_direction": setup_md.get("direction", setup.get("direction", "")),
-        "origin_setup_odme_requirement": setup_md.get("odme_requirement", ""),
-        "origin_setup_fp": setup_md.get("fp", {}),
-        "origin_setup_of_relationship": setup_md.get("of_relationship", ""),
-        "origin_setup_aurora_state": setup_md.get("aurora_state", ""),
-        "origin_setup_pitchfork_state": setup_md.get("pitchfork_state", ""),
-        "origin_setup_rulebook_version": setup_md.get("rulebook_version", ""),
-        "management_family": management_family,
-        "execution_confirmed_by_user": True,
-        "execution_confirmed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-    })
-
-    # Preserve SB4.4 explanation snapshots when present in the live plan.
-    for key in (
-        "expected_behavior", "behavior_health", "behavior_bad_streak",
-        "path_snapshot", "nonarrival_snapshot", "relevance_focus",
-    ):
-        value = plan.get(key)
-        if value not in (None, "", {}, []):
-            trade_meta[key] = value
-
-    saved = dict(saved)
-    saved["metadata_json"] = _json_dumps(trade_meta)
-    saved["updated_at"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    saved = store.upsert_superbrain_trade(saved)
-
-    # Only after the ACTIVE trade exists do we consume the pending setup.
-    entered_setup = store.mark_superbrain_setup_entered(
-        str(setup.get("record_id", "") or ""),
-        str(saved.get("trade_id", "") or ""),
-        execution_meta={
-            "scan_id": scan_id,
-            "strategy_type": saved.get("strategy_type", ""),
-            "direction": saved.get("direction", ""),
-            "entry_reference": saved.get("entry_reference", ""),
-            "management_family": management_family,
-        },
-    )
-
-    analysis["recorded_exposure"] = {
-        "trade_id": saved.get("trade_id", ""),
-        "status": saved.get("status", ""),
-        "strategy_type": saved.get("strategy_type", ""),
-        "direction": saved.get("direction", ""),
-        "action": saved.get("action", ""),
-        "parent_setup_id": setup.get("record_id", ""),
-    }
-    analysis["trade_recording_required"] = False
-    plan["trade_id"] = saved.get("trade_id", "")
-    return {"trade": saved, "setup": entered_setup}
-
-
-def record_superbrain_trade_taken(
-    store: BaseStore,
-    packet: Dict[str, Any],
-    setup_record_id: str,
-) -> Dict[str, Any]:
-    """User-confirmed handoff: PENDING_ENTRY -> ACTIVE campaign + SETUP=ENTERED."""
-    instrument = _norm(packet.get("instrument", ""))
-    if not instrument:
-        raise ValueError("Scan packet has no instrument.")
-    analysis = packet.get("analysis", {}) or {}
-    plan = analysis.get("trade_plan", {}) or {}
-    if str(plan.get("kind", "") or "").upper() != "NEW":
-        raise ValueError("There is no fresh entry plan to record on this scan.")
-
-    pending = list_pending_entry_setups(store, instrument)
-    setup = next((x for x in pending if str(x.get("record_id", "")) == str(setup_record_id or "")), None)
-    if not setup:
-        raise ValueError("Selected setup is no longer PENDING_ENTRY. Refresh SuperBrain before recording the trade.")
-
-    memory = packet.get("memory", {}) or {}
-    scan_id = str(memory.get("scan_id", "") or analysis.get("scan_id", "") or "")
-    mode = str(packet.get("mode", "") or "")
-    open_trades = packet.get("open_trades", []) or []
-    return _persist_new_trade_after_user_confirmation(
-        store, instrument, mode, scan_id, analysis, open_trades, setup
-    )
-
-
-def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]:
-    """Manual Level-3 orchestration.
-
-    A saved expiry enables ODME. If multiple future expiries already exist for
-    the instrument, SuperBrain rolls to the farthest one. After a successful
-    refresh, nearer-expiry snapshots for that instrument are deleted. NEW
-    entries remain advisory until explicit execution confirmation; ACTIVE
-    campaigns are read-only during scans.
-    """
-    instrument = _norm(instrument)
-    stage = "START"
-    try:
-        stage = "BUILD_INSTRUMENT_MAP"
-        mapping = build_instrument_map(store)
-        matched = mapping[mapping["instrument"].eq(instrument)] if not mapping.empty else pd.DataFrame()
-        if matched.empty:
-            raise ValueError(f"{instrument} is not present in TV_TEST_CURRENT.")
-        map_row = matched.iloc[0].to_dict()
-
-        stage = "LOAD_OPEN_SUPERBRAIN_TRADES"
-        open_trades = _open_trade_records(store, instrument)
-
-        stage = "LOAD_TV_CURRENT"
-        tv_rows = store.load_tv_current(instrument)
-        odme_outcome: Dict[str, Any] = {}
-        odme_error = ""
-        odme_live = False
-        pruned_earlier_expiry_snapshots = 0
-
-        stage = "RESOLVE_ODME_EXPIRY"
-        expiry = _resolve_superbrain_expiry(store, instrument, str(map_row.get("selected_expiry", "") or "").strip())
-        if expiry:
-            map_row["selected_expiry"] = expiry
-            stage = "OPTIONAL_ODME_REFRESH"
-            try:
-                angel = AngelConnector(load_angel_credentials())
-                angel.login_automatic()
-                master = angel.load_instrument_master()
-                odme_outcome = run_odme_scan(
-                    store,
-                    angel,
-                    master,
-                    instrument,
-                    expiry,
-                    save_only_if_changed=True,
-                )
-                if isinstance(odme_outcome, dict):
-                    meta = dict(odme_outcome.get("meta", {}) or {})
-                    meta["lot_size"] = _derive_lot_size_from_master(angel, master, instrument, expiry)
-                    odme_outcome["meta"] = meta
-                odme_live = True
-
-                # Only prune after the farthest-expiry refresh succeeded.
-                stage = "PRUNE_NEARER_ODME_EXPIRIES"
-                pruned_earlier_expiry_snapshots = store.delete_earlier_odme_expiries(instrument, expiry)
-            except Exception as exc:
-                odme_error = f"{type(exc).__name__}: {exc}"
-
-        stage = "LOAD_MATCHED_ODME_HISTORY"
-        latest_odme = store.load_latest_odme_snapshot(make_key(instrument, expiry)) if expiry else {}
-        sources = []
-        if tv_rows is not None and not tv_rows.empty and "source" in tv_rows.columns:
-            sources = sorted({str(x).strip() for x in tv_rows["source"] if str(x).strip()})
-
-        mode = "TV + ODME" if odme_live else "TV only"
-        stage = "WRITE_SUPERBRAIN_MEMORY"
-        memory = _persist_scan_memory(
-            store=store,
-            instrument=instrument,
-            mode=mode,
-            mapping=map_row,
-            tv_rows=tv_rows,
-            latest_odme=latest_odme,
-            live_odme_result=(odme_outcome.get("result", {}) if odme_outcome else {}),
-            live_odme_meta=(odme_outcome.get("meta", {}) if odme_outcome else {}),
-            odme_live=odme_live,
-            odme_error=odme_error,
-            open_trades=open_trades,
-        )
-
-        return {
-            "instrument": instrument,
-            "mode": mode,
-            "tv_rows": tv_rows,
-            "tv_sources": sources,
-            "mapping": map_row,
-            "odme_live": odme_live,
-            "odme_outcome": odme_outcome,
-            "latest_odme": latest_odme,
-            "odme_error": odme_error,
-            "open_trades": open_trades,
-            "memory": memory,
-            "analysis": memory.get("analysis", {}),
-            "pruned_earlier_expiry_snapshots": pruned_earlier_expiry_snapshots,
-            "superbrain_build": SUPERBRAIN_BRIDGE_VERSION,
-        }
-    except Exception as exc:
-        raise RuntimeError(str(exc)) from exc
