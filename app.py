@@ -24,6 +24,7 @@ from superbrain_bridge import (
     build_instrument_map,
     prepare_superbrain_scan,
 )
+from superbrain_bias import assess_market_bias
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
@@ -3361,9 +3362,7 @@ def _sb_render_edge_cash_terminal(store: Any, instrument: str, packet: Dict[str,
     row = ctx.get("row") or {}
     healthy = _edge_live_ok(packet)
     _sb_render_freshness(packet)
-    st.caption("EDGE ONLY · no ODME scan · check Renko AURORA manually")
-    st.markdown(f"**Price {_sb_fmt_level(ctx.get('price'))} · OF {row.get('exec_of') or 'UNKNOWN'} · {_sb_short_fp_context(ctx)}**")
-    _sb_show_optional_context(packet)
+    _sb_show_market_bias(packet, ctx, healthy)
     if not healthy:
         st.error("**WAIT** — EDGE data is stale or not on its active execution TF.")
         return
@@ -3439,20 +3438,29 @@ def _sb_render_edge_cash_terminal(store: Any, instrument: str, packet: Dict[str,
     # Option campaign recording and ODME panels are deliberately not called here.
 
 
-def _sb_show_optional_context(packet: Dict[str, Any]) -> None:
-    """One or two materially relevant notes only; no stale/missing-feed warnings.
+def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: bool) -> None:
+    """Display one read-only market bias, not a setup or trade instruction.
 
-    The extra feeds cannot change the EDGE or ODME entry/management policy.
-    Candle AURORA WHITE is a high-priority CHOP caution, not Renko AURORA.
+    The bias deliberately does not enter the EDGE/ODME setup, campaign,
+    recording or Level 2 decision paths.
     """
-    notes=((packet.get("analysis") or {}).get("optional_context") or [])[:2]
-    for item in notes:
-        message=str(item.get("text") or "").strip()
-        if not message:continue
-        if item.get("severity") == "caution":
-            st.warning(message)
-        else:
-            st.caption(message)
+    rows = packet.get("tv_rows")
+    if hasattr(rows, "to_dict"):
+        tv_rows = rows.to_dict("records")
+    elif isinstance(rows, list):
+        tv_rows = [r for r in rows if isinstance(r, dict)]
+    else:
+        tv_rows = []
+    odme = _sb_odme_assessment(packet) if packet.get("odme_live") else None
+    result = assess_market_bias(
+        edge=ctx.get("row") or {},
+        tv_rows=tv_rows,
+        odme=odme,
+        edge_fresh=bool(healthy),
+    )
+    st.markdown(f"**SuperBrain Bias: {result['label']}**")
+    if result.get("basis"):
+        st.caption(result["basis"])
 
 
 def render_public_superbrain() -> None:
@@ -3495,10 +3503,7 @@ def render_public_superbrain() -> None:
     row=ctx.get("row") or {}
     analysis=packet.get("analysis") or {}
     odmea=_sb_odme_assessment(packet)
-    st.markdown(f"**Price {_sb_fmt_level(ctx.get('price'))} · EDGE OF {row.get('exec_of') or 'UNKNOWN'} · ODME {odmea.get('direction') or 'UNKNOWN'}**")
-    fp_note=_sb_short_fp_context(ctx)
-    if fp_note!='Awaiting next FP event':st.caption(fp_note)
-    _sb_show_optional_context(packet)
+    _sb_show_market_bias(packet, ctx, _edge_live_ok(packet))
     lm=_sb_combined_level_ladder(packet,analysis)
     if not packet.get("odme_live"):
         st.warning("**WAIT** — Fresh ODME unavailable; no new trade recommendation.")
