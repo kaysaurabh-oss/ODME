@@ -22,7 +22,6 @@ from superbrain_edge_policy import (
 from superbrain_bridge import (
     build_instrument_map,
     prepare_superbrain_scan,
-    record_superbrain_trade_taken,
 )
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
