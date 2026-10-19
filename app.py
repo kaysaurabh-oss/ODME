@@ -25,6 +25,7 @@ from superbrain_bridge import (
     prepare_superbrain_scan,
 )
 from superbrain_edge_memory import read_edge_tape, intelligent_bias
+from superbrain_market_sessions import session_status, last_session_snapshot
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
@@ -3308,6 +3309,10 @@ def _edge_live_ok(packet: Dict[str, Any]) -> bool:
     dt=_sb_tv_close_dt("EDGE",row)
     if dt is None:return False
     mins=_sb_num(row.get("tf")) or 15.0
+    # Exchange calendar is a safety restriction, never authorization to act.
+    # Closed NSE/MCX sessions can be ANALYSED historically, not traded live.
+    if session_status(str(packet.get('instrument') or row.get('instrument') or ''))['state']=='CLOSED':
+        return False
     age=(datetime.now(timezone.utc)-dt.astimezone(timezone.utc)).total_seconds()/60.0
     return -5.0 <= age <= max(3.0*mins,45.0)
 
@@ -3612,7 +3617,11 @@ def _sb_render_edge_cash_terminal(store: Any, instrument: str, packet: Dict[str,
     with st.expander('Record trade taken (anytime — including WAIT)', expanded=False):
         _sb_render_anytime_entry(store,instrument,packet)
     if not healthy:
-        st.error("**WAIT** — EDGE data is stale or not on its active execution TF.")
+        market=session_status(instrument)
+        if market['state']=='CLOSED':
+            st.info('**NO LIVE ENTRY — MARKET CLOSED.** Previous-session EDGE context is available above; wait for a fresh session before acting.')
+        else:
+            st.error('**WAIT** — EDGE feed is not live or not on its required execution timeframe.')
         return
     pending = [s for s in _sb_pending_setups(store, instrument) if
                str(s.get('status') or '').upper() == 'PENDING_ENTRY']
@@ -3701,14 +3710,28 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
         tv_rows = []
     odme = _sb_odme_assessment(packet) if packet.get("odme_live") else None
     edge_row = ctx.get("row") or {}
-    tape = read_edge_tape(get_store(), str(packet.get("instrument") or edge_row.get("instrument") or "")) if healthy else []
+    symbol=str(packet.get('instrument') or edge_row.get('instrument') or '')
+    market=session_status(symbol)
+    historic=(market['state']=='CLOSED' and
+             last_session_snapshot(symbol,edge_row.get('bar_time')) and
+             str(edge_row.get('edge_tracking_state') or '').upper()=='ACTIVE' and
+             _sb_tf_key(edge_row.get('tf'))==_sb_tf_key(edge_row.get('edge_required_exec_tf') or edge_row.get('exec_tf')))
+    tape = read_edge_tape(get_store(),symbol) if (healthy or historic) else []
     result = intelligent_bias(
         edge=edge_row,
         history=tape,
         tv_rows=tv_rows,
         odme=odme,
-        edge_fresh=bool(healthy),
+        edge_fresh=bool(healthy or historic),
+        # Interpret optional last-session snapshots relative to that session,
+        # not the time the user opens the app hours after the exchange closed.
+        now_ms=_sb_num(edge_row.get('bar_time')) if historic else None,
     )
+    if historic:
+        latest=_sb_tv_close_dt('EDGE',edge_row)
+        last_at=latest.astimezone(ZoneInfo('Asia/Singapore')).strftime('%d %b %H:%M SGT') if latest else 'last recorded close'
+        st.info(f"**MARKET CLOSED — LAST RECORDED SESSION** · {last_at}. "
+                "Bias is historical; no new entry or automatic campaign action until fresh EDGE data arrives after reopening.")
     st.markdown(f"**SuperBrain Bias: {result['label']}**")
     if result.get('commentary') or result.get('basis'):
         st.write(result.get('commentary') or result.get('basis'))
@@ -3827,18 +3850,26 @@ def render_public_superbrain() -> None:
         return
     _sb_render_freshness(packet)
     ctx=_sb_authoritative_edge_context(packet)
-    if not _edge_live_ok(packet):
-        st.error("EDGE is stale, not ACTIVE, on the wrong execution timeframe, or lacks a current FP map. Entry and automated risk decisions are suspended; existing trades may still be recorded manually.")
     row=ctx.get("row") or {}
+    healthy=_edge_live_ok(packet)
+    market=session_status(instrument)
+    if not healthy and market['state']!='CLOSED':
+        st.error('EDGE is not live, not ACTIVE or on the wrong execution timeframe. No new entries or automatic risk decisions. You may still record an executed trade.')
+    elif not healthy and market['state']=='CLOSED' and not last_session_snapshot(instrument,row.get('bar_time')):
+        st.warning('Market closed, but the latest EDGE observation is not from a recent verified session. Historical bias may be unavailable.')
     analysis=packet.get("analysis") or {}
     odmea=_sb_odme_assessment(packet)
-    bias_result=_sb_show_market_bias(packet, ctx, _edge_live_ok(packet)) or {}
+    bias_result=_sb_show_market_bias(packet, ctx, healthy) or {}
     lm=_sb_combined_level_ladder(packet,analysis)
     if not packet.get("odme_live"):
         st.warning("**WAIT** — Fresh ODME unavailable; no new trade recommendation.")
     if lm.get("level_warning"):st.warning(lm["level_warning"])
     active=[t for t in (packet.get("open_trades") or []) if str(t.get("status","ACTIVE") or "ACTIVE").upper() not in {"CLOSED","EXIT","TARGET","INVALIDATED","EXPIRED","CANCELLED"}]
-    pending=_sb_pending_setups(store,instrument)
+    # A previously stored READY setup is never a live entry during a closure
+    # or a feed outage—even if fresh ODME happened to be returned.
+    pending=_sb_pending_setups(store,instrument) if healthy else []
+    if not healthy:
+        st.info('**New entry: WAIT** — live session data required. Previous setups remain stored; no entry is authorised from the last-session scan.')
     if pending:
         st.markdown("### New entry")
         active_setup_ids={str(_sb_json(t.get('metadata_json','')).get('parent_setup_id') or '') for t in active}
@@ -3873,6 +3904,9 @@ def render_public_superbrain() -> None:
         for trade in active:
             setup=_sb_setup_for_trade(store,trade)
             st.write(f"**{trade.get('trade_id') or 'Campaign'} · {_sb_exposure_text(trade)}**")
+            if not healthy:
+                st.info('**PAUSED — NOT A LIVE MANAGEMENT CALL.** Campaign remains recorded. Reassess HOLD / ROLL IN / ROLL OUT / EXIT after the market reopens and a fresh EDGE scan arrives.')
+                continue
             md=_sb_json(trade.get("metadata_json", ""))
             if not md.get("locked_protection"):
                 st.warning("No locked protective levels. Confirm the current available barriers before automatic exits.")

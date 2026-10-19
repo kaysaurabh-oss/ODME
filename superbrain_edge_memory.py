@@ -2,8 +2,8 @@
 
 The Telegram scheduler writes the tape. Streamlit reads it. No effect on existing
 setup recognition, option strikes, campaign mutation or Level 2 alert decisions.
-Never reconstruct missing candles and never treat estimated FP delta as executed
-bid/ask volume. Missing history yields a clearly bounded snapshot-only view.
+Only price may be linearly interpolated across one or two INTRASESSION missing
+candles; never invent OF, FP, delta or market-close bars.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import math
 from typing import Any, Dict, List, Optional
 
 from superbrain_optional_context import _best, _ms, _box_read
+from superbrain_market_sessions import scheduled_trading_minutes, is_open_candle
 
 TAPE_TAB = 'SB_EDGE_TAPE'
 
@@ -40,7 +41,7 @@ def jsondict(v: Any) -> Dict[str, Any]:
         return {}
 
 
-def read_edge_tape(store: Any, instrument: str, max_rows: int=3000) -> List[Dict[str, Any]]:
+def read_edge_tape(store: Any, instrument: str, max_rows: int=9000) -> List[Dict[str, Any]]:
     """Bounded read, fail silent if local-only or tab isn't ready.
 
     The Sheet is provisioned separately; NEVER create or rewrite it from the app.
@@ -53,7 +54,9 @@ def read_edge_tape(store: Any, instrument: str, max_rows: int=3000) -> List[Dict
         cols=34
         headers=ws.row_values(1)[:cols]
         if len(headers)!=cols or headers[0]!='captured_at' or headers[2]!='bar_ms':return []
-        values=ws.get(f'A{start}:AH{last}')
+        # AH contains large JSON FP-hurdle lists; journey reasoning does not
+        # use it. Reading A:AG substantially reduces payload and scan latency.
+        values=ws.get(f'A{start}:AG{last}')
         wanted=str(instrument or '').strip().upper()
         rows=[]
         for row in values:
@@ -91,33 +94,70 @@ def _snap_tape(edge: Dict[str,Any]) -> Dict[str,Any]:
 
 
 def _clean_path(edge:Dict[str,Any],hist:List[Dict[str,Any]]) -> List[Dict[str,Any]]:
-    """Longest recent *observed* uninterrupted run, up to 480 bars / 14d.
+    """Observed 14-day price journey, across known market closures and TF handoffs.
 
-    A timeframe change, missing scheduler samples or nonmonotonic timestamp
-    breaks the journey. In particular we do not interpolate missing candles.
+    Missing 1–2 intraday candles may contribute a synthetic *price only* to
+    smoother price-journey calculations. Synthetic samples are NEVER evidence
+    of order flow, FP delta, zone touches, liquidity events or execution.
     """
     cur=_snap_tape(edge)
     current_ms=_ms(cur.get('bar_ms'))
-    tf=num(cur.get('tf'))
-    if not current_ms or not tf:return []
-    tf_ms=tf*60_000
-    allowed=1.7*tf_ms
+    if not current_ms or not num(cur.get('tf')):return []
     oldest_allowed=current_ms-14*24*60*60_000
-    seen={}
-    for r in hist+[cur]:
-        ms=_ms(r.get('bar_ms'))
-        if not ms or ms>current_ms or ms<oldest_allowed:continue
-        if num(r.get('tf'))!=tf:continue
-        if str(r.get('instrument') or '').strip().upper()!=str(cur.get('instrument') or '').strip().upper():continue
-        seen[int(ms)]=r
-    ordered=[seen[k] for k in sorted(seen)]
+    name=str(cur.get('instrument') or '').strip().upper()
+    observed={}
+    for row in hist+[cur]:
+        ms=_ms(row.get('bar_ms'))
+        tf=num(row.get('tf'))
+        if not ms or ms>current_ms or ms<oldest_allowed or not tf or tf<=0:continue
+        if str(row.get('instrument') or '').strip().upper()!=name:continue
+        if num(row.get('close')) is None:continue
+        observed[int(ms)]=row
+    ordered=[observed[k] for k in sorted(observed)]
     if not ordered:return []
     chain=[ordered[-1]]
-    for r in reversed(ordered[:-1]):
-        if _ms(chain[-1]['bar_ms'])-_ms(r['bar_ms'])>allowed:break
-        chain.append(r)
-        if len(chain)>=480:break
-    return list(reversed(chain))
+    for row in reversed(ordered[:-1]):
+        after=chain[0]
+        previous_ms=_ms(row.get('bar_ms'))
+        after_ms=_ms(after.get('bar_ms'))
+        before_tf=num(row.get('tf')) or 0
+        after_tf=num(after.get('tf')) or 0
+        if not previous_ms or not after_ms or before_tf<=0 or after_tf<=0:break
+        elapsed=(after_ms-previous_ms)/60_000
+        if elapsed<=0:break
+        max_tf=max(before_tf,after_tf)
+        market_minutes=scheduled_trading_minutes(name,previous_ms,after_ms)
+        within_one_bar=elapsed<=1.8*max_tf
+        # Trading minutes excludes known closed sessions; the path continues
+        # without imaginary overnight/weekend/holiday prices or pressures.
+        closure_bridge=(market_minutes is not None and
+                        market_minutes<=3.5*max_tf and elapsed>1.8*max_tf)
+        missing=[]
+        if before_tf==after_tf and elapsed>1.7*before_tf:
+            intervals=round(elapsed/before_tf)
+            if (1<=intervals-1<=2 and
+                abs(elapsed-intervals*before_tf)<=0.17*before_tf):
+                stamps=[int(previous_ms+(i*before_tf*60_000)) for i in range(1,intervals)]
+                if all(is_open_candle(name,t) for t in stamps):
+                    low=num(row.get('close'));high=num(after.get('close'))
+                    if low is not None and high is not None:
+                        for i,tm in enumerate(stamps,1):
+                            missing.append({'instrument':name,'bar_ms':tm,
+                                'tf':before_tf,'close':low+(high-low)*i/intervals,
+                                'synthetic_price_only':True,'exec_of':'',
+                                'exec_of_score':'','fp_interacting':'FALSE',
+                                'fp_event_type':'','fp_session_delta':'',
+                                'fp_zone_id':'','fp_side':''})
+        if not (within_one_bar or closure_bridge or missing):break
+        chain=[row]+missing+chain
+        if sum(not r.get('synthetic_price_only') for r in chain)>=480:break
+    # Retain at most 480 REAL observations; interpolated prices do not count.
+    nreal=0;cut=0
+    for i in range(len(chain)-1,-1,-1):
+        if not chain[i].get('synthetic_price_only'):nreal+=1
+        if nreal>=480:
+            cut=i;break
+    return chain[cut:]
 
 
 def _event_anchor(path:List[Dict[str,Any]],tf_ms:float) -> Optional[int]:
@@ -137,7 +177,7 @@ def _event_anchor(path:List[Dict[str,Any]],tf_ms:float) -> Optional[int]:
         ms=_ms(r.get('bar_ms'))
         zid=str(r.get('fp_zone_id') or '').strip()
         side=str(r.get('fp_side') or '').upper()
-        if not ms or not zid or side not in ('DEMAND','SUPPLY'):continue
+        if not ms or not zid or side not in ('DEMAND','SUPPLY') or r.get('synthetic_price_only'):continue
         ev=str(r.get('fp_event_type') or '').upper()
         tm=_ms(r.get('fp_event_time'))
         bars=num(r.get('fp_bars_since_event'))
@@ -149,7 +189,7 @@ def _event_anchor(path:List[Dict[str,Any]],tf_ms:float) -> Optional[int]:
                           'RUN_CONFIRMED','RECLAIM_CONFIRMED')
                    or (ev.startswith('DEFENCE_') and ev.endswith('_CONFIRMED')))
         if (confirmed and tm is not None and first_ms<=tm<=last_ms
-            and 0<=ms-tm<=1.7*tf_ms and (bars is None or 0<=bars<=2)):
+            and 0<=ms-tm<=1.7*(num(r.get('tf')) or tf_ms/60000)*60000 and (bars is None or 0<=bars<=2)):
             candidates.append((tm,i,'FP_EVENT'))
         # Even if EDGE does not emit a new named event, the first *recorded*
         # zone interaction is a valid (but weaker) start marker.
@@ -166,7 +206,7 @@ def _event_anchor(path:List[Dict[str,Any]],tf_ms:float) -> Optional[int]:
     # observed confirmed event in the dominant journey. Prefer the latest
     # sufficiently developed confirmed transition; only when none exists use
     # a mature initial interaction as the observed journey anchor.
-    mature=[c for c in candidates if len(path)-c[1]>=5]
+    mature=[c for c in candidates if sum(not r.get('synthetic_price_only') for r in path[c[1]:])>=5]
     confirmed=[c for c in mature if c[2]=='FP_EVENT']
     candidates=confirmed or mature
     if not candidates:return None
@@ -194,38 +234,54 @@ def _journey(edge:Dict[str,Any],hist:List[Dict[str,Any]]):
     # A just-triggered FP event must not erase a long uninterrupted journey.
     # Until its own episode has developed, keep the broader observed history,
     # while _natural_fp still reports the new event from its real timestamp.
-    if len(path)-index < 5:
+    if sum(not r.get('synthetic_price_only') for r in path[index:]) < 5:
         return path,'OBSERVED_START · FP DEVELOPING'
     return path[index:], 'RECORDED_FP'
 
 
 def _movement(path:List[Dict[str,Any]]) -> Dict[str,float]:
-    """Price travel, pullbacks, execution OF persistence and market noise."""
-    close=[num(r.get('close')) for r in path]
-    if len(close)<2 or any(x is None or x<=0 for x in close):return {}
-    steps=[(close[i]-close[i-1])/close[i-1]*100 for i in range(1,len(close))]
-    first,last=close[0],close[-1]
+    """Price progress with duration-weighted REAL OF across TF transitions."""
+    observed=[r for r in path if not r.get('synthetic_price_only')]
+    prices=[num(r.get('close')) for r in path]
+    actual_prices=[num(r.get('close')) for r in observed]
+    if len(actual_prices)<2 or any(x is None or x<=0 for x in actual_prices):return {}
+    steps=[(actual_prices[i]-actual_prices[i-1])/actual_prices[i-1]*100
+           for i in range(1,len(actual_prices))]
+    first,last=actual_prices[0],actual_prices[-1]
     travelled=(last-first)/first*100
-    # Robust minimum move: appreciable relative to observed candle noise,
-    # while still allowing a long gradual advance to qualify.
     typical=median(abs(x) for x in steps)
-    threshold=max(0.16,2.1*typical,min(0.35,0.04*math.sqrt(len(close))))
-    prev=path[:-1]
-    bullshare=sum(of(r.get('exec_of'))>0 for r in prev)/len(prev)
-    bearshare=sum(of(r.get('exec_of'))<0 for r in prev)/len(prev)
-    peak=max(close)
-    trough=min(close)
+    threshold=max(0.16,2.1*typical,min(0.35,0.04*math.sqrt(len(actual_prices))))
+    # Each 15m observation covers more market time than one 3m observation;
+    # recent measurements also matter more. Avoid treating a TF switch as an
+    # abrupt reset or counting synthetic prices as pressure observations.
+    end_ms=_ms(observed[-1].get('bar_ms')) or 0
+    weighted=0.0;bull=0.0;bear=0.0
+    for row in observed:
+        pressure=of(row.get('exec_of'))
+        if not pressure:continue
+        tf=max(1,min(240,num(row.get('tf')) or 3))
+        elapsed=max(0,(end_ms-(_ms(row.get('bar_ms')) or end_ms))/3_600_000)
+        weight=tf*math.exp(-elapsed/12.0)
+        weighted+=weight
+        bull+=weight if pressure>0 else 0
+        bear+=weight if pressure<0 else 0
+    bullshare=bull/weighted if weighted else 0
+    bearshare=bear/weighted if weighted else 0
+    peak=max(prices);trough=min(prices)
     peak_gain=(peak-first)/first*100
     trough_drop=(first-trough)/first*100
     retrace_up=(peak-last)/(peak-first) if peak>first else 0
     retrace_down=(last-trough)/(first-trough) if trough<first else 0
-    recent=close[-min(9,len(close)):]
+    recent=actual_prices[-min(9,len(actual_prices)):]
     latest_move=(last-recent[0])/recent[0]*100
     return {'move':travelled,'noise':typical,'threshold':threshold,
             'bullshare':bullshare,'bearshare':bearshare,
             'peak_gain':peak_gain,'trough_drop':trough_drop,
             'retrace_up':retrace_up,'retrace_down':retrace_down,
-            'latest_move':latest_move,'n':len(close)}
+            'latest_move':latest_move,'n':len(actual_prices),
+            'estimated_prices':len(path)-len(observed),
+            'tf_switches':sum(str(observed[i].get('tf'))!=str(observed[i-1].get('tf'))
+                              for i in range(1,len(observed)))}
 
 
 def _htf(edge:Dict[str,Any]):
@@ -291,7 +347,7 @@ def _journey_commentary(label: str, basis: str, path: List[Dict[str,Any]],
     Distinguish persistent control that *worked* from a newer counter-move.
     Do not silently attribute a recovery to an old, unwitnessed FP event.
     """
-    if not progress or len(path)<5:
+    if not progress or sum(not r.get('synthetic_price_only') for r in path)<5:
         return {'label':label, 'commentary':
                 'Current EDGE control is '+str(edge.get('exec_of') or 'unconfirmed').replace('_',' ').lower()+
                 '. There is not enough continuous EDGE history to assess price response or a developing turn.'}
@@ -304,9 +360,10 @@ def _journey_commentary(label: str, basis: str, path: List[Dict[str,Any]],
     tf=num(path[-1].get('tf')) or 0
     mins+=tf
     span=(f'{round(mins/60,1):g}h' if mins>=60 else f'{max(1,round(mins))}m')
-    n=len(path)
-    neg=sum(of(r.get('exec_of'))<0 for r in path)
-    pos=sum(of(r.get('exec_of'))>0 for r in path)
+    real=[r for r in path if not r.get('synthetic_price_only')]
+    n=len(real)
+    neg=sum(of(r.get('exec_of'))<0 for r in real)
+    pos=sum(of(r.get('exec_of'))>0 for r in real)
     travel=progress['move']
     dominant_flow='bearish' if neg>=0.70*n else 'bullish' if pos>=0.70*n else 'mixed'
     if travel>0:
@@ -778,7 +835,7 @@ def _conviction_commentary(edge:Dict[str,Any],path:List[Dict[str,Any]],
     real FP/delta interaction, and only relevant fresh optional observations.
     """
     label=str(previous.get('label') or '')
-    progress=_movement(path) if len(path)>=5 else {}
+    progress=_movement(path) if sum(not r.get('synthetic_price_only') for r in path)>=5 else {}
     control=_natural_control(edge,path)
     outcome=_natural_response(label,path,progress)
     fp=_natural_fp(edge,path)
@@ -839,7 +896,8 @@ def intelligent_bias(edge:Dict[str,Any],history:List[Dict[str,Any]],
     # Longitudinal evidence is separate from short execution control. A long
     # movement against persistent OF should not be erased by one pullback or
     # by a fixed 25-candle sliding window.
-    progress=_movement(tape) if len(tape)>=5 else {}
+    real_count=sum(not x.get('synthetic_price_only') for x in tape)
+    progress=_movement(tape) if real_count>=5 else {}
     if progress:
         move=progress['move']
         threshold=progress['threshold']
@@ -924,7 +982,7 @@ def intelligent_bias(edge:Dict[str,Any],history:List[Dict[str,Any]],
     # The journey has a location history: a *newly observed* FP defence with
     # subsequent favourable price travel can explain where this move began.
     # A carried-forward DEFENCE_CONFIRMED from 60 bars ago does not qualify.
-    if len(tape)>=5:
+    if real_count>=5:
         defended=[]
         for r in tape[:-1]:
             side=str(r.get('fp_side') or '').upper()
@@ -957,8 +1015,10 @@ def intelligent_bias(edge:Dict[str,Any],history:List[Dict[str,Any]],
     explained=_journey_commentary(label,clue,tape,progress,edge)
     return {'label':explained['label'],'basis':clue[:185],
         'commentary':_conviction_commentary(edge,tape,explained,tv_rows,now_ms),
-        'evidence_bars':str(len(tape)), 'temporal':str(len(tape)>=5),
+        'evidence_bars':str(progress.get('n',0)), 'temporal':str(progress.get('n',0)>=5),
         'journey_anchor':anchor_type,
+        'estimated_price_bars':str(progress.get('estimated_prices',0)),
+        'timeframe_changes':str(progress.get('tf_switches',0)),
         'journey_pct':str(round(progress.get('move',0),3)) if progress else '',
         'mtf_summary':_mtf_evidence(edge),
         'fp_summary':_fp_evidence(edge,tape),
