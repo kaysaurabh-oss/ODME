@@ -2929,6 +2929,125 @@ def _sb_record_selected_pending_entry(
     return saved
 
 
+def _sb_record_user_confirmed_trade(
+    store: Any, packet: Dict[str, Any], side: str, contract_type: str,
+    strike: Any, expiry: str, quantity: Any, thesis: str = "",
+    entry_price: Any = "", invalidation: Any = "",
+) -> Dict[str, Any]:
+    """Record a real user-reported exposure without requiring an EDGE setup.
+
+    This does NOT assert the entry was recommended or that the supplied strike
+    was selected by ODME. Never submit orders. Preserve the locked campaign
+    manager's verified-protection requirement.
+    """
+    instrument = str(packet.get('instrument') or '').strip().upper()
+    side = str(side or '').strip().upper()
+    contract_type = str(contract_type or '').strip().upper()
+    if not instrument or side not in {'BUY','SELL'} or contract_type not in {'CE','PE','FUT','CASH','OTHER'}:
+        raise ValueError('Select an instrument, BUY/SELL and a valid contract type.')
+    if contract_type in {'CE','PE'} and _sb_num(str(strike).replace(',','')) is None:
+        raise ValueError('Enter the actual option strike you executed.')
+    lot_count=_sb_num(str(quantity or '').replace(',',''))
+    if lot_count is None or lot_count<=0:
+        raise ValueError('Enter a positive executed lots/quantity amount.')
+    if contract_type in {'CE','PE'} and not str(expiry or '').strip():
+        raise ValueError('Enter the actual executed option expiry.')
+    if invalidation not in ('', None) and _sb_num(str(invalidation).replace(',','')) is None:
+        raise ValueError('The optional underlying-price invalidation must be numeric.')
+    if entry_price not in ('', None) and _sb_num(str(entry_price).replace(',','')) is None:
+        raise ValueError('The optional underlying price at entry must be numeric.')
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    trade_id = f'SB-{uuid.uuid4().hex[:12].upper()}'
+    is_bull = (contract_type=='CE' and side=='BUY') or (contract_type=='PE' and side=='SELL') or (contract_type in {'FUT','CASH','OTHER'} and side=='BUY')
+    direction = 'BULLISH' if is_bull else 'BEARISH'
+    leg = {'leg_id':f'{trade_id}-E1','status':'ACTIVE','opened_at':now,
+           'source':'USER_CONFIRMED_ANYTIME','side':side,'option_type':contract_type,
+           'strike':_sb_management_value(strike),'expiry':str(expiry or '').strip(),
+           'quantity':_sb_management_value(quantity)}
+    ctx = _sb_authoritative_edge_context(packet)
+    row = ctx.get('row') or {}
+    tmd = {
+        'memory_schema':'SB_TRADE_USER_CONFIRMED_3',
+        'manual_anytime_entry':True,'entry_recorded_by_user':True,
+        'entry_readiness_at_recording':'USER_EXECUTED_NOT_EDGE_VERIFIED',
+        'origin_setup_name':'USER_RECORDED_TRADE',
+        'origin_setup_direction':direction,
+        'manual_entry_note':str(thesis or '').strip(),
+        'manual_entry_price_source':'USER_REPORTED' if entry_price not in ('',None) else 'NOT_SUPPLIED',
+        'management_family':'PRIMARY_CAMPAIGN_MANAGEMENT',
+        'management_revision':0,'current_exposure_source':'USER_CONFIRMED_ANYTIME',
+        'recorded_at':now,
+    }
+    # Manually entered trades have no verified source FP plan. Never silently
+    # adopt *today's* ODME/EDGE barriers as if they were locked at execution.
+    # The existing Active Campaign panel permits the user to verify and lock
+    # actual current protections explicitly on the next scan.
+    tmd['protection_state']='AWAITING_USER_CONFIRMATION'
+    market_state = {'price':_sb_num(row.get('close')),'macro':row.get('macro'),
+                    'exec_of':row.get('exec_of'),
+                    'snapshot_at_recording':True,
+                    'actual_entry_timestamp_unknown':True}
+    trade = {
+        'instrument':instrument,'trade_id':trade_id,'status':'ACTIVE',
+        'strategy_type':'USER_RECORDED_TRADE','direction':direction,
+        'created_at':now,'updated_at':now,'closed_at':'',
+        'scan_id':(packet.get('memory') or {}).get('scan_id') or '',
+        'mode':packet.get('mode') or 'USER_CONFIRMED',
+        'action':'TRADE_TAKEN','thesis':str(thesis or '').strip() or 'User-confirmed trade; no EDGE entry signal claimed.',
+        'entry_reference':_sb_management_value(entry_price),
+        'target':'','invalidation':_sb_management_value(invalidation),
+        'legs_json':json.dumps([leg],separators=(',',':'),default=str),
+        'market_state_json':json.dumps(market_state,separators=(',',':'),default=str),
+        'metadata_json':json.dumps(tmd,separators=(',',':'),default=str),
+    }
+    return store.upsert_superbrain_trade(trade)
+
+
+def _sb_render_anytime_entry(store: Any, instrument: str, packet: Dict[str,Any]) -> None:
+    """Visible even with no FP, no pending setup, WAIT, or stale scan."""
+    key = f'anytime_recorded_{instrument}'
+    if st.session_state.get(key):
+        st.success(f"Trade saved and verified: {st.session_state[key]}. It will appear under Active campaigns.")
+        if st.button('Record another executed trade',key=f'anytime_again_{instrument}'):
+            st.session_state.pop(key,None)
+            st.rerun()
+        return
+    st.caption('Already executed a trade? Record it regardless of the current EDGE entry verdict. Recording is not an endorsement of the entry.')
+    default_type = 'CE' if (packet.get('mapping') or {}).get('odme_scan_enabled') else 'CASH'
+    side = st.selectbox('Executed side',['SELL','BUY'],key=f'anytime_side_{instrument}')
+    typelist = list(dict.fromkeys([default_type,'CE','PE','FUT','CASH','OTHER']))
+    opt = st.selectbox('Executed contract type',typelist,key=f'anytime_type_{instrument}')
+    strike = st.text_input('Actual option strike (required for CE/PE)',key=f'anytime_strike_{instrument}')
+    expiry = st.text_input('Expiry',value=str((packet.get('mapping') or {}).get('selected_expiry') or ''),key=f'anytime_expiry_{instrument}')
+    quantity = st.text_input('Lots / quantity',key=f'anytime_qty_{instrument}')
+    thesis = st.text_input('Your original trade thesis (optional)',key=f'anytime_thesis_{instrument}',
+                           placeholder='e.g. bearish continuation / non-arrival / demand rebound')
+    entry_price = st.text_input('Underlying price at execution (optional)',key=f'anytime_entry_px_{instrument}')
+    invalidation = st.text_input('Your underlying-price invalidation (optional)',key=f'anytime_invalidation_{instrument}',
+                                 help='Only if you have an actual price level that invalidates your thesis; not an option premium.')
+    is_option = opt in {'CE','PE'}
+    missing = (is_option and (_sb_num(str(strike).replace(',','')) is None or not str(expiry or '').strip())) or (_sb_num(str(quantity or '').replace(',','')) is None or (_sb_num(str(quantity or '').replace(',','')) or 0)<=0)
+    if missing: st.caption('Enter actual quantity, and option strike/expiry where applicable, to record the exposure.')
+    if st.button('I executed this trade — record campaign',type='primary',use_container_width=True,
+                 disabled=missing,key=f'anytime_submit_{instrument}'):
+        try:
+            if type(store).__name__=='LocalStore':
+                raise RuntimeError('Cannot persist this campaign: the app is using LocalStore, not Google Sheet storage.')
+            trade = _sb_record_user_confirmed_trade(store,packet,side,opt,strike,expiry,quantity,thesis,entry_price,invalidation)
+            tid = str(trade.get('trade_id') or '').strip()
+            if not tid:raise RuntimeError('The store did not return a trade ID.')
+            saved = store.list_superbrain_trades(instrument=instrument,open_only=False)
+            if saved is None or saved.empty or 'trade_id' not in saved.columns or not saved['trade_id'].astype(str).eq(tid).any():
+                raise RuntimeError(f'Write could not be verified in persistent storage: {tid}.')
+            packet['open_trades'] = [t for t in (packet.get('open_trades') or []) if str(t.get('trade_id'))!=tid]+[trade]
+            st.session_state.public_superbrain_last = packet
+            st.session_state[key] = tid
+            st.session_state['superbrain_notice'] = f'User-confirmed campaign {tid} recorded and verified. Management applies on the next scan.'
+            st.rerun()
+        except Exception as exc:
+            st.error(f'Campaign NOT confirmed as saved: {type(exc).__name__}: {exc}')
+
+
 def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str, Any]) -> None:
     """Render user-confirmed campaign recording for every persisted PENDING_ENTRY."""
     analysis = packet.get("analysis", {}) or {}
@@ -2957,9 +3076,12 @@ def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str,
         and str(row.get("record_id", "") or "").strip()
         and str(row.get("record_id", "") or "").strip() not in linked_setup_ids
     ]
+    _sb_render_anytime_entry(store,instrument,packet)
     if not pending_rows:
         return
 
+    st.divider()
+    st.caption('Alternatively, attach an executed trade to a previously saved EDGE setup:')
     plan_setup_id = ""
     if str(plan.get("kind", "") or "").upper() == "NEW":
         for key in ("setup_record_id", "record_id", "parent_setup_id", "origin_setup_record_id"):
@@ -3356,13 +3478,60 @@ def _edge_manage_trade(packet:Dict[str,Any], trade:Dict[str,Any]) -> List[Dict[s
     return results
 
 
+def _sb_render_cash_confirmed_campaigns(store: Any, instrument: str, packet: Dict[str, Any],
+                                        bias: Dict[str,Any], healthy: bool) -> None:
+    """Review USER-CONFIRMED cash/future exposure even if EDGE has no new FP entry.
+
+    There is no automatic option L2/L3 risk management for cash. Use the user-
+    provided invalidation only when the required EDGE TF is live and current.
+    """
+    trades=[]
+    try:
+        df=store.list_superbrain_trades(instrument=instrument,open_only=True)
+        if df is not None and not df.empty:trades=df.to_dict('records')
+    except Exception:
+        trades=[t for t in (packet.get('open_trades') or []) if str(t.get('status') or '').upper()=='ACTIVE']
+    active=[]
+    for tr in trades:
+        if str(tr.get('status') or '').upper() in {'ACTIVE','OPEN'}:
+            legs=_sb_active_leg_rows(tr)
+            if any(str(x['leg'].get('option_type') or '').upper() in {'CASH','FUT','OTHER'} for x in legs):
+                active.append(tr)
+    if not active:return
+    st.markdown('### Active campaigns')
+    spot=_sb_num((_sb_authoritative_edge_context(packet).get('row') or {}).get('close'))
+    bias_name=str(bias.get('label') or 'UNAVAILABLE')
+    for trade in active:
+        st.write(f"**{trade.get('trade_id') or 'Campaign'} · {_sb_exposure_text(trade)}**")
+        inv=_sb_num(trade.get('invalidation'))
+        side=str(trade.get('direction') or '').upper()
+        if not healthy or spot is None:
+            status='DATA NOT VERIFIED';call='REVIEW — NO LIVE EDGE CONFIRMATION'
+        elif inv is not None and ((side=='BULLISH' and spot<=inv) or (side=='BEARISH' and spot>=inv)):
+            status='USER PLAN INVALIDATED';call='EXIT — RECORDED INVALIDATION CROSSED'
+        elif inv is None:
+            status='RISK PLAN UNVERIFIED';call='REVIEW — RECORD INVALIDATION'
+        else:
+            opposes=('BULLISH' in bias_name and side=='BEARISH') or ('BEARISH' in bias_name and side=='BULLISH')
+            status='ON WATCH — OPPOSING EDGE JOURNEY' if opposes else 'ON PLAN — STOP NOT CROSSED'
+            call='HOLD / REVIEW' if opposes else 'HOLD'
+        st.markdown(f'**Plan:** {status}')
+        st.write(f'**Behaviour:** {bias_name}. Current EDGE journey is informational; the user-recorded invalidation is the only executable risk boundary available for this cash/futures campaign.')
+        st.info(f'**{call}** · No option-roll recommendation applies.')
+        with st.expander('Record executed management adjustment',expanded=False):
+            _sb_render_management_confirmation(store,packet,trade,{},packet.get('analysis') or {},final_decisions=[])
+
+
 def _sb_render_edge_cash_terminal(store: Any, instrument: str, packet: Dict[str, Any]) -> None:
     """Public SuperBrain only. Never scan or display ODME in EDGE-only mode."""
     ctx = _sb_authoritative_edge_context(packet)
     row = ctx.get("row") or {}
     healthy = _edge_live_ok(packet)
     _sb_render_freshness(packet)
-    _sb_show_market_bias(packet, ctx, healthy)
+    cash_bias = _sb_show_market_bias(packet, ctx, healthy) or {}
+    _sb_render_cash_confirmed_campaigns(store,instrument,packet,cash_bias,healthy)
+    with st.expander('Record trade taken (anytime — including WAIT)', expanded=False):
+        _sb_render_anytime_entry(store,instrument,packet)
     if not healthy:
         st.error("**WAIT** — EDGE data is stale or not on its active execution TF.")
         return
@@ -3462,8 +3631,85 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
         edge_fresh=bool(healthy),
     )
     st.markdown(f"**SuperBrain Bias: {result['label']}**")
-    if result.get("basis"):
-        st.caption(result["basis"])
+    if result.get('commentary') or result.get('basis'):
+        st.write(result.get('commentary') or result.get('basis'))
+    return result
+
+
+def _sb_campaign_plain_language(trade: Dict[str,Any], decision: Dict[str,Any],
+                                bias: Dict[str,Any], packet: Dict[str,Any]) -> Dict[str,str]:
+    """Explain the *unchanged* locked-rule management action, never change it.
+
+    The user's explicitly supplied underlying-price invalidation overrides the
+    display call if crossed, without mutating trade records or sending orders.
+    """
+    raw_action=str(decision.get('action') or 'REVIEW').upper()
+    display={'CLOSE':'EXIT','ROLL FARTHER':'ROLL OUT','EXIT REVIEW':'EXIT — VERIFY BREAK',
+             'HOLD / RECHECK ODME':'HOLD — RECHECK ODME'}.get(raw_action,raw_action)
+    reason=str(decision.get('reason') or '').strip()
+    md=_sb_json(trade.get('metadata_json') or '')
+    option=str(decision.get('option_type') or '').upper()
+    expected='BEARISH' if option=='CE' else 'BULLISH' if option=='PE' else str(trade.get('direction') or '').upper()
+    bias_name=str(bias.get('label') or '').upper()
+    market_side='BULLISH' if bias_name.startswith(('BULLISH','STRONG BULLISH')) else 'BEARISH' if bias_name.startswith(('BEARISH','STRONG BEARISH')) else ''
+    row=(_sb_authoritative_edge_context(packet).get('row') or {})
+    score=_sb_num(row.get('exec_of_score'))
+    current_of=str(row.get('exec_of') or 'UNKNOWN').replace('_',' ').lower()
+    vote=f"execution OF {current_of}"+(f" ({score:+.0f})" if score is not None else '')
+    if market_side and expected and market_side==expected:
+        trade_read='The observed EDGE journey supports this exposure.'
+    elif market_side and expected and market_side!=expected:
+        trade_read='The observed EDGE journey is opposing this exposure.'
+    else:
+        trade_read='The EDGE journey is mixed or not independently verified.'
+    if 'REBOUND' in bias_name and expected=='BEARISH':
+        trade_read+=' A developing rebound challenges sellers; it is not yet a confirmed reversal.'
+    elif ('PULLBACK' in bias_name or 'FADING' in bias_name) and expected=='BULLISH':
+        trade_read+=' A counter-move is developing; check whether the original bullish thesis still holds.'
+    mtf_note=str(bias.get('mtf_summary') or '').strip()
+    fp_note=str(bias.get('fp_summary') or '').strip()
+    liq_note=str(bias.get('liquidity_summary') or '').strip()
+    # Only evidence with a confirmed, material interaction belongs in a
+    # campaign readout; stale carried-forward zones must not become a trigger.
+    evidence=[f'Current {vote}.']
+    if mtf_note:evidence.append(mtf_note)
+    if fp_note and ('test:' in fp_note or 'Fresh ' in fp_note):evidence.append(fp_note)
+    elif liq_note:evidence.append(liq_note)
+    commentary=' '.join([trade_read]+evidence)
+    if raw_action=='REVIEW':
+        status='PROTECTION NOT VERIFIED'
+    elif raw_action=='EXIT REVIEW':
+        status='POSSIBLE PROTECTION FAILURE — CONFIRM URGENTLY'
+    elif raw_action in {'ROLL OUT','ROLL FARTHER','CLOSE'}:
+        status='PLAN REQUIRES ACTION — RISK MANAGEMENT TRIGGERED'
+    elif raw_action=='ROLL IN':
+        status='ON PLAN — INWARD ROLL OPPORTUNITY VERIFIED BY LOCKED RULES'
+    elif raw_action=='HOLD / RECHECK ODME':
+        status='STRUCTURE NOT CONFIRMED BROKEN — ODME UNAVAILABLE'
+    elif market_side and expected and market_side!=expected:
+        status='ON WATCH — MARKET JOURNEY CHALLENGES THIS EXPOSURE'
+    elif 'REVERSAL RISK' in bias_name:
+        status='ON WATCH — REVERSAL RISK AGAINST THE PLAN'
+    elif ('REBOUND DEVELOPING' in bias_name and expected=='BEARISH') or ('PULLBACK' in bias_name and expected=='BULLISH'):
+        status='ON PLAN, BUT COUNTER-PRESSURE DEVELOPING'
+    else:
+        status='ON PLAN — NO CONFIRMED LOCKED BREAK' if raw_action=='HOLD' else 'PLAN REQUIRES ACTION'
+    if md.get('manual_anytime_entry'):
+        original=str(md.get('manual_entry_note') or '').strip()
+        if original:status+=' · USER THESIS: '+original[:100]
+    # An explicit underlying-price stop from the user has priority even when
+    # FP/ODME management is otherwise HOLD. Never infer a stop from market bias.
+    invalidation=_sb_num(trade.get('invalidation'))
+    spot=_sb_num((_sb_authoritative_edge_context(packet).get('row') or {}).get('close'))
+    if invalidation is not None and spot is not None and _edge_live_ok(packet) and expected in {'BULLISH','BEARISH'}:
+        violated=spot<=invalidation if expected=='BULLISH' else spot>=invalidation
+        if violated:
+            display='EXIT — USER INVALIDATION'
+            status='USER-LOCKED PLAN INVALIDATED'
+            reason='Current underlying price has crossed the invalidation level you recorded; do not treat the existing HOLD/roll map as permission to ignore your stop.'
+    if not commentary:
+        commentary='EDGE price journey is not independently verified on this scan.'
+    return {'status':status,'behavior':commentary,'action':display,'reason':reason}
 
 
 def render_public_superbrain() -> None:
@@ -3506,7 +3752,7 @@ def render_public_superbrain() -> None:
     row=ctx.get("row") or {}
     analysis=packet.get("analysis") or {}
     odmea=_sb_odme_assessment(packet)
-    _sb_show_market_bias(packet, ctx, _edge_live_ok(packet))
+    bias_result=_sb_show_market_bias(packet, ctx, _edge_live_ok(packet)) or {}
     lm=_sb_combined_level_ladder(packet,analysis)
     if not packet.get("odme_live"):
         st.warning("**WAIT** — Fresh ODME unavailable; no new trade recommendation.")
@@ -3569,22 +3815,25 @@ def render_public_superbrain() -> None:
                                     st.success('Protection levels recorded. Reopen/scan to apply the new lock.')
                                     st.rerun()
             decisions=_edge_manage_trade(packet,trade)
+            if not decisions:
+                st.warning('**REVIEW** — This exposure is not a managed short CE/PE. Record adjustments manually; no automated protective-level verdict is available.')
             for d in decisions:
-                action=d['action'];rank=d.get('required_rank')
-                msg=f"{action} — {d.get('option_type')} {_sb_fmt_level(d.get('strike'))}"
+                readout=_sb_campaign_plain_language(trade,d,bias_result,packet)
+                st.markdown(f"**Plan:** {readout['status']}")
+                st.write(f"**Behaviour:** {readout['behavior']}")
+                msg=f"**{readout['action']}** — {d.get('option_type')} {_sb_fmt_level(d.get('strike'))}"
                 if d.get('target') is not None:msg+=f" → {_sb_fmt_level(d['target'])}"
-                if action in {'CLOSE','ROLL OUT','EXIT REVIEW'}:st.error(msg)
-                elif action=='REVIEW':st.warning(msg)
+                if readout['action'].startswith(('EXIT','ROLL OUT')):st.error(msg)
+                elif readout['action']=='REVIEW':st.warning(msg)
                 else:st.info(msg)
-                reason=str(d.get('reason') or '').split('.')[0].strip()
-                if reason:st.caption(reason+'.')
+                if readout['reason']:st.caption('Why: '+readout['reason'])
             with st.expander("Record management action",expanded=False):
                 _sb_render_management_confirmation(store,packet,trade,setup,analysis,final_decisions=decisions,companion_action=None)
     with st.expander("View ODME levels and full structural map",expanded=False):
         summary=_sb_level_map_summary(lm)
         if summary:st.caption(summary)
         _sb_render_odme(packet)
-    with st.expander("Record executed entry",expanded=False):
+    with st.expander("Record trade taken (anytime — including WAIT)",expanded=False):
         _sb_render_trade_confirmation(store,instrument,packet)
 
 def _run_expired_cleanup_once(store: Any, show_notice: bool = True) -> None:

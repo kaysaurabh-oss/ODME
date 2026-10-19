@@ -267,6 +267,307 @@ def _recent_liq(rows:List[Dict[str,Any]],edge:Dict[str,Any],now_ms:float):
     return ''
 
 
+def _journey_commentary(label: str, basis: str, path: List[Dict[str,Any]],
+                        progress: Dict[str,float], edge: Dict[str,Any]) -> Dict[str,str]:
+    """A brief evidence-based market narrative, no trade/entry instruction.
+
+    Distinguish persistent control that *worked* from a newer counter-move.
+    Do not silently attribute a recovery to an old, unwitnessed FP event.
+    """
+    if not progress or len(path)<5:
+        return {'label':label, 'commentary':
+                'Current EDGE control is '+str(edge.get('exec_of') or 'unconfirmed').replace('_',' ').lower()+
+                '. There is not enough continuous EDGE history to assess price response or a developing turn.'}
+    first=num(path[0].get('close'))
+    current=num(path[-1].get('close'))
+    if not first or not current:return {'label':label,'commentary':basis}
+    ms0=_ms(path[0].get('bar_ms'))
+    ms1=_ms(path[-1].get('bar_ms'))
+    mins=(ms1-ms0)/60000 if ms0 and ms1 and ms1>ms0 else 0
+    tf=num(path[-1].get('tf')) or 0
+    mins+=tf
+    span=(f'{round(mins/60,1):g}h' if mins>=60 else f'{max(1,round(mins))}m')
+    n=len(path)
+    neg=sum(of(r.get('exec_of'))<0 for r in path)
+    pos=sum(of(r.get('exec_of'))>0 for r in path)
+    travel=progress['move']
+    dominant_flow='bearish' if neg>=0.70*n else 'bullish' if pos>=0.70*n else 'mixed'
+    if travel>0:
+        achievement=f'advanced {travel:.2f}%'
+    elif travel<0:
+        achievement=f'declined {abs(travel):.2f}%'
+    else:achievement='made little net progress'
+    if (travel>0 and dominant_flow=='bearish') or (travel<0 and dominant_flow=='bullish'):
+        verb=('sellers could not secure sustained downside' if dominant_flow=='bearish'
+              else 'buyers could not secure sustained upside')
+        main=(f'Over {span} ({n} observed candles), price {achievement} despite '+
+              f'{dominant_flow} execution OF on {neg if dominant_flow=="bearish" else pos}/{n} bars; {verb}.')
+    else:
+        main=(f'Over {span} ({n} observed candles), price {achievement} while '+
+              (f'{dominant_flow} execution OF persisted on {neg if dominant_flow=="bearish" else pos}/{n} bars; '
+               if dominant_flow!='mixed' else 'execution OF was mixed; ')+
+              ('directional pressure has achieved price progress.' if dominant_flow!='mixed'
+               else 'the broader journey lacks consistent execution control.'))
+    # Reversal probes are tied to recent observed extremes, not the global low
+    # hours earlier. Two meaningful counter-directional closes are required.
+    prices=[num(r.get('close')) for r in path]
+    recent=prices[-min(12,len(prices)):]
+    median_step=progress.get('noise',0)
+    floor=max(0.18,1.6*median_step)
+    after_extreme=0
+    move_since_extreme=0.0
+    if travel < 0 and 'BEARISH' in label:
+        i=min(range(len(recent)), key=lambda j:recent[j])
+        after_extreme=len(recent)-i-1
+        move_since_extreme=(recent[-1]-recent[i])/recent[i]*100
+        if after_extreme>=2 and move_since_extreme>=floor:
+            if move_since_extreme>=max(0.65, abs(travel)*0.50):
+                label='BEARISH · REVERSAL RISK'
+                tail=(f'But price has rebounded {move_since_extreme:.2f}% from its recent low '+
+                      'while execution OF remains bearish; seller control is being challenged substantially.')
+            else:
+                label='BEARISH · REBOUND DEVELOPING'
+                tail=(f'But price rebounded {move_since_extreme:.2f}% from its recent low '+
+                      'without a bullish OF turn; early seller ineffectiveness, not yet a confirmed reversal.')
+            return {'label':label,'commentary':main+' '+tail}
+    if travel > 0 and label.startswith(('BULLISH','STRONG BULLISH')):
+        i=max(range(len(recent)), key=lambda j:recent[j])
+        after_extreme=len(recent)-i-1
+        move_since_extreme=(recent[i]-recent[-1])/recent[i]*100
+        if after_extreme>=2 and move_since_extreme>=floor:
+            if move_since_extreme>=max(0.65,travel*0.50):
+                label='BULLISH · REVERSAL RISK'
+                tail=f'However, the latest decline of {move_since_extreme:.2f}% from the recent high is challenging buyers.'
+            else:
+                label=label+' · PULLBACK' if 'PULLBACK' not in label else label
+                tail=f'A {move_since_extreme:.2f}% pullback is developing; the larger upside journey has not yet reversed.'
+            return {'label':label,'commentary':main+' '+tail}
+    # Brief structural qualifier, not a list of levels.
+    htf=_htf(edge)
+    flow=of(edge.get('exec_of'))
+    if flow and htf and flow!=htf:
+        tail='The execution move remains against higher-timeframe control.'
+    elif 'RECOVERY' in label:
+        tail='The observed recovery leads, although execution control still disagrees.'
+    else:
+        tail='No sufficiently developed opposing price turn is yet confirmed.'
+    return {'label':label,'commentary':main+' '+tail}
+
+
+
+def _signed_score(value: Any) -> str:
+    n=num(value)
+    return f'{n:+.0f}' if n is not None else 'unknown'
+
+
+def _execution_evidence(edge: Dict[str,Any], path: List[Dict[str,Any]]) -> str:
+    """Use actual OF scores and changes; price is not a proxy for OF."""
+    state=str(edge.get('exec_of') or 'UNCONFIRMED').replace('_',' ').lower()
+    score=_signed_score(edge.get('exec_of_score'))
+    msg=f'Execution OF {state} ({score})'
+    hist=[num(r.get('exec_of_score')) for r in path]
+    hist=[x for x in hist if x is not None]
+    if len(hist)>=10:
+        prior=median(hist[:min(6,len(hist)//3)])
+        recent=median(hist[-min(6,len(hist)//3):])
+        delta=recent-prior
+        if abs(delta)>=15:
+            direction='less bearish' if prior<0 and recent<0 and delta>0 else (
+                'more bearish' if prior<0 and recent<0 and delta<0 else (
+                'less bullish' if prior>0 and recent>0 and delta<0 else (
+                'more bullish' if prior>0 and recent>0 and delta>0 else 'shifting')))
+            msg+=f'; control has become {direction} ({prior:+.0f} to {recent:+.0f})'
+        elif abs(recent)>=45:
+            msg+='; pressure has stayed persistent'
+    return msg+'.'
+
+
+def _mtf_evidence(edge: Dict[str,Any]) -> str:
+    """Prefer the nearest independent control layers, retain the 4h nuance."""
+    raw=jsondict(edge.get('raw_json'))
+    records=raw.get('edge_router_map') or []
+    routes={str(q.get('tf')):q for q in records if isinstance(q,dict)}
+    summary=[]
+    direction=of(edge.get('exec_of'))
+    for tf in ('15','60','75'):
+        q=routes.get(tf)
+        if q and of(q.get('of_state'))==direction and direction:
+            score=num(q.get('of_score'))
+            summary.append(f'{tf}m {score:+.0f}' if score is not None else f'{tf}m {"bullish" if direction>0 else "bearish"}')
+    if len(summary)>=2:
+        lead='Confirming MTF OF: '+', '.join(summary[:3])
+    elif summary:
+        lead='Aligned MTF OF: '+', '.join(summary)
+    else:
+        lead=''
+    long=[routes.get(tf) for tf in ('125','240')]
+    valid=[(tf,q) for tf,q in zip(('125m','240m'),long) if q and of(q.get('of_state'))]
+    opposing=[(tf,q) for tf,q in valid if of(q.get('of_state'))==-direction and direction]
+    if opposing:
+        tf,q=opposing[-1]
+        longnote=f'{tf} still {str(q.get("of_state") or "").replace("_"," ").lower()} ({_signed_score(q.get("of_score"))})'
+    elif valid and all(of(q.get('of_state'))==direction for tf,q in valid) and direction:
+        longnote='125m/240m direction agrees'
+    else:
+        longnote='higher timeframes mixed' if not lead and len(valid)<2 else ''
+    parts=[p for p in (lead,longnote) if p]
+    return '; '.join(parts)+'.' if parts else ''
+
+
+def _fp_evidence(edge:Dict[str,Any],path:List[Dict[str,Any]]) -> str:
+    """In-zone delta is estimated and meaningful only while an interaction is actually observed."""
+    snap=_snap_tape(edge)
+    if not path or not snap:return ''
+    zid=str(snap.get('fp_zone_id') or '').strip()
+    side=str(snap.get('fp_side') or '').upper()
+    active=str(snap.get('fp_interacting') or '').upper() in ('TRUE','1')
+    recent_event=str(snap.get('fp_event_type') or '').upper()
+    ev_bars=num(snap.get('fp_bars_since_event'))
+    if active and zid and side in ('DEMAND','SUPPLY'):
+        sess=[]
+        for row in reversed(path):
+            if (str(row.get('fp_zone_id') or '').strip()!=zid or
+                str(row.get('fp_side') or '').upper()!=side or
+                str(row.get('fp_interacting') or '').upper() not in ('TRUE','1')):
+                break
+            sess.append(row)
+        sess.reverse()
+        if len(sess)<2:
+            return f'{side.lower()} FP is being tested; one observed bar is insufficient to interpret delta accumulation.'
+        earlier=num(sess[0].get('fp_session_delta'));later=num(sess[-1].get('fp_session_delta'))
+        oldpx=num(sess[0].get('close'));newpx=num(sess[-1].get('close'))
+        if earlier is None or later is None or oldpx is None or newpx is None or oldpx<=0:
+            return f'{side.lower()} FP has {len(sess)} recorded interacting candles; delta buildup is unverified.'
+        change=later-earlier
+        price=(newpx-oldpx)/oldpx*100
+        if abs(change)<1:
+            return f'{side.lower()} FP is interacting; no measurable change in estimated in-zone delta yet.'
+        pressure='buying' if change>0 else 'selling'
+        expected=1 if change>0 else -1
+        if abs(price)<0.08:
+            effectiveness='but price has barely progressed; pressure effectiveness is unconfirmed'
+        elif price*expected<0:
+            effectiveness='yet price moved the opposite way; that pressure has not controlled price'
+        else:
+            effectiveness='with price travelling in the same direction'
+        return f'{len(sess)}-bar {side.lower()} FP test: estimated delta {change:+,.0f} ({pressure}), {effectiveness}.'
+    # Do not call the carried-forward FP event a new confirmed defence/break.
+    if ev_bars is not None and 0<=ev_bars<=2 and any(x in recent_event for x in ('DEFENCE','BREAK','RUN')):
+        event_label='defence' if 'DEFENCE' in recent_event else 'break/run'
+        return f'Fresh {side.lower()} FP {event_label} is on the EDGE map; no ongoing in-zone delta test.'
+    # Only add absence as a qualification if current flow is very strong.
+    strength=abs(num(edge.get('exec_of_score')) or 0)
+    if strength>=65:
+        return 'No fresh FP interaction or usable in-zone delta buildup; the OF reading alone cannot prove absorption.'
+    return ''
+
+
+def _structure_evidence(edge:Dict[str,Any]) -> str:
+    raw=jsondict(edge.get('raw_json'))
+    pct=num(raw.get('battlefield_range_position_pct'))
+    lower=num(raw.get('battlefield_map_lower'));upper=num(raw.get('battlefield_map_upper'))
+    price=num(edge.get('close'))
+    if pct is None and lower is not None and upper is not None and upper>lower and price is not None:
+        pct=(price-lower)/(upper-lower)*100
+    zone=''
+    book=raw.get('fp_hurdle_book') or {}
+    for z in (book.get('hurdles') or []) if isinstance(book,dict) else []:
+        if not isinstance(z,dict) or str(z.get('status') or '').upper() in {'RUN','BROKEN','FAILED'}:
+            continue
+        dist=num(z.get('distance_atr'))
+        score=num(z.get('strength_score'))
+        side=str(z.get('side') or '').upper()
+        if side not in {'DEMAND','SUPPLY'} or dist is None or abs(dist)>2.5:
+            continue
+        direction='supply overhead' if side=='SUPPLY' else 'demand below'
+        score_note=f' (FP score {score:.0f})' if score is not None else ''
+        zone=f'Nearby {str(z.get("strength") or "").lower()} {direction}{score_note}; no defence/break inferred from proximity.'
+        break
+    if pct is None:return zone
+    if pct>100:location='above upper battlefield boundary; acceptance has not been established from location alone'
+    elif pct<0:location='below lower battlefield boundary; acceptance has not been established from location alone'
+    elif pct>=75:location='upper battlefield, supply is the opposing side'
+    elif pct<=25:location='lower battlefield, demand is the defending side'
+    else:location='middle battlefield, no boundary advantage'
+    return 'Location: '+location+'.'+(' '+zone if zone else '')
+
+
+def _liquidity_sequence_evidence(rows:List[Dict[str,Any]],edge:Dict[str,Any],now_ms:float) -> str:
+    row=_best(rows,'LIQUIDITY',edge,now_ms)
+    if not row:return ''
+    current=_ms(edge.get('bar_time'))
+    tf=num(edge.get('tf')) or 15
+    if not current:return ''
+    cutoff=max(45, min(180, 4*tf))*60000
+    events=[]
+    for i in range(1,6):
+        name=f'liq_event{i}_'
+        kind=str(row.get(name+'type') or '').upper()
+        tm=_ms(row.get(name+'confirm_time'))
+        lvl=num(row.get(name+'level'))
+        if tm and 0<=current-tm<=cutoff and 'FULL' in kind and any(t in kind for t in ('RUN','SWEEP')):
+            events.append((tm,kind,lvl))
+    events.sort(reverse=True)
+    if not events:return ''
+    ups=sum('BUY_' in k for _,k,_ in events)
+    downs=len(events)-ups
+    latest=events[0]
+    k=latest[1];lvl=latest[2];price=num(edge.get('close'))
+    if 'SWEEP' in k and lvl is not None and price is not None:
+        relation=('below' if price<lvl else 'above' if price>lvl else 'at')
+        outcome=f'; price now {relation} that sweep level'
+    else:outcome=''
+    if ups>=2 and ups>downs:
+        kind='buy-side';desc=f'{ups} recent buy-side full runs/sweeps'
+    elif downs>=2 and downs>ups:
+        kind='sell-side';desc=f'{downs} recent sell-side full runs/sweeps'
+    else:
+        kind='mixed';desc='mixed recent full liquidity events'
+    newest=('sweep' if 'SWEEP' in k else 'run')
+    return f'Liquidity: {desc}; latest {"buy-side" if "BUY_" in k else "sell-side"} {newest}{outcome}.'
+
+
+def _aurora_evidence(rows:List[Dict[str,Any]],edge:Dict[str,Any],now_ms:float) -> str:
+    row=_best(rows,'AURORA',edge,now_ms)
+    if not row:return ''
+    box=_box_read(row,edge)
+    if box:
+        enriched=row.copy()
+        from superbrain_optional_context import aurora_box_fields
+        enriched=aurora_box_fields(enriched)
+        lo=num(enriched.get('htf_box_low') or enriched.get('htf_range_low'))
+        hi=num(enriched.get('htf_box_high') or enriched.get('htf_range_high'))
+        px=num(edge.get('close'))
+        if lo is not None and hi is not None and hi>lo and px is not None:
+            pct=(px-lo)/(hi-lo)*100
+            loc=('above the upper' if pct>100 else 'below the lower' if pct<0 else
+                 'near the upper' if pct>=75 else 'near the lower' if pct<=25 else 'inside the middle of the')
+            prefix='Candle AURORA WHITE (chop); ' if str(row.get('aurora_state') or '').upper()=='WHITE' else 'Candle AURORA: '
+            return f'{prefix}verified HTF box, price {loc} boundary.'
+    if str(row.get('aurora_state') or '').upper()=='WHITE':
+        return 'Candle AURORA WHITE flags choppy conditions; it is not a directional vote.'
+    return ''
+
+
+def _conviction_commentary(edge:Dict[str,Any],path:List[Dict[str,Any]],
+                           previous:Dict[str,str],tv_rows:List[Dict[str,Any]],
+                           now_ms:float) -> str:
+    """Keep to four evidence-first sentences: score, MTF, FP/location, response + optional."""
+    of_note=_execution_evidence(edge,path)
+    mtf_note=_mtf_evidence(edge)
+    fp_note=_fp_evidence(edge,path)
+    location_note=_structure_evidence(edge)
+    liquidity_note=_liquidity_sequence_evidence(tv_rows,edge,now_ms)
+    aurora_note=_aurora_evidence(tv_rows,edge,now_ms)
+    journey=str(previous.get('commentary') or previous.get('basis') or '').strip()
+    # The old journey text leads with price; put its behavioural interpretation last.
+    # Limit optional commentary to relevant fresh context. Avoid needless levels.
+    structural=' '.join(x for x in (fp_note,location_note) if x)
+    optional=' '.join(x for x in (liquidity_note,aurora_note) if x)
+    parts=[x for x in (of_note,mtf_note,structural,journey,optional) if x]
+    return ' '.join(parts)
+
+
 def intelligent_bias(edge:Dict[str,Any],history:List[Dict[str,Any]],
                      tv_rows:List[Dict[str,Any]],odme:Optional[Dict[str,Any]]=None,
                      edge_fresh:bool=True,now_ms:Optional[float]=None) -> Dict[str,str]:
@@ -285,12 +586,12 @@ def intelligent_bias(edge:Dict[str,Any],history:List[Dict[str,Any]],
             # AURORA only provides range location. Its color does not vote on direction.
             box_message=box[0]
             if 'inside the box' in box_message:
-                return {'label':'RANGE / CHOPPY','basis':'Inside confirmed HTF range; wait near an edge or confirmed break.'}
+                return {'label':'RANGE / CHOPPY','basis':'Inside confirmed HTF range; wait near an edge or confirmed break.', 'commentary':_conviction_commentary(edge,_clean_path(edge,history),{'commentary':'Inside the verified HTF box; EDGE directional pressure alone does not confirm escape.'},tv_rows,now_ms)}
             box_note='HTF box boundary active'
         else:
             box_note=''
         if str(a.get('aurora_state') or '').upper()=='WHITE':
-            return {'label':'CHOPPY / SIDEWAYS','basis':'Candle AURORA WHITE; directional conviction is poor.'}
+            return {'label':'CHOPPY / SIDEWAYS','basis':'Candle AURORA WHITE; directional conviction is poor.', 'commentary':_conviction_commentary(edge,_clean_path(edge,history),{'commentary':'AURORA WHITE warns of chop; a clean EDGE breakout is not confirmed from the color alone.'},tv_rows,now_ms)}
     else:
         box_note=''
     flow=of(edge.get('exec_of'))
@@ -407,7 +708,13 @@ def intelligent_bias(edge:Dict[str,Any],history:List[Dict[str,Any]],
             # ODME may temper conviction; it doesn't erase price-history evidence.
             if label.startswith('STRONG '):label=label[7:]
             clue=clue+'; ODME differs'
-    return {'label':label,'basis':clue[:185],
+    explained=_journey_commentary(label,clue,tape,progress,edge)
+    return {'label':explained['label'],'basis':clue[:185],
+        'commentary':_conviction_commentary(edge,tape,explained,tv_rows,now_ms),
         'evidence_bars':str(len(tape)), 'temporal':str(len(tape)>=5),
         'journey_anchor':anchor_type,
-        'journey_pct':str(round(progress.get('move',0),3)) if progress else ''}
+        'journey_pct':str(round(progress.get('move',0),3)) if progress else '',
+        'mtf_summary':_mtf_evidence(edge),
+        'fp_summary':_fp_evidence(edge,tape),
+        'liquidity_summary':_liquidity_sequence_evidence(tv_rows,edge,now_ms),
+        'aurora_summary':_aurora_evidence(tv_rows,edge,now_ms)}
