@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import math
+import json
 
 
 def _number(x: Any) -> Optional[float]:
@@ -72,7 +73,34 @@ def _bool(x: Any) -> bool:
     return str(x or '').strip().lower() in ('true','1','yes','on','active') or x is True
 
 
+def aurora_box_fields(aurora: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract explicit box geometry from either top-level or raw TV JSON.
+
+    A missing box is missing data, never a reconstructed box.
+    """
+    ans=dict(aurora or {})
+    raw=aurora.get('raw_json') if aurora else None
+    if isinstance(raw,str):
+        try:raw=json.loads(raw)
+        except (ValueError,TypeError):raw={}
+    if not isinstance(raw,dict):raw={}
+    box=raw.get('htf_box') if isinstance(raw.get('htf_box'),dict) else {}
+    source={**raw}
+    aliases={'htf_box_active':('active','valid'),'htf_box_low':('low','bottom'),
+             'htf_box_high':('high','top'),'htf_box_state':('state',),
+             'htf_box_break_confirmed':('break_confirmed',)}
+    for k, v in source.items():
+        if k.startswith(('htf_box_', 'htf_range_')) and ans.get(k) in ('',None):ans[k]=v
+    for dst,names in aliases.items():
+        if ans.get(dst) in ('',None):
+            for n in names:
+                if box.get(n) is not None:
+                    ans[dst]=box[n];break
+    return ans
+
+
 def _box_read(aurora: Dict[str, Any], edge: Dict[str, Any]):
+    aurora=aurora_box_fields(aurora)
     active = _bool(aurora.get('htf_box_active')) or _bool(aurora.get('htf_range_active'))
     lo = _number(aurora.get('htf_box_low'))
     hi = _number(aurora.get('htf_box_high'))
@@ -114,21 +142,10 @@ def _aurora_read(aurora: Dict[str, Any], edge: Dict[str, Any]):
     if state == 'WHITE':
         return {'source': 'AURORA', 'severity': 'caution',
                 'text': 'Candle AURORA WHITE: sideways/choppy; avoid fresh directional entries until price/EDGE confirms a clean move.'}
-    if state not in ('GREEN', 'RED', 'YELLOW', 'PINK'):
-        return None
-    of = str(edge.get('exec_of') or '').upper()
-    strong_bull = 'BULL' in of and 'BEAR' not in of
-    strong_bear = 'BEAR' in of
-    disagreement = (strong_bull and state in ('RED', 'PINK')) or (strong_bear and state in ('GREEN', 'YELLOW'))
-    if disagreement:
-        return {'source': 'AURORA', 'severity': 'caution',
-                'text': f'Candle AURORA {state} conflicts with EDGE OF; avoid assuming an uninterrupted directional move.'}
-    change = str(aurora.get('aurora_change') or '').upper()
-    if change in ('FRESH_TURN', 'STATE_CHANGE', 'CONFIRMED_TURN', 'FLIP') and (
-       (strong_bull and state == 'GREEN') or (strong_bear and state == 'RED')):
-        return {'source': 'AURORA', 'severity': 'notice',
-                'text': f'Fresh candle AURORA {state} turn supports current EDGE control.'}
+    # Candle AURORA GREEN/YELLOW/PINK/RED are not directional votes.
+    # Only WHITE (chop) and explicit HTF box geometry are used here.
     return None
+
 
 
 def _liquidity_read(row: Dict[str, Any], edge: Dict[str, Any]):

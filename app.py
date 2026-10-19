@@ -24,7 +24,7 @@ from superbrain_bridge import (
     build_instrument_map,
     prepare_superbrain_scan,
 )
-from superbrain_bias import assess_market_bias
+from superbrain_edge_memory import read_edge_tape, intelligent_bias
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
@@ -3452,8 +3452,11 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
     else:
         tv_rows = []
     odme = _sb_odme_assessment(packet) if packet.get("odme_live") else None
-    result = assess_market_bias(
-        edge=ctx.get("row") or {},
+    edge_row = ctx.get("row") or {}
+    tape = read_edge_tape(get_store(), str(packet.get("instrument") or edge_row.get("instrument") or "")) if healthy else []
+    result = intelligent_bias(
+        edge=edge_row,
+        history=tape,
         tv_rows=tv_rows,
         odme=odme,
         edge_fresh=bool(healthy),
