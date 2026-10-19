@@ -567,97 +567,98 @@ def _aurora_evidence(rows:List[Dict[str,Any]],edge:Dict[str,Any],now_ms:float) -
 
 
 def _natural_control(edge: Dict[str,Any], path: List[Dict[str,Any]]) -> str:
-    """Explain cross-timeframe OF and its evolution without indicator readings."""
+    """Plain-English control: short-term pressure, nearby agreement, macro trend."""
     flow=of(edge.get('exec_of'))
-    state=str(edge.get('exec_of') or '').upper()
-    if flow<0:
-        sentence=('Execution selling remains forceful' if 'STRONG' in state else
-                  'Execution selling remains active')
-    elif flow>0:
-        sentence=('Execution buying remains forceful' if 'STRONG' in state else
-                  'Execution buying remains active')
+    strong='STRONG' in str(edge.get('exec_of') or '').upper()
+    if flow>0:
+        lead='Short-term buying pressure is strong' if strong else 'Short-term buying pressure is active'
+    elif flow<0:
+        lead='Short-term selling pressure is strong' if strong else 'Short-term selling pressure is active'
     else:
-        sentence='Execution order flow does not show decisive control'
+        lead='Short-term buying and selling pressure are balanced'
     raw=jsondict(edge.get('raw_json'))
-    bytf={str(x.get('tf')):x for x in (raw.get('edge_router_map') or []) if isinstance(x,dict)}
-    near=[of(bytf[t].get('of_state')) for t in ('15','60','75') if t in bytf and of(bytf[t].get('of_state'))]
-    wider=[of(bytf[t].get('of_state')) for t in ('125','240') if t in bytf and of(bytf[t].get('of_state'))]
-    supporting=sum(x==flow for x in near) if flow else 0
-    opposing=sum(x==-flow for x in near) if flow else 0
-    wider_against=sum(x==-flow for x in wider) if flow else 0
-    if supporting>=2:
-        sentence+=', reinforced across the nearer timeframes'
-    elif opposing>=2:
-        sentence+=', although nearer timeframes are moving against it'
-    elif near:
-        sentence+=', with mixed confirmation nearby'
-    if wider_against:
-        sentence+='; broader control still offers opposition'
-    elif len(wider)>=2 and flow and all(x==flow for x in wider):
-        sentence+=' and the broader structure agrees'
+    routes={str(x.get('tf')):x for x in (raw.get('edge_router_map') or []) if isinstance(x,dict)}
+    near=[of(routes[t].get('of_state')) for t in ('15','60','75') if t in routes and of(routes[t].get('of_state'))]
+    if flow and sum(v==flow for v in near)>=2:
+        lead+=', and nearby timeframes mostly agree'
+    elif flow and sum(v==-flow for v in near)>=2:
+        lead+=', although nearby timeframes disagree'
+    elif near and flow:
+        lead+=', with mixed support from nearby timeframes'
+    macro=str(edge.get('macro') or '').upper()
+    if macro in ('BULLISH','BEARISH'):
+        macro_direction=1 if macro=='BULLISH' else -1
+        if macro_direction==flow:
+            lead+=f'. The macro trend is {macro.lower()} too'
+        elif macro_direction==-flow:
+            lead+=f'. The macro trend is {macro.lower()}, against the short-term pressure'
+        else:
+            lead+=f'. The macro trend is {macro.lower()}'
     scores=[num(r.get('exec_of_score')) for r in path]
-    scores=[v for v in scores if v is not None]
-    if len(scores)>=10:
+    scores=[x for x in scores if x is not None]
+    if len(scores)>=10 and flow:
         n=min(6,len(scores)//3)
         old=median(scores[:n]);recent=median(scores[-n:]);change=recent-old
         if old*recent>0 and abs(change)>=15:
             if (old<0 and change>0) or (old>0 and change<0):
-                sentence+=', while that pressure has begun to ease'
+                lead+='. Short-term pressure has started to weaken'
             else:
-                sentence+=', with pressure intensifying'
-    return sentence+'.'
+                lead+='. Short-term pressure is strengthening'
+    return lead+'.'
 
 
 def _natural_response(label: str, path: List[Dict[str,Any]],
                       progress: Dict[str,float]) -> str:
-    """Price is evidence of OF effectiveness, not a stand-alone bias vote."""
+    """Explain whether buying/selling pressure is working; avoid indicator jargon."""
     if not progress or len(path)<5:
-        return 'There is not enough uninterrupted EDGE history yet to judge whether that pressure is effective.'
+        return 'There is not enough continuous EDGE history yet to tell whether this pressure is working.'
     n=len(path)
     bear=sum(of(r.get('exec_of'))<0 for r in path)/n
     bull=sum(of(r.get('exec_of'))>0 for r in path)/n
-    move=progress['move']; threshold=progress['threshold']
-    if 'UPSIDE FAILURE' in label.upper():
-        statement=('Buying stayed forceful through an earlier advance, but much of that progress has been lost. '
-                   'The failure to hold gains is challenging buyer effectiveness even though execution OF remains bullish.')
-    elif 'DOWNSIDE FAILURE' in label.upper():
-        statement=('Selling drove an earlier decline, but much of that decline has been recovered. '
-                   'The inability to hold downside progress is challenging seller effectiveness even though execution OF remains bearish.')
+    move=progress['move'];threshold=progress['threshold']
+    label=label.upper()
+    if 'UPSIDE FAILURE' in label:
+        sentence='Buyers drove an earlier rise, but most of those gains have been lost. Buying pressure remains strong, yet buyers are struggling to hold progress.'
+    elif 'DOWNSIDE FAILURE' in label:
+        sentence='Sellers drove an earlier fall, but most of that decline has been recovered. Selling pressure remains, yet sellers are struggling to hold progress.'
     elif bear>=.70 and move<=-threshold:
-        statement='Sustained selling has also achieved genuine downside progress, supporting bearish control.'
+        sentence='Selling pressure is working: price has continued lower during the observed move.'
     elif bear>=.70 and move>=threshold:
-        statement='Despite persistent selling, price has advanced; sellers have not converted their pressure into sustained downside progress.'
+        sentence='Selling pressure has not worked: price has climbed despite persistent sellers.'
     elif bull>=.70 and move>=threshold:
-        statement='Buying pressure is producing sustained upside progress, supporting bullish control.'
+        sentence='Buying pressure is working: price has continued higher during the observed move.'
     elif bull>=.70 and move<=-threshold:
-        statement='Despite persistent buying, price has declined; buyers have failed to achieve sustained upside progress.'
+        sentence='Buying pressure has not worked: price has fallen despite persistent buyers.'
     elif bear>=.70:
-        statement='Sellers have struggled to make meaningful net progress despite sustained pressure.'
+        sentence='Sellers have not made much progress despite repeated selling pressure.'
     elif bull>=.70:
-        statement='Buyers have struggled to make meaningful net progress despite sustained pressure.'
+        sentence='Buyers have not made much progress despite repeated buying pressure.'
     else:
-        statement='Price response has been uneven, with neither side establishing consistent effectiveness.'
-    tag=label.upper()
-    if 'REBOUND DEVELOPING' in tag:
-        statement+=' A recovery from the recent low is now challenging sellers, but has not established a confirmed reversal.'
-    elif 'REVERSAL RISK' in tag:
-        statement+=' The emerging counter-move is substantial enough to put the prior direction at risk.'
-    elif 'PULLBACK' in tag or ('FADING' in tag and tag.startswith('BULLISH')):
-        statement+=' A recent pullback is challenging buyers without yet erasing the wider recovery.'
-    elif 'FADING' in tag and tag.startswith('BEARISH'):
-        statement+=' The counter-move is retracing the earlier decline, reducing bearish conviction.'
-    return statement
+        sentence='Neither buyers nor sellers have gained lasting ground during the observed move.'
+    if 'REBOUND DEVELOPING' in label:
+        sentence+=' A rebound is starting, but sellers have not lost control yet.'
+    elif 'REVERSAL RISK' in label:
+        sentence+=' The move against the trend is now large enough to warn of a possible change.'
+    elif 'PULLBACK' in label or ('FADING' in label and label.startswith('BULLISH')):
+        sentence+=' The recent pullback needs watching, but has not yet erased the bigger recovery.'
+    elif 'FADING' in label and label.startswith('BEARISH'):
+        sentence+=' The rebound is challenging the bearish trend.'
+    return sentence
 
 
 def _natural_fp(edge: Dict[str,Any], path: List[Dict[str,Any]]) -> str:
-    """Only describe witnessed FP interactions and estimated delta that actually changed."""
+    """Read delta against price behaviour at the same FP, never equate delta with a break.
+
+    A negative cumulative delta at demand + limited downside may suggest
+    possible absorption, not proof. A single observation cannot show buildup.
+    """
     if not path:return ''
     cur=_snap_tape(edge)
     zid=str(cur.get('fp_zone_id') or '').strip()
     side=str(cur.get('fp_side') or '').upper()
     if side not in ('DEMAND','SUPPLY') or not zid:return ''
     active=str(cur.get('fp_interacting') or '').upper() in ('TRUE','1')
-    name='demand' if side=='DEMAND' else 'supply'
+    name='Demand' if side=='DEMAND' else 'Supply'
     if active:
         session=[]
         for row in reversed(path):
@@ -666,29 +667,47 @@ def _natural_fp(edge: Dict[str,Any], path: List[Dict[str,Any]]) -> str:
                 str(row.get('fp_interacting') or '').upper() not in ('TRUE','1')):break
             session.append(row)
         session.reverse()
+        d_now=num(cur.get('fp_session_delta'))
+        status=str(cur.get('fp_context_state') or '').upper()
+        event=str(cur.get('fp_event_type') or '').upper()
+        pending='BREACH' in status or 'BREACH' in event or str(cur.get('fp_breach_pending') or '').upper() in ('TRUE','1')
+        prefix=(f'{name} is under a breach test, not a confirmed break.' if pending
+                else f'{name} is being tested.')
         if len(session)<2:
-            return f'{name.capitalize()} is being tested, but the delta response is not yet developed.'
+            if d_now is not None and d_now<0 and side=='DEMAND':
+                return prefix+' FP delta is negative; if price stops falling or reclaims Demand, this may indicate absorption. One reading cannot confirm it.'
+            if d_now is not None and d_now>0 and side=='SUPPLY':
+                return prefix+' FP delta is positive; if price stops rising, this may indicate absorption. One reading cannot confirm it.'
+            return prefix+' There is not enough recorded delta change yet to judge absorption.'
         d0=num(session[0].get('fp_session_delta'));d1=num(session[-1].get('fp_session_delta'))
         p0=num(session[0].get('close'));p1=num(session[-1].get('close'))
-        if d0 is None or d1 is None or not p0 or p1 is None or abs(d1-d0)<1:
-            return f'{name.capitalize()} is being tested without a meaningful recorded delta buildup yet.'
-        d=d1-d0;change=(p1-p0)/p0*100
-        pressure='selling' if d<0 else 'buying'
-        if abs(change)<.08:
-            outcome='price is barely responding, so the pressure has not yet proved effective'
-        elif (change>0 and d<0) or (change<0 and d>0):
-            outcome='price is resisting that pressure, suggesting a possible defensive response'
-        else:
-            outcome='price is moving with the pressure'
-        return f'At {name}, estimated {pressure} delta is accumulating but {outcome}.' if 'resisting' in outcome or 'barely' in outcome else f'At {name}, estimated {pressure} delta is accumulating and {outcome}.'
-    # A carried-forward old event is not a fresh defence; use timestamp too.
-    tm=_ms(cur.get('fp_event_time'));current=_ms(cur.get('bar_ms'))
+        if d0 is None or d1 is None or p0 is None or p1 is None or not p0:
+            return prefix+' FP delta is not clear enough to judge absorption.'
+        change=(p1-p0)/abs(p0)*100
+        difference=d1-d0
+        if abs(difference)<1:
+            return prefix+' FP delta has not built up enough to show who is gaining ground.'
+        if side=='DEMAND' and difference<0:
+            if change>=-.08:
+                return prefix+' Selling delta is building, but price is holding up. This could be buying absorption at Demand, not a confirmed reversal.'
+            return prefix+' Selling delta is building and price is falling; sellers are still making progress.'
+        if side=='SUPPLY' and difference>0:
+            if change<=.08:
+                return prefix+' Buying delta is building, but price is not advancing. This could be selling absorption at Supply, not a confirmed reversal.'
+            return prefix+' Buying delta is building and price is rising; buyers are still making progress.'
+        if d1<0 and difference>0:
+            return prefix+' FP delta remains negative but selling pressure is easing. Watch whether Demand holds.'
+        if d1>0 and difference<0:
+            return prefix+' FP delta remains positive but buying pressure is easing. Watch whether Supply holds.'
+        return prefix+' FP delta is changing, but the result is not yet clear.'
+    tm=_ms(cur.get('fp_event_time'));now=_ms(cur.get('bar_ms'))
     bars=num(cur.get('fp_bars_since_event'));tf=num(cur.get('tf'))
     ev=str(cur.get('fp_event_type') or '').upper()
-    if (tm is not None and current is not None and tf and bars is not None
-        and 0<=bars<=2 and 0<=current-tm<=2.5*tf*60000):
-        if 'DEFENCE' in ev:return f'A fresh {name} defence has formed, though its durability still needs confirmation.'
-        if 'BREAK' in ev or 'RUN' in ev:return f'A fresh {name} break has been confirmed; acceptance beyond the zone still needs monitoring.'
+    if (tm is not None and now is not None and tf and bars is not None
+        and 0<=bars<=2 and 0<=now-tm<=2.5*tf*60000):
+        if ev=='RUN_CONFIRMED':return f'{name} has a confirmed FP break; watch whether price stays beyond it.'
+        if ev=='DEFENCE_CONFIRMED':return f'{name} has just been defended; watch whether that hold continues.'
+        if 'BREACH' in ev:return f'{name} is under a breach test, but EDGE has not confirmed a break.'
     return ''
 
 
@@ -696,8 +715,8 @@ def _natural_location(edge:Dict[str,Any]) -> str:
     raw=jsondict(edge.get('raw_json'))
     pct=num(raw.get('battlefield_range_position_pct'))
     if pct is None:return ''
-    if pct>=75 and pct<=110:return 'Price is in the upper battlefield, with supply remaining the opposing structural side.'
-    if pct<=25 and pct>=-10:return 'Price is in the lower battlefield, where demand is the structural side to watch.'
+    if pct>=75 and pct<=110:return 'Price is in the upper battlefield, with Supply still ahead.'
+    if pct<=25 and pct>=-10:return 'Price is in the lower battlefield, where Demand matters most.'
     if pct>110:return 'Price is beyond the upper battlefield boundary, but acceptance there is not yet established.'
     if pct<-10:return 'Price is beyond the lower battlefield boundary, but acceptance there is not yet established.'
     return ''
@@ -720,8 +739,8 @@ def _natural_liquidity(tv_rows:List[Dict[str,Any]],edge:Dict[str,Any],now_ms:flo
     if not events:return ''
     events.sort(reverse=True)
     ups=sum('BUY_' in k for _,k,_ in events);downs=sum('SELL_' in k for _,k,_ in events)
-    if ups>=2 and ups>downs:sentence='Recent liquidity events show repeated attempts to take upside liquidity'
-    elif downs>=2 and downs>ups:sentence='Recent liquidity events show repeated attempts to take downside liquidity'
+    if ups>=2 and ups>downs:sentence='Recent Liquidity runs and sweeps have focused on the upside'
+    elif downs>=2 and downs>ups:sentence='Recent Liquidity runs and sweeps have focused on the downside'
     else:return ''  # isolated/mixed noise should not crowd the core reading
     tm,latest,lvl=events[0];spot=num(edge.get('close'))
     if lvl is not None and spot is not None and 'SWEEP' in latest:
@@ -742,11 +761,11 @@ def _natural_aurora(tv_rows:List[Dict[str,Any]],edge:Dict[str,Any],now_ms:float)
     white=str(row.get('aurora_state') or '').upper()=='WHITE'
     if boxed:
         msg=str(boxed[0]).lower()
-        if 'inside the box' in msg:return 'A verified higher-timeframe box is containing price and limits directional confidence.'
+        if 'inside the box' in msg:return 'Price is inside an HTF box; directional conviction is lower.'
         if 'above' in msg:return 'Price is testing beyond a verified higher-timeframe box; a sustained escape is not yet established.'
         if 'below' in msg:return 'Price is testing below a verified higher-timeframe box; a sustained escape is not yet established.'
         return 'A verified higher-timeframe box is relevant to the current structure.'
-    if white:return 'Candle AURORA flags sideways conditions, limiting directional conviction.'
+    if white:return 'AURORA WHITE suggests sideways conditions, so wait for clearer direction.'
     return ''
 
 

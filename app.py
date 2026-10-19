@@ -3327,6 +3327,82 @@ def _edge_option_for_setup(row: Dict[str, Any]) -> str:
     return ""
 
 
+def _sb_live_break_entry_gate(setup: Dict[str, Any], packet: Dict[str, Any],
+                              ctx: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """Mandatory independent revalidation of a stored FP break *for new entries*.
+
+    A stored PENDING_ENTRY is not current EDGE truth. The exact FP zone must
+    now have RUN/RUN_CONFIRMED and price accepted beyond it. This does not
+    rewrite campaign protections, stored setup records or user-recorded trades.
+    """
+    md = _sb_setup_md(setup)
+    name = str(md.get("setup_name") or setup.get("strategy_type") or "").upper()
+    if name not in {"SHORT_CE_AFTER_DEMAND_BREAK", "SHORT_PE_AFTER_SUPPLY_BREAK"}:
+        return {"status": "PASS", "reason": ""}
+    ctx = ctx if ctx is not None else _sb_authoritative_edge_context(packet)
+    edge = ctx.get("row") or {}
+    raw = ctx.get("raw") or {}
+    fp = md.get("fp") if isinstance(md.get("fp"), dict) else {}
+    side = "DEMAND" if name == "SHORT_CE_AFTER_DEMAND_BREAK" else "SUPPLY"
+    zid = str(fp.get("zoneId") or fp.get("zone_id") or "").strip()
+    lo, hi = _sb_num(fp.get("low")), _sb_num(fp.get("high"))
+    if not zid or lo is None or hi is None or hi < lo:
+        return {"status": "WAIT", "reason": "Stored FP zone cannot be verified; wait for a fresh EDGE-confirmed break."}
+    book = raw.get("fp_hurdle_book") if isinstance(raw.get("fp_hurdle_book"), dict) else {}
+    candidates = [x for x in (book.get("hurdles") or []) if isinstance(x, dict)]
+    # Typed fields provide a fallback when this FP is the currently selected FP.
+    for suffix, zone_side in (("", str(edge.get("fp_side") or "").upper()),
+                              ("d", "DEMAND"), ("s", "SUPPLY")):
+        prefix = f"fp_{suffix}_" if suffix else "fp_"
+        zone_id = edge.get(prefix + "zone_id")
+        if zone_id not in (None, ""):
+            candidates.append({
+                "zone_id": zone_id, "side": zone_side,
+                "low": edge.get(prefix + "low"), "high": edge.get(prefix + "high"),
+                "status": edge.get(prefix + "status"),
+                "event_type": edge.get(prefix + "event_type"),
+                "context": edge.get(prefix + "context_state"),
+                "breach_pending": edge.get(prefix + "breach_pending"),
+                "bars_since_event": edge.get(prefix + "bars_since_event"),
+                "event_time": edge.get(prefix + "event_time"),
+            })
+    matched = [z for z in candidates
+               if str(z.get("zone_id") or "").strip() == zid
+               and str(z.get("side") or "").upper() == side
+               and _sb_num(z.get("low")) is not None
+               and _sb_num(z.get("high")) is not None
+               and abs(float(z.get("low")) - lo) < 1e-7
+               and abs(float(z.get("high")) - hi) < 1e-7]
+    if not matched:
+        return {"status": "WAIT", "reason": "Stored FP zone is not confirmed in the current EDGE map; await a fresh setup."}
+    spot, bar_ms = _sb_num(edge.get("close")), _sb_num(edge.get("bar_time"))
+    tf = _sb_num(edge.get("tf"))
+    for z in matched:
+        status = str(z.get("status") or "").upper()
+        event = str(z.get("event_type") or "").upper()
+        context = str(z.get("context") or z.get("context_state") or "").upper()
+        if status != "RUN" or event != "RUN_CONFIRMED":
+            continue
+        if _sb_boolish(z.get("breach_pending")) or context in {"BREACH_PENDING", "WAITING_CONFIRM"}:
+            continue
+        age = _sb_num(z.get("bars_since_event"))
+        if age is None or not 0 <= age <= 3:
+            continue
+        event_ms = _sb_num(z.get("event_time"))
+        if bar_ms is None or tf is None or tf <= 0 or event_ms is None:
+            continue
+        if not 0 <= bar_ms - event_ms <= (age + 1.5) * tf * 60000:
+            continue
+        if spot is None or (side == "DEMAND" and spot >= lo) or (side == "SUPPLY" and spot <= hi):
+            continue
+        return {"status": "PASS", "reason": "Same-zone FP RUN confirmed by current EDGE."}
+    return {"status": "WAIT", "reason": (
+        "Demand break is still pending; wait for EDGE to confirm FP RUN before SELL CE."
+        if side == "DEMAND" else
+        "Supply break is still pending; wait for EDGE to confirm FP RUN before SELL PE."
+    )}
+
+
 def _edge_entry_matrix_for(row: Dict[str, Any], packet: Dict[str, Any]) -> Dict[str, Any]:
     opt = _edge_option_for_setup(row)
     if not opt:
@@ -3334,6 +3410,9 @@ def _edge_entry_matrix_for(row: Dict[str, Any], packet: Dict[str, Any]) -> Dict[
     if not _edge_live_ok(packet):
         return {"status":"WAIT","reason":"EDGE on correct execution timeframe is not ACTIVE or FP book is unavailable.","choices":{}}
     ctx = _sb_authoritative_edge_context(packet)
+    live_break = _sb_live_break_entry_gate(row, packet, ctx)
+    if live_break["status"] != "PASS":
+        return {"status": "WAIT", "reason": live_break["reason"], "choices": {}, "option_type": opt}
     if str(row.get("status") or "").upper() != "PENDING_ENTRY":
         return {"status":"WAIT","reason":"No pending EDGE entry trigger.","choices":{}}
     lm = _sb_combined_level_ladder(packet, packet.get("analysis") or {})
@@ -3655,11 +3734,11 @@ def _sb_campaign_plain_language(trade: Dict[str,Any], decision: Dict[str,Any],
     # Explain the market in ordinary language; the original risk decision and
     # locked protection rules remain untouched. Avoid repeating MTF/OF scores.
     if market_side and expected and market_side==expected:
-        trade_read='The observed market journey remains broadly consistent with this exposure.'
+        trade_read='The current market behaviour still supports this trade.'
     elif market_side and expected and market_side!=expected:
-        trade_read='The observed market journey is challenging this exposure.'
+        trade_read='The current market behaviour is moving against this trade.'
     else:
-        trade_read='Market confirmation for this exposure remains mixed or incomplete.'
+        trade_read='The market is mixed; the trade needs closer watching.'
     natural=str(bias.get('commentary') or '').strip()
     paragraphs=[part.strip() for part in natural.split('\n\n') if part.strip()]
     # The first paragraph explains execution control, cross-timeframe agreement
@@ -3674,7 +3753,7 @@ def _sb_campaign_plain_language(trade: Dict[str,Any], decision: Dict[str,Any],
                 narrative+=' '+nextpart.split('. ')[0].rstrip('.')+'.'
         commentary=trade_read+' '+narrative
     else:
-        commentary=trade_read+' The current control and zone response are not yet independently verified.'
+        commentary=trade_read+' EDGE has not yet confirmed the market direction or zone response.'
     if raw_action=='REVIEW':
         status='PROTECTION NOT VERIFIED'
     elif raw_action=='EXIT REVIEW':
@@ -3779,6 +3858,9 @@ def render_public_superbrain() -> None:
                 status=str(matrix.get('status') or 'WAIT').upper()
                 if status=='AVOID':st.error("**AVOID** — Adverse ODME expansion risk.")
                 else:
+                    if "break is still pending" in str(matrix.get('reason') or '').lower():
+                        st.warning("**WAIT — FP break not confirmed.** The Demand/Supply breach is still being tested; no new opposite-side entry yet.")
+                        continue
                     current_fp=_sb_short_fp_context(ctx)
                     if current_fp=='Awaiting next FP event':
                         st.warning("**WAIT** — No current EDGE defence/break confirmation or qualified protected strike.")
