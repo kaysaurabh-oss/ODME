@@ -141,10 +141,15 @@ def _event_anchor(path:List[Dict[str,Any]],tf_ms:float) -> Optional[int]:
         ev=str(r.get('fp_event_type') or '').upper()
         tm=_ms(r.get('fp_event_time'))
         bars=num(r.get('fp_bars_since_event'))
-        if (tm is not None and first_ms<=tm<=last_ms
-            and 0<=ms-tm<=1.7*tf_ms
-            and (bars is None or bars<=2)
-            and any(k in ev for k in ('DEFENCE','BREAK','RUN','RECLAIM','BREACH'))):
+        # An absorption probe, breach test or repeatedly published pending
+        # event is not a completed defence/break. Only a confirmed transition
+        # may reset the dominant journey. The recent FP activity is still
+        # available to the separate zone/delta commentary.
+        confirmed=(ev in ('DEFENCE_CONFIRMED','BREAK_CONFIRMED',
+                          'RUN_CONFIRMED','RECLAIM_CONFIRMED')
+                   or (ev.startswith('DEFENCE_') and ev.endswith('_CONFIRMED')))
+        if (confirmed and tm is not None and first_ms<=tm<=last_ms
+            and 0<=ms-tm<=1.7*tf_ms and (bars is None or 0<=bars<=2)):
             candidates.append((tm,i,'FP_EVENT'))
         # Even if EDGE does not emit a new named event, the first *recorded*
         # zone interaction is a valid (but weaker) start marker.
@@ -157,7 +162,14 @@ def _event_anchor(path:List[Dict[str,Any]],tf_ms:float) -> Optional[int]:
         if active and not preceding:
             candidates.append((ms,i,'FP_INTERACTION'))
     if not candidates:return None
-    # Latest genuinely witnessed event/interaction, not the latest stale label.
+    # A new TEST or early zone engagement must not supersede an older, fully
+    # observed confirmed event in the dominant journey. Prefer the latest
+    # sufficiently developed confirmed transition; only when none exists use
+    # a mature initial interaction as the observed journey anchor.
+    mature=[c for c in candidates if len(path)-c[1]>=5]
+    confirmed=[c for c in mature if c[2]=='FP_EVENT']
+    candidates=confirmed or mature
+    if not candidates:return None
     _tm, index, kind=max(candidates,key=lambda q:(q[0],-q[1]))
     # When an FP confirmed its defence/break a few candles after first touch,
     # use the first recorded touch in that same episode as the true start.
@@ -179,6 +191,11 @@ def _journey(edge:Dict[str,Any],hist:List[Dict[str,Any]]):
     if not path or not tf:return path,'OBSERVED_START'
     index=_event_anchor(path,tf*60_000)
     if index is None:return path,'OBSERVED_START'
+    # A just-triggered FP event must not erase a long uninterrupted journey.
+    # Until its own episode has developed, keep the broader observed history,
+    # while _natural_fp still reports the new event from its real timestamp.
+    if len(path)-index < 5:
+        return path,'OBSERVED_START · FP DEVELOPING'
     return path[index:], 'RECORDED_FP'
 
 
@@ -549,24 +566,223 @@ def _aurora_evidence(rows:List[Dict[str,Any]],edge:Dict[str,Any],now_ms:float) -
     return ''
 
 
+def _natural_control(edge: Dict[str,Any], path: List[Dict[str,Any]]) -> str:
+    """Explain cross-timeframe OF and its evolution without indicator readings."""
+    flow=of(edge.get('exec_of'))
+    state=str(edge.get('exec_of') or '').upper()
+    if flow<0:
+        sentence=('Execution selling remains forceful' if 'STRONG' in state else
+                  'Execution selling remains active')
+    elif flow>0:
+        sentence=('Execution buying remains forceful' if 'STRONG' in state else
+                  'Execution buying remains active')
+    else:
+        sentence='Execution order flow does not show decisive control'
+    raw=jsondict(edge.get('raw_json'))
+    bytf={str(x.get('tf')):x for x in (raw.get('edge_router_map') or []) if isinstance(x,dict)}
+    near=[of(bytf[t].get('of_state')) for t in ('15','60','75') if t in bytf and of(bytf[t].get('of_state'))]
+    wider=[of(bytf[t].get('of_state')) for t in ('125','240') if t in bytf and of(bytf[t].get('of_state'))]
+    supporting=sum(x==flow for x in near) if flow else 0
+    opposing=sum(x==-flow for x in near) if flow else 0
+    wider_against=sum(x==-flow for x in wider) if flow else 0
+    if supporting>=2:
+        sentence+=', reinforced across the nearer timeframes'
+    elif opposing>=2:
+        sentence+=', although nearer timeframes are moving against it'
+    elif near:
+        sentence+=', with mixed confirmation nearby'
+    if wider_against:
+        sentence+='; broader control still offers opposition'
+    elif len(wider)>=2 and flow and all(x==flow for x in wider):
+        sentence+=' and the broader structure agrees'
+    scores=[num(r.get('exec_of_score')) for r in path]
+    scores=[v for v in scores if v is not None]
+    if len(scores)>=10:
+        n=min(6,len(scores)//3)
+        old=median(scores[:n]);recent=median(scores[-n:]);change=recent-old
+        if old*recent>0 and abs(change)>=15:
+            if (old<0 and change>0) or (old>0 and change<0):
+                sentence+=', while that pressure has begun to ease'
+            else:
+                sentence+=', with pressure intensifying'
+    return sentence+'.'
+
+
+def _natural_response(label: str, path: List[Dict[str,Any]],
+                      progress: Dict[str,float]) -> str:
+    """Price is evidence of OF effectiveness, not a stand-alone bias vote."""
+    if not progress or len(path)<5:
+        return 'There is not enough uninterrupted EDGE history yet to judge whether that pressure is effective.'
+    n=len(path)
+    bear=sum(of(r.get('exec_of'))<0 for r in path)/n
+    bull=sum(of(r.get('exec_of'))>0 for r in path)/n
+    move=progress['move']; threshold=progress['threshold']
+    if 'UPSIDE FAILURE' in label.upper():
+        statement=('Buying stayed forceful through an earlier advance, but much of that progress has been lost. '
+                   'The failure to hold gains is challenging buyer effectiveness even though execution OF remains bullish.')
+    elif 'DOWNSIDE FAILURE' in label.upper():
+        statement=('Selling drove an earlier decline, but much of that decline has been recovered. '
+                   'The inability to hold downside progress is challenging seller effectiveness even though execution OF remains bearish.')
+    elif bear>=.70 and move<=-threshold:
+        statement='Sustained selling has also achieved genuine downside progress, supporting bearish control.'
+    elif bear>=.70 and move>=threshold:
+        statement='Despite persistent selling, price has advanced; sellers have not converted their pressure into sustained downside progress.'
+    elif bull>=.70 and move>=threshold:
+        statement='Buying pressure is producing sustained upside progress, supporting bullish control.'
+    elif bull>=.70 and move<=-threshold:
+        statement='Despite persistent buying, price has declined; buyers have failed to achieve sustained upside progress.'
+    elif bear>=.70:
+        statement='Sellers have struggled to make meaningful net progress despite sustained pressure.'
+    elif bull>=.70:
+        statement='Buyers have struggled to make meaningful net progress despite sustained pressure.'
+    else:
+        statement='Price response has been uneven, with neither side establishing consistent effectiveness.'
+    tag=label.upper()
+    if 'REBOUND DEVELOPING' in tag:
+        statement+=' A recovery from the recent low is now challenging sellers, but has not established a confirmed reversal.'
+    elif 'REVERSAL RISK' in tag:
+        statement+=' The emerging counter-move is substantial enough to put the prior direction at risk.'
+    elif 'PULLBACK' in tag or ('FADING' in tag and tag.startswith('BULLISH')):
+        statement+=' A recent pullback is challenging buyers without yet erasing the wider recovery.'
+    elif 'FADING' in tag and tag.startswith('BEARISH'):
+        statement+=' The counter-move is retracing the earlier decline, reducing bearish conviction.'
+    return statement
+
+
+def _natural_fp(edge: Dict[str,Any], path: List[Dict[str,Any]]) -> str:
+    """Only describe witnessed FP interactions and estimated delta that actually changed."""
+    if not path:return ''
+    cur=_snap_tape(edge)
+    zid=str(cur.get('fp_zone_id') or '').strip()
+    side=str(cur.get('fp_side') or '').upper()
+    if side not in ('DEMAND','SUPPLY') or not zid:return ''
+    active=str(cur.get('fp_interacting') or '').upper() in ('TRUE','1')
+    name='demand' if side=='DEMAND' else 'supply'
+    if active:
+        session=[]
+        for row in reversed(path):
+            if (str(row.get('fp_zone_id') or '').strip()!=zid or
+                str(row.get('fp_side') or '').upper()!=side or
+                str(row.get('fp_interacting') or '').upper() not in ('TRUE','1')):break
+            session.append(row)
+        session.reverse()
+        if len(session)<2:
+            return f'{name.capitalize()} is being tested, but the delta response is not yet developed.'
+        d0=num(session[0].get('fp_session_delta'));d1=num(session[-1].get('fp_session_delta'))
+        p0=num(session[0].get('close'));p1=num(session[-1].get('close'))
+        if d0 is None or d1 is None or not p0 or p1 is None or abs(d1-d0)<1:
+            return f'{name.capitalize()} is being tested without a meaningful recorded delta buildup yet.'
+        d=d1-d0;change=(p1-p0)/p0*100
+        pressure='selling' if d<0 else 'buying'
+        if abs(change)<.08:
+            outcome='price is barely responding, so the pressure has not yet proved effective'
+        elif (change>0 and d<0) or (change<0 and d>0):
+            outcome='price is resisting that pressure, suggesting a possible defensive response'
+        else:
+            outcome='price is moving with the pressure'
+        return f'At {name}, estimated {pressure} delta is accumulating but {outcome}.' if 'resisting' in outcome or 'barely' in outcome else f'At {name}, estimated {pressure} delta is accumulating and {outcome}.'
+    # A carried-forward old event is not a fresh defence; use timestamp too.
+    tm=_ms(cur.get('fp_event_time'));current=_ms(cur.get('bar_ms'))
+    bars=num(cur.get('fp_bars_since_event'));tf=num(cur.get('tf'))
+    ev=str(cur.get('fp_event_type') or '').upper()
+    if (tm is not None and current is not None and tf and bars is not None
+        and 0<=bars<=2 and 0<=current-tm<=2.5*tf*60000):
+        if 'DEFENCE' in ev:return f'A fresh {name} defence has formed, though its durability still needs confirmation.'
+        if 'BREAK' in ev or 'RUN' in ev:return f'A fresh {name} break has been confirmed; acceptance beyond the zone still needs monitoring.'
+    return ''
+
+
+def _natural_location(edge:Dict[str,Any]) -> str:
+    raw=jsondict(edge.get('raw_json'))
+    pct=num(raw.get('battlefield_range_position_pct'))
+    if pct is None:return ''
+    if pct>=75 and pct<=110:return 'Price is in the upper battlefield, with supply remaining the opposing structural side.'
+    if pct<=25 and pct>=-10:return 'Price is in the lower battlefield, where demand is the structural side to watch.'
+    if pct>110:return 'Price is beyond the upper battlefield boundary, but acceptance there is not yet established.'
+    if pct<-10:return 'Price is beyond the lower battlefield boundary, but acceptance there is not yet established.'
+    return ''
+
+
+def _natural_liquidity(tv_rows:List[Dict[str,Any]],edge:Dict[str,Any],now_ms:float) -> str:
+    row=_best(tv_rows,'LIQUIDITY',edge,now_ms)
+    if not row:return ''
+    current=_ms(edge.get('bar_time'))
+    tf=num(edge.get('tf')) or 15
+    if not current:return ''
+    cutoff=max(45,min(180,4*tf))*60_000
+    events=[]
+    for i in range(1,6):
+        kind=str(row.get(f'liq_event{i}_type') or '').upper()
+        tm=_ms(row.get(f'liq_event{i}_confirm_time'))
+        lvl=num(row.get(f'liq_event{i}_level'))
+        if tm and 0<=current-tm<=cutoff and 'FULL' in kind and ('RUN' in kind or 'SWEEP' in kind):
+            events.append((tm,kind,lvl))
+    if not events:return ''
+    events.sort(reverse=True)
+    ups=sum('BUY_' in k for _,k,_ in events);downs=sum('SELL_' in k for _,k,_ in events)
+    if ups>=2 and ups>downs:sentence='Recent liquidity events show repeated attempts to take upside liquidity'
+    elif downs>=2 and downs>ups:sentence='Recent liquidity events show repeated attempts to take downside liquidity'
+    else:return ''  # isolated/mixed noise should not crowd the core reading
+    tm,latest,lvl=events[0];spot=num(edge.get('close'))
+    if lvl is not None and spot is not None and 'SWEEP' in latest:
+        if 'BUY_' in latest and spot<lvl:
+            sentence+=', with the latest sweep rejected'
+        elif 'SELL_' in latest and spot>lvl:
+            sentence+=', followed by a recovery above the sweep'
+    elif lvl is not None and spot is not None and 'RUN' in latest:
+        if 'BUY_' in latest and spot>lvl:sentence+=', with price remaining above the latest run'
+        if 'SELL_' in latest and spot<lvl:sentence+=', with price remaining below the latest run'
+    return sentence+'.'
+
+
+def _natural_aurora(tv_rows:List[Dict[str,Any]],edge:Dict[str,Any],now_ms:float) -> str:
+    row=_best(tv_rows,'AURORA',edge,now_ms)
+    if not row:return ''
+    boxed=_box_read(row,edge)
+    white=str(row.get('aurora_state') or '').upper()=='WHITE'
+    if boxed:
+        msg=str(boxed[0]).lower()
+        if 'inside the box' in msg:return 'A verified higher-timeframe box is containing price and limits directional confidence.'
+        if 'above' in msg:return 'Price is testing beyond a verified higher-timeframe box; a sustained escape is not yet established.'
+        if 'below' in msg:return 'Price is testing below a verified higher-timeframe box; a sustained escape is not yet established.'
+        return 'A verified higher-timeframe box is relevant to the current structure.'
+    if white:return 'Candle AURORA flags sideways conditions, limiting directional conviction.'
+    return ''
+
+
 def _conviction_commentary(edge:Dict[str,Any],path:List[Dict[str,Any]],
                            previous:Dict[str,str],tv_rows:List[Dict[str,Any]],
                            now_ms:float) -> str:
-    """Keep to four evidence-first sentences: score, MTF, FP/location, response + optional."""
-    of_note=_execution_evidence(edge,path)
-    mtf_note=_mtf_evidence(edge)
-    fp_note=_fp_evidence(edge,path)
-    location_note=_structure_evidence(edge)
-    liquidity_note=_liquidity_sequence_evidence(tv_rows,edge,now_ms)
-    aurora_note=_aurora_evidence(tv_rows,edge,now_ms)
-    journey=str(previous.get('commentary') or previous.get('basis') or '').strip()
-    # The old journey text leads with price; put its behavioural interpretation last.
-    # Limit optional commentary to relevant fresh context. Avoid needless levels.
-    structural=' '.join(x for x in (fp_note,location_note) if x)
-    optional=' '.join(x for x in (liquidity_note,aurora_note) if x)
-    parts=[x for x in (of_note,mtf_note,structural,journey,optional) if x]
-    return ' '.join(parts)
+    """Short natural-language appraisal. Indicator values stay in metadata, not prose.
 
+    Preserve distinct evidence: OF + timeframes, realised price effectiveness,
+    real FP/delta interaction, and only relevant fresh optional observations.
+    """
+    label=str(previous.get('label') or '')
+    progress=_movement(path) if len(path)>=5 else {}
+    control=_natural_control(edge,path)
+    outcome=_natural_response(label,path,progress)
+    fp=_natural_fp(edge,path)
+    location=_natural_location(edge)
+    liquidity=_natural_liquidity(tv_rows,edge,now_ms)
+    aurora=_natural_aurora(tv_rows,edge,now_ms)
+    # FP response is more decisive than general battlefield location. Ignore
+    # optional noise if it does not materially change the central assessment.
+    context=[]
+    if fp:context.append(fp)
+    elif location:context.append(location)
+    if liquidity:context.append(liquidity)
+    if aurora:context.append(aurora)
+    if not fp and not liquidity and not aurora and progress and abs(num(edge.get('exec_of_score')) or 0)>=65:
+        if of(edge.get('exec_of'))<0:
+            context.append('No fresh demand defence or in-zone delta response is currently confirmed.')
+        elif of(edge.get('exec_of'))>0:
+            context.append('No fresh supply rejection or in-zone delta response is currently confirmed.')
+    # Two readable paragraphs, no raw score/timeframe/price lists. Cap to the
+    # most relevant context, but retain observed FP and fresh Liquidity first.
+    first=control+' '+outcome
+    second=' '.join(context[:3])
+    return first+('\n\n'+second if second else '')
 
 def intelligent_bias(edge:Dict[str,Any],history:List[Dict[str,Any]],
                      tv_rows:List[Dict[str,Any]],odme:Optional[Dict[str,Any]]=None,
@@ -610,7 +826,18 @@ def intelligent_bias(edge:Dict[str,Any],history:List[Dict[str,Any]],
         threshold=progress['threshold']
         bearshare=progress['bearshare']
         bullshare=progress['bullshare']
-        if bearshare>=0.70 and move>=threshold:
+        # Control effectiveness can reverse while the current OF remains
+        # bullish/bearish. A meaningful rally that was mostly surrendered is
+        # NOT fresh bullish confirmation; the mirrored rule holds for shorts.
+        if (bullshare>=0.70 and progress['peak_gain']>=max(0.50,2*threshold)
+            and progress['retrace_up']>=0.70 and move<threshold):
+            label='BULLISH PRESSURE · UPSIDE FAILURE'
+            clue='sustained buying failed to retain the earlier advance'
+        elif (bearshare>=0.70 and progress['trough_drop']>=max(0.50,2*threshold)
+              and progress['retrace_down']>=0.70 and move>-threshold):
+            label='BEARISH PRESSURE · DOWNSIDE FAILURE'
+            clue='sustained selling failed to retain the earlier decline'
+        elif bearshare>=0.70 and move>=threshold:
             label='BULLISH RECOVERY'
             clue='price advancing despite persistent bearish OF'
             if progress['retrace_up']>=0.55 and progress['latest_move']<0:

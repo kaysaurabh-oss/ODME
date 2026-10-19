@@ -3652,30 +3652,29 @@ def _sb_campaign_plain_language(trade: Dict[str,Any], decision: Dict[str,Any],
     expected='BEARISH' if option=='CE' else 'BULLISH' if option=='PE' else str(trade.get('direction') or '').upper()
     bias_name=str(bias.get('label') or '').upper()
     market_side='BULLISH' if bias_name.startswith(('BULLISH','STRONG BULLISH')) else 'BEARISH' if bias_name.startswith(('BEARISH','STRONG BEARISH')) else ''
-    row=(_sb_authoritative_edge_context(packet).get('row') or {})
-    score=_sb_num(row.get('exec_of_score'))
-    current_of=str(row.get('exec_of') or 'UNKNOWN').replace('_',' ').lower()
-    vote=f"execution OF {current_of}"+(f" ({score:+.0f})" if score is not None else '')
+    # Explain the market in ordinary language; the original risk decision and
+    # locked protection rules remain untouched. Avoid repeating MTF/OF scores.
     if market_side and expected and market_side==expected:
-        trade_read='The observed EDGE journey supports this exposure.'
+        trade_read='The observed market journey remains broadly consistent with this exposure.'
     elif market_side and expected and market_side!=expected:
-        trade_read='The observed EDGE journey is opposing this exposure.'
+        trade_read='The observed market journey is challenging this exposure.'
     else:
-        trade_read='The EDGE journey is mixed or not independently verified.'
-    if 'REBOUND' in bias_name and expected=='BEARISH':
-        trade_read+=' A developing rebound challenges sellers; it is not yet a confirmed reversal.'
-    elif ('PULLBACK' in bias_name or 'FADING' in bias_name) and expected=='BULLISH':
-        trade_read+=' A counter-move is developing; check whether the original bullish thesis still holds.'
-    mtf_note=str(bias.get('mtf_summary') or '').strip()
-    fp_note=str(bias.get('fp_summary') or '').strip()
-    liq_note=str(bias.get('liquidity_summary') or '').strip()
-    # Only evidence with a confirmed, material interaction belongs in a
-    # campaign readout; stale carried-forward zones must not become a trigger.
-    evidence=[f'Current {vote}.']
-    if mtf_note:evidence.append(mtf_note)
-    if fp_note and ('test:' in fp_note or 'Fresh ' in fp_note):evidence.append(fp_note)
-    elif liq_note:evidence.append(liq_note)
-    commentary=' '.join([trade_read]+evidence)
+        trade_read='Market confirmation for this exposure remains mixed or incomplete.'
+    natural=str(bias.get('commentary') or '').strip()
+    paragraphs=[part.strip() for part in natural.split('\n\n') if part.strip()]
+    # The first paragraph explains execution control, cross-timeframe agreement
+    # and its actual price effectiveness. Include the second only when it
+    # contains material zone/delta or liquidity intelligence.
+    if paragraphs:
+        narrative=paragraphs[0]
+        if len(paragraphs)>1:
+            nextpart=paragraphs[1]
+            if any(word in nextpart.lower() for word in
+                   ('delta', 'defence', 'defense', 'liquidity', 'sweep', 'break', 'rejection')):
+                narrative+=' '+nextpart.split('. ')[0].rstrip('.')+'.'
+        commentary=trade_read+' '+narrative
+    else:
+        commentary=trade_read+' The current control and zone response are not yet independently verified.'
     if raw_action=='REVIEW':
         status='PROTECTION NOT VERIFIED'
     elif raw_action=='EXIT REVIEW':
@@ -3690,6 +3689,8 @@ def _sb_campaign_plain_language(trade: Dict[str,Any], decision: Dict[str,Any],
         status='ON WATCH — MARKET JOURNEY CHALLENGES THIS EXPOSURE'
     elif 'REVERSAL RISK' in bias_name:
         status='ON WATCH — REVERSAL RISK AGAINST THE PLAN'
+    elif ('UPSIDE FAILURE' in bias_name and expected=='BULLISH') or (          'DOWNSIDE FAILURE' in bias_name and expected=='BEARISH'):
+        status='ON WATCH — THE MARKET IS NOT REWARDING THE ORIGINAL PRESSURE'
     elif ('REBOUND DEVELOPING' in bias_name and expected=='BEARISH') or ('PULLBACK' in bias_name and expected=='BULLISH'):
         status='ON PLAN, BUT COUNTER-PRESSURE DEVELOPING'
     else:
