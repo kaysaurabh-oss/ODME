@@ -2930,10 +2930,58 @@ def _sb_record_selected_pending_entry(
     return saved
 
 
+def _sb_entry_quote(packet: Dict[str, Any], contract_type: str, strike: Any, expiry: str) -> Dict[str, Any]:
+    """Read only an exact strike quote from the fresh, matching ODME scan.
+
+    Quotes are indicative, not broker executions. Never fall back to a nearby
+    strike, a wall level, or a stale ODME snapshot.
+    """
+    if not packet.get('odme_live') or contract_type not in {'CE', 'PE'}:
+        return {}
+    selected = str((packet.get('mapping') or {}).get('selected_expiry') or '').upper().replace(' ', '')
+    requested = str(expiry or '').upper().replace(' ', '')
+    if not selected or selected != requested:
+        return {}
+    target = _sb_num(str(strike).replace(',', ''))
+    result = ((packet.get('odme_outcome') or {}).get('result') or {})
+    table = result.get('strike_table') if isinstance(result, dict) else None
+    if target is None or not isinstance(table, pd.DataFrame) or table.empty or 'strike' not in table.columns:
+        return {}
+    values = pd.to_numeric(table['strike'], errors='coerce')
+    matched = table.loc[(values-target).abs() < 1e-7]
+    if len(matched) != 1:
+        return {}
+    col = 'ce_ltp' if contract_type == 'CE' else 'pe_ltp'
+    if col not in matched.columns:
+        return {}
+    quote = _sb_num(matched.iloc[0][col])
+    if quote is None or quote <= 0:
+        return {}
+    return {'premium': float(quote), 'source': 'FRESH_ODME_OPTION_QUOTE',
+            'quote_recorded_at': datetime.now(timezone.utc).isoformat(),
+            'contract_type': contract_type, 'strike': float(target), 'expiry': requested}
+
+
+def _sb_auto_entry_protection(packet: Dict[str, Any], contract_type: str,
+                              strike: Any, now: str, expiry: str = '') -> Optional[Dict[str, Any]]:
+    selected = str((packet.get('mapping') or {}).get('selected_expiry') or '').strip().upper().replace(' ', '')
+    if not selected or selected != str(expiry or '').strip().upper().replace(' ', ''):
+        return None
+    if contract_type not in {'CE', 'PE'} or not _edge_live_ok(packet) or not packet.get('odme_live'):
+        return None
+    lm = _sb_combined_level_ladder(packet, packet.get('analysis') or {})
+    if not lm.get('level_rank_reliable'):
+        return None
+    ladder = (lm.get('below') if contract_type == 'PE' else lm.get('above')) or []
+    return _sb_lock_actual_protection(ladder, contract_type, strike, now,
+                                      _sb_authoritative_edge_context(packet).get('exec_tf'))
+
+
 def _sb_record_user_confirmed_trade(
     store: Any, packet: Dict[str, Any], side: str, contract_type: str,
     strike: Any, expiry: str, quantity: Any, thesis: str = "",
     entry_price: Any = "", invalidation: Any = "",
+    option_premium: Any = "", premium_quote: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Record a real user-reported exposure without requiring an EDGE setup.
 
@@ -2957,6 +3005,10 @@ def _sb_record_user_confirmed_trade(
         raise ValueError('The optional underlying-price invalidation must be numeric.')
     if entry_price not in ('', None) and _sb_num(str(entry_price).replace(',','')) is None:
         raise ValueError('The optional underlying price at entry must be numeric.')
+    if option_premium not in ('', None):
+        pv = _sb_num(str(option_premium).replace(',', ''))
+        if pv is None or pv <= 0:
+            raise ValueError('Option premium must be positive or left blank.')
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     trade_id = f'SB-{uuid.uuid4().hex[:12].upper()}'
     is_bull = (contract_type=='CE' and side=='BUY') or (contract_type=='PE' and side=='SELL') or (contract_type in {'FUT','CASH','OTHER'} and side=='BUY')
@@ -2974,19 +3026,36 @@ def _sb_record_user_confirmed_trade(
         'origin_setup_name':'USER_RECORDED_TRADE',
         'origin_setup_direction':direction,
         'manual_entry_note':str(thesis or '').strip(),
-        'manual_entry_price_source':'USER_REPORTED' if entry_price not in ('',None) else 'NOT_SUPPLIED',
+        'manual_entry_price_source':('EDGE_REFERENCE_AT_RECORDING' if entry_price not in ('',None) else 'NOT_AVAILABLE'),
         'management_family':'PRIMARY_CAMPAIGN_MANAGEMENT',
         'management_revision':0,'current_exposure_source':'USER_CONFIRMED_ANYTIME',
         'recorded_at':now,
     }
-    # Manually entered trades have no verified source FP plan. Never silently
-    # adopt *today's* ODME/EDGE barriers as if they were locked at execution.
-    # The existing Active Campaign panel permits the user to verify and lock
-    # actual current protections explicitly on the next scan.
-    tmd['protection_state']='AWAITING_USER_CONFIRMATION'
+    quote = premium_quote or {}
+    quoted = _sb_num(quote.get('premium'))
+    entered = _sb_num(option_premium)
+    if contract_type in {'CE','PE'} and entered is not None:
+        tmd['option_entry_premium'] = float(entered)
+        tmd['option_entry_premium_source'] = ('ODME_QUOTE_AT_RECORDING' if
+            quoted is not None and abs(quoted - entered) < 1e-8 else 'USER_CONFIRMED_PRICE')
+        leg['entry_premium'] = float(entered)
+        leg['entry_premium_source'] = tmd['option_entry_premium_source']
+        if quote:
+            tmd['option_quote_reference'] = quote
+    # Lock only a current verified protection map at the recording timestamp.
+    # Historical fill-time protection cannot be reconstructed from this map.
+    protection = _sb_auto_entry_protection(packet, contract_type, strike, now, expiry)
+    if protection:
+        tmd['locked_protection'] = protection
+        tmd['protection_state'] = 'AUTO_LOCKED_AT_RECORDING'
+    else:
+        tmd['protection_state'] = 'UNVERIFIED_REVIEW_REQUIRED'
     market_state = {'price':_sb_num(row.get('close')),'macro':row.get('macro'),
                     'exec_of':row.get('exec_of'),
                     'snapshot_at_recording':True,
+                    'underlying_price_source':('EDGE_AT_RECORDING' if _edge_live_ok(packet) and
+                        _sb_num(row.get('close')) is not None else 'LAST_EDGE_REFERENCE'),
+                    'edge_bar_time_ms':row.get('bar_time'),
                     'actual_entry_timestamp_unknown':True}
     trade = {
         'instrument':instrument,'trade_id':trade_id,'status':'ACTIVE',
@@ -3021,9 +3090,29 @@ def _sb_render_anytime_entry(store: Any, instrument: str, packet: Dict[str,Any])
     strike = st.text_input('Actual option strike (required for CE/PE)',key=f'anytime_strike_{instrument}')
     expiry = st.text_input('Expiry',value=str((packet.get('mapping') or {}).get('selected_expiry') or ''),key=f'anytime_expiry_{instrument}')
     quantity = st.text_input('Lots / quantity',key=f'anytime_qty_{instrument}')
-    thesis = st.text_input('Your original trade thesis (optional)',key=f'anytime_thesis_{instrument}',
-                           placeholder='e.g. bearish continuation / non-arrival / demand rebound')
-    entry_price = st.text_input('Underlying price at execution (optional)',key=f'anytime_entry_px_{instrument}')
+    thesis = st.text_input('Trade thesis (editable)',value=str((packet.get('analysis') or {}).get('bias_reason') or ''),
+                           key=f'anytime_thesis_{instrument}',placeholder='Why you took this trade')
+    ctx = _sb_authoritative_edge_context(packet)
+    underlying = _sb_num((ctx.get('row') or {}).get('close'))
+    price_source = 'current EDGE reference' if _edge_live_ok(packet) else 'last EDGE reference — market may be closed'
+    if underlying is not None:
+        st.caption(f'Underlying reference: {_sb_fmt_level(underlying)} ({price_source}). Saved automatically; not claimed as your historical fill.')
+    quote = _sb_entry_quote(packet, opt, strike, expiry) if opt in {'CE','PE'} else {}
+    quote_key = f'anytime_premium_key_{instrument}'
+    quote_identity = (opt, str(strike), str(expiry))
+    # Refresh the quoted default on contract change, but retain user edits during reruns.
+    prev_contract = st.session_state.get(quote_key)
+    if prev_contract != quote_identity:
+        st.session_state[quote_key] = quote_identity
+        st.session_state[f'anytime_premium_{instrument}'] = (str(quote.get('premium')) if quote else '')
+    premium = ''
+    if opt in {'CE','PE'}:
+        premium = st.text_input('Option premium at entry (editable)', key=f'anytime_premium_{instrument}',
+                                help='Prefilled with the latest matching ODME quote if available. Confirm/edit your actual execution premium.')
+        if quote:
+            st.caption('Prefilled from current ODME option LTP; it is not verified broker execution price.')
+        else:
+            st.caption('No matching fresh option quote. Enter premium if known, otherwise leave blank (P&L will be unavailable).')
     invalidation = st.text_input('Your underlying-price invalidation (optional)',key=f'anytime_invalidation_{instrument}',
                                  help='Only if you have an actual price level that invalidates your thesis; not an option premium.')
     is_option = opt in {'CE','PE'}
@@ -3034,7 +3123,8 @@ def _sb_render_anytime_entry(store: Any, instrument: str, packet: Dict[str,Any])
         try:
             if type(store).__name__=='LocalStore':
                 raise RuntimeError('Cannot persist this campaign: the app is using LocalStore, not Google Sheet storage.')
-            trade = _sb_record_user_confirmed_trade(store,packet,side,opt,strike,expiry,quantity,thesis,entry_price,invalidation)
+            trade = _sb_record_user_confirmed_trade(store,packet,side,opt,strike,expiry,quantity,thesis,
+                underlying if underlying is not None else '',invalidation,premium,quote)
             tid = str(trade.get('trade_id') or '').strip()
             if not tid:raise RuntimeError('The store did not return a trade ID.')
             saved = store.list_superbrain_trades(instrument=instrument,open_only=False)
@@ -3078,8 +3168,7 @@ def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str,
         and str(row.get("record_id", "") or "").strip() not in linked_setup_ids
     ]
     _sb_render_anytime_entry(store,instrument,packet)
-    if not pending_rows:
-        return
+    return  # Single recording path: no duplicate setup form / Renko confirmation.
 
     st.divider()
     st.caption('Alternatively, attach an executed trade to a previously saved EDGE setup:')
