@@ -1,10 +1,12 @@
-"""WISH SuperBrain EDGE + ODME policy v1. Does not calculate Pine/ODME indicators.
+"""WISH SuperBrain EDGE + ODME policy (locked October 2026 rulebook). Does not calculate Pine/ODME indicators.
 
 Pure, testable decision helpers. AURORA is deliberately manual for ENTRY only.
 No AURORA/STRUCTURE/LIQUIDITY feed is consumed by this module.
 """
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
+
+RULEBOOK_VERSION = "SB_EDGE_ODME_20261022_V2"
 
 
 def direction(v: Any) -> str:

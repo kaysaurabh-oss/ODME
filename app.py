@@ -18,7 +18,7 @@ from superbrain_edge_policy import (
     direction as _edge_direction, adverse_expansion as _edge_adverse_expansion,
     entry_matrix as _edge_entry_matrix, protection_broken as _edge_protection_broken,
     campaign_decision as _edge_campaign_decision, option_direction as _edge_option_direction,
-    cash_entry_signal as _edge_cash_entry_signal,
+    cash_entry_signal as _edge_cash_entry_signal, RULEBOOK_VERSION as _edge_policy_version,
 )
 from superbrain_bridge import (
     build_instrument_map,
@@ -26,6 +26,23 @@ from superbrain_bridge import (
 )
 from superbrain_edge_memory import read_edge_tape, intelligent_bias
 from superbrain_market_sessions import session_status, last_session_snapshot
+
+RULEBOOK_VERSION = "SB_EDGE_ODME_20261022_V2"
+
+
+def _sb_rulebook_gate(store: Any) -> Dict[str, Any]:
+    """Fail closed on stale/unreadable active rulebook; never silently reuse legacy rows."""
+    if _edge_policy_version != RULEBOOK_VERSION:
+        return {'ok': False, 'reason': 'App and EDGE policy versions differ; both Python files must be deployed together.'}
+    try:
+        sheet = store.sheet.worksheet('SUPERBRAIN_RULES')
+        version = str(sheet.acell('S2').value or '').strip()
+        state = str(sheet.acell('R2').value or '').strip().upper()
+        return {'ok': version == RULEBOOK_VERSION and state == 'LOCKED',
+                'version': version, 'state': state}
+    except Exception as exc:
+        return {'ok': False, 'reason': 'Cannot verify current locked rulebook: ' + type(exc).__name__}
+
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
 
@@ -525,6 +542,12 @@ def _sb_record_management_adjustment(
     expiry: str = "",
     quantity: Any = "",
     note: str = "",
+    old_exit_premium: Any = "",
+    new_entry_premium: Any = "",
+    old_quote: Optional[Dict[str, Any]] = None,
+    new_quote: Optional[Dict[str, Any]] = None,
+    roll_direction: str = "",
+    manual_price: Any = "",
 ) -> Dict[str, Any]:
     """Update the SAME active campaign after a user-confirmed management action.
 
@@ -578,9 +601,19 @@ def _sb_record_management_adjustment(
         "source": "USER_CONFIRMED_SUPERBRAIN",
     }
 
+    for field, raw in [('Old exit premium', old_exit_premium), ('New entry premium', new_entry_premium),
+                       ('Underlying price', manual_price)]:
+        if raw not in ('', None) and (_sb_num(raw) is None or _sb_num(raw) <= 0):
+            raise ValueError(f'{field} must be positive or blank.')
+    if manual_price not in ('', None):
+        event['price'] = float(_sb_num(manual_price))
+        event['price_source'] = 'USER_EDITABLE_REFERENCE'
+
     if action == "ROLL":
         old_type=str((legs[selected_leg_index] or {}).get("option_type") or "").upper()
         new_type=str(contract_type or old_type).upper()
+        if str(side or legs[selected_leg_index].get('side') or '').upper() != str(legs[selected_leg_index].get('side') or '').upper():
+            raise ValueError('A roll must retain the same BUY/SELL direction. Record a different position as a separate campaign.')
         if old_type in {"PE","CE"} and new_type != old_type:
             raise ValueError("Rolls must retain the original CE/PE side. Opposite-side positions require a new independent campaign.")
         old = legs[selected_leg_index]
@@ -599,12 +632,22 @@ def _sb_record_management_adjustment(
         old["management_event_id"] = event_id
 
         new_id = f"{trade_id}-M{revision}"
+        # Previous fill belongs only to the previous leg; never inherit its premium.
+        if _sb_num(old_exit_premium) is not None:
+            old['exit_premium'] = float(_sb_num(old_exit_premium))
+            old['exit_premium_source'] = 'USER_EDITABLE_MARKET_REFERENCE'
         new_leg = dict(old)
+        for key in ('entry_premium','entry_premium_source','exit_premium','exit_premium_source',
+                    'entry_price','entry_price_source','closed_at','close_reason',
+                    'replaced_by_leg_id','rolled_to_leg_id'):
+            new_leg.pop(key, None)
         for key in ("closed_at", "close_reason", "replaced_by_leg_id", "rolled_to_leg_id"):
             new_leg.pop(key, None)
         new_leg["leg_id"] = new_id
         new_leg["status"] = "ACTIVE"
         new_leg["opened_at"] = now
+        new_leg['underlying_at_open'] = _sb_num(manual_price) if manual_price not in ('', None) else _sb_num(event.get('price'))
+        new_leg['underlying_at_open_source'] = event.get('price_source') or 'EDGE_REFERENCE_AT_ROLL'
         new_leg["management_event_id"] = event_id
         new_leg["rolled_from_leg_id"] = old_id
         new_leg["side"] = str(side or old_snapshot["side"] or "").upper()
@@ -615,20 +658,28 @@ def _sb_record_management_adjustment(
             new_leg["expiry"] = str(expiry).strip()
         if str(quantity).strip():
             new_leg["quantity"] = _sb_management_value(quantity)
-        old["rolled_to_leg_id"] = new_id
+        if _sb_num(new_entry_premium) is not None:
+            new_leg['entry_premium'] = float(_sb_num(new_entry_premium))
+            new_leg['entry_premium_source'] = 'USER_EDITABLE_MARKET_REFERENCE'
+        old['rolled_to_leg_id'] = new_id
         legs.append(new_leg)
-
-        event["from_leg"] = old_snapshot
+        event['roll_direction'] = roll_direction or ''
+        event['old_exit_premium'] = old.get('exit_premium')
+        event['new_entry_premium'] = new_leg.get('entry_premium')
+        event['old_quote_reference'] = old_quote or {}
+        event['new_quote_reference'] = new_quote or {}
+        event['manual_override_review'] = 'PRICE_IS_REFERENCE_NOT_BROKER_EXECUTION'
+        event['from_leg'] = old_snapshot
         # A genuine user-confirmed roll starts a new protected leg. Lock its
         # fresh L2/L3 map explicitly; never auto-slide during passive scans.
         old_locked=tmd.get("locked_protection")
-        levels=_sb_combined_level_ladder(packet,packet.get("analysis") or {})
-        new_opt=str(new_leg.get("option_type") or "").upper()
-        new_ladder=(levels.get("below") if new_opt=="PE" else levels.get("above")) or []
-        new_lock=(_sb_lock_actual_protection(new_ladder,new_opt,new_leg.get('strike'),now,
-                     _sb_authoritative_edge_context(packet).get('exec_tf'))
-                  if levels.get('level_rank_reliable') and packet.get('odme_live')
-                     and _edge_live_ok(packet) else None)
+        check_leg = dict(old_snapshot)
+        check_leg['expiry'] = new_leg.get('expiry')
+        selection_check = _sb_roll_target_check(packet, check_leg, new_leg.get('strike'), roll_direction)
+        event['roll_direction'] = selection_check.get('direction') or event.get('roll_direction') or ''
+        event['recommendation_eligibility'] = {'eligible': selection_check.get('eligible'),
+                                              'reason': selection_check.get('reason')}
+        new_lock = selection_check.get('locked_protection') if selection_check.get('eligible') else None
         if new_lock:
             tmd['locked_protection']=new_lock
             event['prior_locked_protection']=old_locked
@@ -638,6 +689,8 @@ def _sb_record_management_adjustment(
             tmd.pop("locked_protection",None)
             event["prior_locked_protection"]=old_locked
             event["new_locked_protection"]="UNAVAILABLE_REQUIRES_VERIFICATION"
+        tmd['active_option_entry_premium'] = new_leg.get('entry_premium')
+        tmd['active_option_entry_premium_source'] = new_leg.get('entry_premium_source', 'NOT_AVAILABLE')
         event["to_leg"] = {
             "leg_id": new_id,
             "side": new_leg.get("side", ""),
@@ -666,6 +719,11 @@ def _sb_record_management_adjustment(
     elif action == "CLOSE":
         old = legs[selected_leg_index]
         old["status"] = "CLOSED"
+        if _sb_num(old_exit_premium) is not None:
+            old['exit_premium'] = float(_sb_num(old_exit_premium))
+            old['exit_premium_source'] = 'USER_EDITABLE_MARKET_REFERENCE'
+            event['old_exit_premium'] = old['exit_premium']
+            event['old_quote_reference'] = old_quote or {}
         old["closed_at"] = now
         old["close_reason"] = str(note or "User-confirmed management close").strip()
         old["management_event_id"] = event_id
@@ -752,7 +810,7 @@ def _sb_render_management_confirmation(
             decision_lines.append(f"{c_action} {c_opt} at L{c_rank}.")
     recommendation = " ".join(decision_lines) if decision_lines else "No strike-ladder adjustment is recommended on this scan."
 
-    with st.expander("I did a management adjustment", expanded=False):
+    with st.container():
         st.caption(
             "Record only an adjustment you actually executed. This updates the same campaign; "
             "it does not create a new trade."
@@ -768,14 +826,12 @@ def _sb_render_management_confirmation(
         # opportunities must be confirmed as new setup-linked campaigns.
         action_labels = [
             "Roll / replace an active leg",
-            "Close an active leg",
-            "Change size of an active leg",
+            "Close an active leg (actual execution only)",
         ]
         action_label = st.selectbox("What did you do?", action_labels, key=f"sb_mgmt_action_{trade_id}")
         action_map = {
             "Roll / replace an active leg": "ROLL",
-            "Close an active leg": "CLOSE",
-            "Change size of an active leg": "RESIZE",
+            "Close an active leg (actual execution only)": "CLOSE",
         }
         action_code = action_map[action_label]
 
@@ -791,6 +847,12 @@ def _sb_render_management_confirmation(
             selected_idx = int(selected_leg["index"])
 
         base_leg = selected_leg["leg"] if selected_leg else {}
+        suggestion = next((d for d in (final_decisions or [])
+                           if str(d.get('leg_id')) == str(selected_leg.get('leg_id'))
+                           and str(d.get('action') or '').upper() in {'ROLL IN','ROLL OUT'}
+                           and d.get('target') is not None), {}) if selected_leg else {}
+        suggested_direction = str(suggestion.get('action') or '').replace('ROLL ', '')
+        suggested_target = suggestion.get('target')
         base_side = str(base_leg.get("side", "") or "SELL").upper()
         base_type = str(
             base_leg.get("option_type") or base_leg.get("option")
@@ -799,7 +861,7 @@ def _sb_render_management_confirmation(
         side_options = list(dict.fromkeys([base_side, "SELL", "BUY"]))
         type_options = list(dict.fromkeys([base_type, "CE", "PE", "FUT", "CASH", "OTHER"]))
 
-        with st.form(f"sb_mgmt_form_{trade_id}_{action_code}"):
+        with st.container():
             side = base_side
             contract_type = base_type
             strike = str(base_leg.get("strike", "") or "")
@@ -809,17 +871,14 @@ def _sb_render_management_confirmation(
                 or ""
             )
 
-            if action_code in {"ROLL", "ADD"}:
-                side = st.selectbox("Side", side_options, key=f"sb_mgmt_side_{trade_id}_{action_code}")
-                contract_type = st.selectbox(
-                    "Contract type", type_options, key=f"sb_mgmt_type_{trade_id}_{action_code}"
-                )
-                strike = st.text_input(
-                    "New strike / contract level",
-                    value=strike if action_code == "ROLL" else "",
-                    key=f"sb_mgmt_strike_{trade_id}_{action_code}",
-                    help="Required for CE/PE. Leave blank for a non-option leg if no strike applies.",
-                )
+            if action_code == "ROLL":
+                st.caption(f"Same-side {base_type} only. Suggested {suggested_direction or 'roll'}: {suggested_target if suggested_target is not None else 'none'}; all fields editable.")
+                strike_key = f"sb_mgmt_strike_{trade_id}_{action_code}"
+                suggested_identity = (str(selected_leg['leg_id']), suggested_direction, str(suggested_target))
+                if st.session_state.get(strike_key + '_suggestion') != suggested_identity:
+                    st.session_state[strike_key + '_suggestion'] = suggested_identity
+                    st.session_state[strike_key] = str(suggested_target) if suggested_target is not None else strike
+                strike = st.text_input('Replacement strike (editable)', key=strike_key)
                 expiry = st.text_input(
                     "Expiry",
                     value=expiry,
@@ -837,13 +896,44 @@ def _sb_render_management_confirmation(
                     key=f"sb_mgmt_qty_{trade_id}_{action_code}",
                 )
 
+            old_quote = _sb_entry_quote(packet, base_type, base_leg.get('strike'), base_leg.get('expiry')) if action_code in {'ROLL','CLOSE'} else {}
+            new_quote = _sb_entry_quote(packet, base_type, strike, expiry) if action_code == 'ROLL' else {}
+            old_exit = ''
+            new_entry = ''
+            if action_code in {'ROLL', 'CLOSE'}:
+                st.caption('Old leg close and replacement entry quotes are indicative ODME prices, not broker fills.')
+                old_key = f'sb_mgmt_exit_premium_{trade_id}_{action_code}'
+                old_identity = (str(selected_leg['leg_id']),str(base_leg.get('expiry')),
+                                str(old_quote.get('ask') or old_quote.get('premium') or ''))
+                if st.session_state.get(old_key + '_quote_identity') != old_identity:
+                    st.session_state[old_key + '_quote_identity'] = old_identity
+                    st.session_state[old_key] = str(old_quote.get('ask') or old_quote.get('premium') or '')
+                old_exit = st.text_input('Old leg closing premium (editable)', key=old_key)
+            if action_code == 'ROLL':
+                new_key = f'sb_mgmt_entry_premium_{trade_id}_{action_code}'
+                new_identity = (str(strike), str(expiry), str(new_quote.get('bid') or new_quote.get('premium') or ''))
+                if st.session_state.get(new_key + '_quote_identity') != new_identity:
+                    st.session_state[new_key + '_quote_identity'] = new_identity
+                    st.session_state[new_key] = str(new_quote.get('bid') or new_quote.get('premium') or '')
+                new_entry = st.text_input('Replacement entry premium (editable)', key=new_key)
+                edited_leg = dict(base_leg)
+                edited_leg['expiry'] = expiry
+                selection = _sb_roll_target_check(packet, edited_leg, strike)
+                if not selection.get('eligible'):
+                    st.warning('Not rule-eligible: ' + str(selection.get('reason')) +
+                               ' Recording an ACTUALLY EXECUTED override is permitted for audit, not approved as a proposed trade.')
+                else:
+                    st.caption('Replacement passes live ODME safer-boundary and structure checks. Verify trade costs and fill before execution.')
+            ref = _sb_reference_price(packet)
+            actual_underlying = st.text_input('Underlying price at adjustment (editable)',
+                value=str(ref.get('price') or ''), key=f'sb_mgmt_underlying_{trade_id}_{action_code}')
             note = st.text_input(
                 "Adjustment note (optional)",
                 value="",
                 key=f"sb_mgmt_note_{trade_id}_{action_code}",
             )
 
-            submitted = st.form_submit_button(
+            submitted = st.button(
                 "I did this adjustment — update campaign",
                 type="primary",
                 use_container_width=True,
@@ -866,6 +956,13 @@ def _sb_render_management_confirmation(
                     expiry=expiry,
                     quantity=quantity,
                     note=note,
+                    old_exit_premium=old_exit,
+                    new_entry_premium=new_entry,
+                    old_quote=old_quote,
+                    new_quote=new_quote,
+                    roll_direction=suggested_direction if suggestion and
+                        str(strike).strip() == str(suggested_target) else '',
+                    manual_price=actual_underlying,
                 )
 
                 # Refresh the visible packet immediately so the terminal shows the
@@ -2957,9 +3054,110 @@ def _sb_entry_quote(packet: Dict[str, Any], contract_type: str, strike: Any, exp
     quote = _sb_num(matched.iloc[0][col])
     if quote is None or quote <= 0:
         return {}
-    return {'premium': float(quote), 'source': 'FRESH_ODME_OPTION_QUOTE',
-            'quote_recorded_at': datetime.now(timezone.utc).isoformat(),
-            'contract_type': contract_type, 'strike': float(target), 'expiry': requested}
+    out = {'premium': float(quote), 'source': 'FRESH_ODME_OPTION_QUOTE',
+           'quote_recorded_at': datetime.now(timezone.utc).isoformat(),
+           'contract_type': contract_type, 'strike': float(target), 'expiry': requested}
+    # Preserve executable bid/ask only if the scan actually supplies them.
+    row = matched.iloc[0]
+    for side in ('bid', 'ask'):
+        value = next((_sb_num(row[col]) for col in
+            (f'{contract_type.lower()}_{side}', f'{contract_type.lower()}_{side}_price',
+             f'{contract_type.lower()}_best_{side}')
+            if col in matched.columns and _sb_num(row[col]) is not None), None)
+        if value is not None and value > 0:
+            out[side] = float(value)
+    if out.get('bid') is not None and out.get('ask') is not None and out['ask'] < out['bid']:
+        out.pop('bid', None); out.pop('ask', None)
+    return out
+
+
+def _sb_reference_price(packet: Dict[str, Any]) -> Dict[str, Any]:
+    """Automatic underlying reference from authoritative EDGE, not a fabricated broker fill."""
+    ctx = _sb_authoritative_edge_context(packet)
+    row = ctx.get('row') or {}
+    spot = _sb_num(row.get('close'))
+    return {'price': spot, 'source': 'LIVE_EDGE_CLOSE' if _edge_live_ok(packet) else 'LAST_EDGE_REFERENCE',
+            'bar_time': row.get('bar_time'), 'live': _edge_live_ok(packet)}
+
+
+def _sb_roll_target_check(packet: Dict[str, Any], leg: Dict[str, Any], target: Any,
+                          roll_direction: str = '') -> Dict[str, Any]:
+    """Validate same-side listed roll and independent ODME safer boundary.
+
+    Do not turn a manual historical execution into an approved recommendation.
+    """
+    opt = str(leg.get('option_type') or '').upper()
+    old = _sb_num(leg.get('strike'))
+    new = _sb_num(target)
+    expiry = str(leg.get('expiry') or '').strip().upper().replace(' ', '')
+    selected_expiry = str((packet.get('mapping') or {}).get('selected_expiry') or '').strip().upper().replace(' ', '')
+    if opt not in {'CE','PE'} or old is None or new is None:
+        return {'eligible': False, 'reason': 'Missing option side or strike.'}
+    if not _edge_live_ok(packet) or not packet.get('odme_live') or not selected_expiry or expiry != selected_expiry:
+        return {'eligible': False, 'reason': 'Current EDGE/ODME or identical live expiry is unavailable.'}
+    if new not in _sb_live_option_strikes(packet):
+        return {'eligible': False, 'reason': 'Selected replacement strike is not on the current listed chain.'}
+    if new == old:
+        return {'eligible': False, 'reason': 'Replacement strike equals existing strike.'}
+    observed = 'OUT' if (new < old if opt == 'PE' else new > old) else 'IN'
+    if roll_direction and observed != roll_direction.upper():
+        return {'eligible': False, 'reason': f'Edited strike describes ROLL {observed}, not the proposed ROLL {roll_direction}.'}
+    odme = _sb_odme_data(packet)
+    safer = _sb_num(_sb_first(odme, 'safer_sell_pe', 'safe_pe') if opt == 'PE'
+                    else _sb_first(odme, 'safer_sell_ce', 'safe_ce'))
+    if safer is None or (new > safer if opt == 'PE' else new < safer):
+        return {'eligible': False, 'reason': 'Edited strike is closer to spot than the ODME safer-strike boundary.'}
+    lock = _sb_auto_entry_protection(packet, opt, new, datetime.now(timezone.utc).isoformat(), expiry)
+    if not lock:
+        return {'eligible': False, 'reason': 'No fresh verified structural protection can be locked for replacement.'}
+    if not _sb_entry_quote(packet, opt, new, expiry):
+        return {'eligible': False, 'reason': 'Replacement contract has no exact current ODME premium.'}
+    return {'eligible': True, 'direction': observed, 'reason': 'Listed same-side contract, ODME safer boundary and new structural protection verified.',
+            'locked_protection': lock}
+
+
+def _sb_roll_in_opportunity(packet: Dict[str, Any], leg: Dict[str, Any], trade: Dict[str, Any],
+                            of: str, locked: Dict[str, Any]) -> Dict[str, Any]:
+    """Optional inward roll only after favorable progress and quoted incremental credit.
+
+    Bid/ask net credit is gross of fees; without fees it is an opportunity to
+    evaluate, not an unconditional executable recommendation.
+    """
+    opt = str(leg.get('option_type') or '').upper()
+    old = _sb_num(leg.get('strike'))
+    # After ROLL OUT the replacement leg's own opening spot is the recovery baseline.
+    entry = _sb_num(leg.get('underlying_at_open'))
+    if entry is None:
+        entry = _sb_num(trade.get('entry_reference'))
+    spot = _sb_reference_price(packet).get('price')
+    if opt not in {'CE','PE'} or old is None or spot is None or entry is None:
+        return {}
+    if _edge_direction(of) != _edge_option_direction(opt):
+        return {}
+    if not (spot > entry if opt == 'PE' else spot < entry):
+        return {}
+    expiry = str(leg.get('expiry') or '').strip()
+    old_quote = _sb_entry_quote(packet, opt, old, expiry)
+    if not old_quote or not old_quote.get('ask'):
+        return {}
+    candidates = sorted(_sb_live_option_strikes(packet), reverse=(opt == 'CE'))
+    for strike in candidates:
+        if not (strike > old if opt == 'PE' else strike < old):
+            continue
+        check = _sb_roll_target_check(packet, leg, strike, 'IN')
+        if not check.get('eligible'):
+            continue
+        new_quote = _sb_entry_quote(packet, opt, strike, expiry)
+        new_bid = _sb_num(new_quote.get('bid'))
+        old_ask = _sb_num(old_quote.get('ask'))
+        if new_bid is None or old_ask is None or new_bid <= old_ask:
+            continue
+        return {'action': 'ROLL IN', 'target': strike, 'reason':
+            'Favorable underlying progress, supportive EDGE OF, verified closer ODME-safe strike and positive quoted bid/ask credit. '
+            'Check transaction costs and actual fills before executing; this is not guaranteed net profit.',
+            'quoted_gross_credit': round(new_bid - old_ask, 8),
+            'requires_cost_verification': True, 'target_check': check}
+    return {}
 
 
 def _sb_auto_entry_protection(packet: Dict[str, Any], contract_type: str,
@@ -2968,6 +3166,14 @@ def _sb_auto_entry_protection(packet: Dict[str, Any], contract_type: str,
     if not selected or selected != str(expiry or '').strip().upper().replace(' ', ''):
         return None
     if contract_type not in {'CE', 'PE'} or not _edge_live_ok(packet) or not packet.get('odme_live'):
+        return None
+    value = _sb_num(str(strike).replace(',', ''))
+    odme = _sb_odme_data(packet)
+    safer = _sb_num(_sb_first(odme,'safer_sell_pe','safe_pe') if contract_type == 'PE'
+                    else _sb_first(odme,'safer_sell_ce','safe_ce'))
+    if value is None or safer is None or value not in _sb_live_option_strikes(packet):
+        return None
+    if (value > safer if contract_type == 'PE' else value < safer):
         return None
     lm = _sb_combined_level_ladder(packet, packet.get('analysis') or {})
     if not lm.get('level_rank_reliable'):
@@ -3003,8 +3209,8 @@ def _sb_record_user_confirmed_trade(
         raise ValueError('Enter the actual executed option expiry.')
     if invalidation not in ('', None) and _sb_num(str(invalidation).replace(',','')) is None:
         raise ValueError('The optional underlying-price invalidation must be numeric.')
-    if entry_price not in ('', None) and _sb_num(str(entry_price).replace(',','')) is None:
-        raise ValueError('The optional underlying price at entry must be numeric.')
+    if entry_price not in ('', None) and (_sb_num(str(entry_price).replace(',','')) is None or _sb_num(str(entry_price).replace(',','')) <= 0):
+        raise ValueError('The underlying price at entry must be positive or left blank.')
     if option_premium not in ('', None):
         pv = _sb_num(str(option_premium).replace(',', ''))
         if pv is None or pv <= 0:
@@ -3027,13 +3233,18 @@ def _sb_record_user_confirmed_trade(
         'origin_setup_direction':direction,
         'manual_entry_note':str(thesis or '').strip(),
         'manual_entry_price_source':('EDGE_REFERENCE_AT_RECORDING' if entry_price not in ('',None) else 'NOT_AVAILABLE'),
+        'manual_entry_price_is_editable':True,
         'management_family':'PRIMARY_CAMPAIGN_MANAGEMENT',
         'management_revision':0,'current_exposure_source':'USER_CONFIRMED_ANYTIME',
         'recorded_at':now,
+        'rulebook_version_at_recording':RULEBOOK_VERSION,
     }
     quote = premium_quote or {}
     quoted = _sb_num(quote.get('premium'))
     entered = _sb_num(option_premium)
+    if contract_type == 'CASH' and entry_price not in ('', None):
+        leg['entry_price'] = _sb_num(entry_price)
+        leg['entry_price_source'] = 'USER_EDITABLE_MARKET_REFERENCE'
     if contract_type in {'CE','PE'} and entered is not None:
         tmd['option_entry_premium'] = float(entered)
         tmd['option_entry_premium_source'] = ('ODME_QUOTE_AT_RECORDING' if
@@ -3050,7 +3261,7 @@ def _sb_record_user_confirmed_trade(
         tmd['protection_state'] = 'AUTO_LOCKED_AT_RECORDING'
     else:
         tmd['protection_state'] = 'UNVERIFIED_REVIEW_REQUIRED'
-    market_state = {'price':_sb_num(row.get('close')),'macro':row.get('macro'),
+    market_state = {'price':_sb_num(row.get('close')),'recorded_underlying_price':_sb_num(entry_price),'macro':row.get('macro'),
                     'exec_of':row.get('exec_of'),
                     'snapshot_at_recording':True,
                     'underlying_price_source':('EDGE_AT_RECORDING' if _edge_live_ok(packet) and
@@ -3083,39 +3294,83 @@ def _sb_render_anytime_entry(store: Any, instrument: str, packet: Dict[str,Any])
             st.rerun()
         return
     st.caption('Already executed a trade? Record it regardless of the current EDGE entry verdict. Recording is not an endorsement of the entry.')
-    default_type = 'CE' if (packet.get('mapping') or {}).get('odme_scan_enabled') else 'CASH'
-    side = st.selectbox('Executed side',['SELL','BUY'],key=f'anytime_side_{instrument}')
-    typelist = list(dict.fromkeys([default_type,'CE','PE','FUT','CASH','OTHER']))
+    option_enabled = bool((packet.get('mapping') or {}).get('odme_scan_enabled'))
+    default_type = 'CE' if option_enabled else 'CASH'
+    recommended = {}
+    if option_enabled and _edge_live_ok(packet) and packet.get('odme_live'):
+        pending = [r for r in _sb_pending_setups(store, instrument)
+                   if str(r.get('status') or '').upper() == 'PENDING_ENTRY']
+        if pending:
+            aurora = st.selectbox('Renko AURORA at entry (manual)',
+                ['CHECK','BULLISH','NEUTRAL','BEARISH'],
+                key=f'anytime_manual_renko_{instrument}',
+                help='Manual Renko AURORA input; candle AURORA and liquidity remain optional context.')
+            for setup in pending:
+                matrix = _edge_entry_matrix_for(setup, packet)
+                choice = (matrix.get('choices') or {}).get(aurora)
+                if choice and choice.get('status') == 'ENTRY READY' and choice.get('strike') is not None:
+                    recommended = {'option_type': matrix.get('option_type'),
+                                   'strike': choice.get('strike'), 'rank': choice.get('rank'),
+                                   'record_id': setup.get('record_id'), 'aurora': aurora}
+                    break
+            if recommended:
+                st.success(f"Suggested SELL {recommended['strike']:g} {recommended['option_type']} · L{recommended['rank']} — fields below remain editable.")
+            elif aurora != 'CHECK':
+                st.caption('No verified entry-ready strike for this Renko AURORA condition; manual historical recording remains possible.')
+    type_key = f'anytime_type_{instrument}'
+    rec_type_key = type_key + '_recommendation'
+    rec_type_id = (recommended.get('record_id'), recommended.get('aurora'), recommended.get('option_type'))
+    if recommended and st.session_state.get(rec_type_key) != rec_type_id:
+        # Do not clobber a manually changed contract type on reruns.
+        if type_key not in st.session_state or st.session_state.get(type_key) == default_type or st.session_state.get(type_key) == st.session_state.get(rec_type_key + '_type'):
+            st.session_state[type_key] = recommended['option_type']
+        st.session_state[rec_type_key] = rec_type_id
+        st.session_state[rec_type_key + '_type'] = recommended['option_type']
+    typelist = list(dict.fromkeys([recommended.get('option_type') or default_type,'CE','PE','FUT','CASH','OTHER']))
     opt = st.selectbox('Executed contract type',typelist,key=f'anytime_type_{instrument}')
-    strike = st.text_input('Actual option strike (required for CE/PE)',key=f'anytime_strike_{instrument}')
-    expiry = st.text_input('Expiry',value=str((packet.get('mapping') or {}).get('selected_expiry') or ''),key=f'anytime_expiry_{instrument}')
-    quantity = st.text_input('Lots / quantity',key=f'anytime_qty_{instrument}')
+    side_choices = ['BUY','SELL'] if opt == 'CASH' else ['SELL','BUY']
+    side = st.selectbox('Executed side', side_choices, key=f'anytime_side_{instrument}')
+    is_option = opt in {'CE', 'PE'}
+    if is_option:
+        strike_key = f'anytime_strike_{instrument}'
+        suggestion_id = (recommended.get('record_id'), recommended.get('aurora'),
+                         recommended.get('option_type'), recommended.get('strike'))
+        if recommended and opt == recommended.get('option_type') and st.session_state.get(strike_key+'_suggestion') != suggestion_id:
+            st.session_state[strike_key+'_suggestion'] = suggestion_id
+            st.session_state[strike_key] = str(recommended['strike'])
+        strike = st.text_input('Actual option strike (required for CE/PE)',key=strike_key)
+
+        expiry = st.text_input('Expiry',value=str((packet.get('mapping') or {}).get('selected_expiry') or ''),key=f'anytime_expiry_{instrument}')
+        quantity = st.text_input('Lots / quantity',key=f'anytime_qty_{instrument}')
+    else:
+        strike, expiry = '', ''
+        quantity = st.text_input('Number of shares' if opt == 'CASH' else 'Contracts / quantity', key=f'anytime_qty_{instrument}')
     thesis = st.text_input('Trade thesis (editable)',value=str((packet.get('analysis') or {}).get('bias_reason') or ''),
                            key=f'anytime_thesis_{instrument}',placeholder='Why you took this trade')
-    ctx = _sb_authoritative_edge_context(packet)
-    underlying = _sb_num((ctx.get('row') or {}).get('close'))
-    price_source = 'current EDGE reference' if _edge_live_ok(packet) else 'last EDGE reference — market may be closed'
-    if underlying is not None:
-        st.caption(f'Underlying reference: {_sb_fmt_level(underlying)} ({price_source}). Saved automatically; not claimed as your historical fill.')
-    quote = _sb_entry_quote(packet, opt, strike, expiry) if opt in {'CE','PE'} else {}
+    ref = _sb_reference_price(packet)
+    # Always expose the prefilled reference as an editable field. Never claim a fill.
+    ref_key = f'anytime_underlying_price_{instrument}'
+    current_ref_identity = (ref.get('bar_time'), ref.get('source'))
+    if st.session_state.get(f'{ref_key}_identity') != current_ref_identity:
+        st.session_state[f'{ref_key}_identity'] = current_ref_identity
+        st.session_state[ref_key] = str(ref['price']) if ref['price'] is not None else ''
+    recorded_price = st.text_input('Cash purchase price (editable)' if opt == 'CASH' else
+                                   'Underlying price at recording (editable)', key=ref_key)
+    st.caption(f"Auto-filled from {ref['source'].replace('_', ' ').lower()}. Reference quote, not verified broker execution. Edit to record actual fill if known.")
+    quote = _sb_entry_quote(packet, opt, strike, expiry) if is_option else {}
     quote_key = f'anytime_premium_key_{instrument}'
-    quote_identity = (opt, str(strike), str(expiry))
-    # Refresh the quoted default on contract change, but retain user edits during reruns.
-    prev_contract = st.session_state.get(quote_key)
-    if prev_contract != quote_identity:
+    # Contract identity controls auto-prefill; reruns do not reset a manual edit.
+    quote_identity = (opt, str(strike), str(expiry), quote.get('premium'))
+    if st.session_state.get(quote_key) != quote_identity:
         st.session_state[quote_key] = quote_identity
-        st.session_state[f'anytime_premium_{instrument}'] = (str(quote.get('premium')) if quote else '')
+        st.session_state[f'anytime_premium_{instrument}'] = str(quote.get('premium')) if quote else ''
     premium = ''
-    if opt in {'CE','PE'}:
-        premium = st.text_input('Option premium at entry (editable)', key=f'anytime_premium_{instrument}',
-                                help='Prefilled with the latest matching ODME quote if available. Confirm/edit your actual execution premium.')
-        if quote:
-            st.caption('Prefilled from current ODME option LTP; it is not verified broker execution price.')
-        else:
-            st.caption('No matching fresh option quote. Enter premium if known, otherwise leave blank (P&L will be unavailable).')
+    if is_option:
+        premium = st.text_input('Option premium at entry (editable)',key=f'anytime_premium_{instrument}',
+                                help='Fresh exact-matched ODME LTP is indicative. Change it to actual fill if known.')
+        st.caption('Fresh exact ODME premium prefilled.' if quote else 'No fresh matching premium. Leave blank if actual price is unknown.')
     invalidation = st.text_input('Your underlying-price invalidation (optional)',key=f'anytime_invalidation_{instrument}',
                                  help='Only if you have an actual price level that invalidates your thesis; not an option premium.')
-    is_option = opt in {'CE','PE'}
     missing = (is_option and (_sb_num(str(strike).replace(',','')) is None or not str(expiry or '').strip())) or (_sb_num(str(quantity or '').replace(',','')) is None or (_sb_num(str(quantity or '').replace(',','')) or 0)<=0)
     if missing: st.caption('Enter actual quantity, and option strike/expiry where applicable, to record the exposure.')
     if st.button('I executed this trade — record campaign',type='primary',use_container_width=True,
@@ -3124,7 +3379,7 @@ def _sb_render_anytime_entry(store: Any, instrument: str, packet: Dict[str,Any])
             if type(store).__name__=='LocalStore':
                 raise RuntimeError('Cannot persist this campaign: the app is using LocalStore, not Google Sheet storage.')
             trade = _sb_record_user_confirmed_trade(store,packet,side,opt,strike,expiry,quantity,thesis,
-                underlying if underlying is not None else '',invalidation,premium,quote)
+                recorded_price,invalidation,premium,quote)
             tid = str(trade.get('trade_id') or '').strip()
             if not tid:raise RuntimeError('The store did not return a trade ID.')
             saved = store.list_superbrain_trades(instrument=instrument,open_only=False)
@@ -3513,11 +3768,20 @@ def _edge_entry_matrix_for(row: Dict[str, Any], packet: Dict[str, Any]) -> Dict[
     ladder = lm.get("below") if opt == "PE" else lm.get("above")
     odme = _sb_odme_data(packet)
     safer = _sb_num(_sb_first(odme, "safer_sell_pe", "safe_pe") if opt == "PE" else _sb_first(odme, "safer_sell_ce", "safe_ce"))
+    # The applicable ODME safer strike is a non-negotiable boundary, even
+    # when the EDGE structural ladder offers a nearer listed option.
+    def listed_safer_selector(ot, boundary):
+        if safer is None:
+            return None
+        vals = reversed(_sb_live_option_strikes(packet)) if ot == 'PE' else _sb_live_option_strikes(packet)
+        return next((v for v in vals if
+                (v < boundary-1e-9 and v <= safer+1e-9 if ot == 'PE'
+                 else v > boundary+1e-9 and v >= safer-1e-9)), None)
     result = _edge_entry_matrix(
-        opt, ctx.get("row",{}).get("exec_of"), _sb_odme_assessment(packet),
-        ladder or [], bool(packet.get("odme_live")),bool(lm.get("level_rank_reliable")),
-        lambda ot,bound:next((v for v in (reversed(_sb_live_option_strikes(packet)) if ot=='PE' else _sb_live_option_strikes(packet))
-              if (v<bound-1e-9 if ot=='PE' else v>bound+1e-9)),None), safer
+        opt, ctx.get('row',{}).get('exec_of'), _sb_odme_assessment(packet),
+        ladder or [], bool(packet.get('odme_live') and safer is not None),
+        bool(lm.get('level_rank_reliable')),
+        listed_safer_selector, None
     )
     result["level_map"] = lm
     return result
@@ -3557,6 +3821,21 @@ def _edge_locked_breaks(packet:Dict[str,Any],locked:Dict[str,Any],opt:str) -> Di
     ctx=_sb_authoritative_edge_context(packet)
     now=ctx.get("row") or {}
     previous=_edge_previous_confirmed_row(packet)
+    tape = packet.get('_confirmed_edge_tape') or []
+    # Use only actual recorded EDGE tape bars. No interpolation, session-gap
+    # assumption or TF handoff can confirm a protection breach.
+    now_ms = _sb_num(now.get('bar_time'))
+    now_tf = _sb_tf_key(now.get('tf'))
+    if now_ms is not None and now_tf:
+        observed = {}
+        for candle in tape:
+            t = _sb_num(candle.get('bar_ms'))
+            if t is not None and t < now_ms and _sb_tf_key(candle.get('tf')) == now_tf and _sb_num(candle.get('close')) is not None:
+                observed[t] = candle
+        if observed:
+            closest = observed[max(observed)]
+            previous = {'close':closest.get('close'),'tf':closest.get('tf'),
+                        'bar_time':closest.get('bar_ms')}
     current_px=_sb_num(now.get("close"))
     prior_px=_sb_num(previous.get("close"))
     same_tf=bool(_sb_tf_key(now.get("tf")) == _sb_tf_key(previous.get("tf")))
@@ -3643,6 +3922,20 @@ def _edge_manage_trade(packet:Dict[str,Any], trade:Dict[str,Any]) -> List[Dict[s
                 broken_l1=bool(broken.get('l1')))
             if action['action']=='HOLD':
                 action['reason']+=" ROLL IN is optional only when a fresh scan verifies sufficient premium benefit and maintained protection."
+        if action.get('action') == 'ROLL OUT' and action.get('target') is not None:
+            check = _sb_roll_target_check(packet, leg, action['target'], 'OUT')
+            if not check.get('eligible'):
+                action = {'action': 'EXIT REVIEW', 'reason':
+                          'Outward target NOT verified: ' + str(check.get('reason')) +
+                          ' Existing risk trigger still requires urgent review.',
+                          'required_rank': risk_rank}
+            else:
+                action['target_check'] = check
+        # Only explore inward rolls after the higher-priority risk branch clears.
+        if action.get('action') == 'HOLD' and not crossed and not odme_adverse:
+            candidate = _sb_roll_in_opportunity(packet, leg, trade, of, locked)
+            if candidate:
+                action = candidate
         action.update({"option_type":opt,"strike":strike,"leg_id":item['leg_id'],
             "locked_l2":(locked.get("l2") or {}).get("boundary"),
             "locked_l3":(locked.get("l3") or {}).get("boundary"),
@@ -3918,6 +4211,11 @@ def render_public_superbrain() -> None:
     except Exception as exc:
         st.error(f"Market data connection unavailable: {exc}")
         return
+    rule_gate = _sb_rulebook_gate(store)
+    if not rule_gate.get('ok'):
+        st.error('SuperBrain rules are unavailable or stale. New entries and automatic management are PAUSED until the current locked rulebook is verified. ' +
+                 str(rule_gate.get('reason') or f"Sheet version {rule_gate.get('version')}, status {rule_gate.get('state')}; app needs {RULEBOOK_VERSION}."))
+        return
     if instruments is None or instruments.empty:
         st.info("No active EDGE instruments in TV_TEST_CURRENT.")
         return
@@ -3959,36 +4257,11 @@ def render_public_superbrain() -> None:
     pending=_sb_pending_setups(store,instrument) if healthy else []
     if not healthy:
         st.info('**New entry: WAIT** — live session data required. Previous setups remain stored; no entry is authorised from the last-session scan.')
-    if pending:
-        st.markdown("### New entry")
-        active_setup_ids={str(_sb_json(t.get('metadata_json','')).get('parent_setup_id') or '') for t in active}
-        for setup in pending:
-            if str(setup.get('record_id') or '') in active_setup_ids:continue
-            if str(setup.get('status') or '').upper()!='PENDING_ENTRY':continue
-            md=_sb_setup_md(setup)
-            matrix=_edge_entry_matrix_for(setup,packet)
-            ready=_sb_compact_manual_choices(matrix)
-            opt=matrix.get('option_type') or _edge_option_for_setup(setup)
-            if ready:
-                st.success(f"**SELL {opt} — ENTRY READY** · Check Renko AURORA:")
-                for choice in ready:
-                    st.write(f"**{' / '.join(choice['auroras'])} → SELL {_sb_fmt_level(choice['strike'])} {opt} · L{choice['rank']}**")
-            else:
-                # Avoid repeating the missing rank in warnings (including L3).
-                status=str(matrix.get('status') or 'WAIT').upper()
-                if status=='AVOID':st.error("**AVOID** — Adverse ODME expansion risk.")
-                else:
-                    if "break is still pending" in str(matrix.get('reason') or '').lower():
-                        st.warning("**WAIT — FP break not confirmed.** The Demand/Supply breach is still being tested; no new opposite-side entry yet.")
-                        continue
-                    current_fp=_sb_short_fp_context(ctx)
-                    if current_fp=='Awaiting next FP event':
-                        st.warning("**WAIT** — No current EDGE defence/break confirmation or qualified protected strike.")
-                    else:
-                        st.warning("**WAIT** — FP event is developing, but a sufficiently protected entry is not established.")
-    elif not active:
-        st.info("**WAIT** — No new EDGE FP entry setup.")
     if active:
+        try:
+            packet['_confirmed_edge_tape'] = read_edge_tape(store, instrument, max_rows=350)
+        except Exception:
+            packet['_confirmed_edge_tape'] = []
         st.markdown("### Active campaigns")
         for trade in active:
             setup=_sb_setup_for_trade(store,trade)
@@ -4030,11 +4303,41 @@ def render_public_superbrain() -> None:
                 msg=f"**{readout['action']}** — {d.get('option_type')} {_sb_fmt_level(d.get('strike'))}"
                 if d.get('target') is not None:msg+=f" → {_sb_fmt_level(d['target'])}"
                 if readout['action'].startswith(('EXIT','ROLL OUT')):st.error(msg)
+                elif readout['action']=='ROLL IN':st.success(msg)
                 elif readout['action']=='REVIEW':st.warning(msg)
                 else:st.info(msg)
                 if readout['reason']:st.caption('Why: '+readout['reason'])
             with st.expander("Record management action",expanded=False):
                 _sb_render_management_confirmation(store,packet,trade,setup,analysis,final_decisions=decisions,companion_action=None)
+    if pending:
+        st.markdown("### New entry")
+        active_setup_ids={str(_sb_json(t.get('metadata_json','')).get('parent_setup_id') or '') for t in active}
+        for setup in pending:
+            if str(setup.get('record_id') or '') in active_setup_ids:continue
+            if str(setup.get('status') or '').upper()!='PENDING_ENTRY':continue
+            md=_sb_setup_md(setup)
+            matrix=_edge_entry_matrix_for(setup,packet)
+            ready=_sb_compact_manual_choices(matrix)
+            opt=matrix.get('option_type') or _edge_option_for_setup(setup)
+            if ready:
+                st.success(f"**SELL {opt} — ENTRY READY** · Check Renko AURORA:")
+                for choice in ready:
+                    st.write(f"**{' / '.join(choice['auroras'])} → SELL {_sb_fmt_level(choice['strike'])} {opt} · L{choice['rank']}**")
+            else:
+                # Avoid repeating the missing rank in warnings (including L3).
+                status=str(matrix.get('status') or 'WAIT').upper()
+                if status=='AVOID':st.error("**AVOID** — Adverse ODME expansion risk.")
+                else:
+                    if "break is still pending" in str(matrix.get('reason') or '').lower():
+                        st.warning("**WAIT — FP break not confirmed.** The Demand/Supply breach is still being tested; no new opposite-side entry yet.")
+                        continue
+                    current_fp=_sb_short_fp_context(ctx)
+                    if current_fp=='Awaiting next FP event':
+                        st.warning("**WAIT** — No current EDGE defence/break confirmation or qualified protected strike.")
+                    else:
+                        st.warning("**WAIT** — FP event is developing, but a sufficiently protected entry is not established.")
+    elif not active:
+        st.info("**WAIT** — No new EDGE FP entry setup.")
     with st.expander("View ODME levels and full structural map",expanded=False):
         summary=_sb_level_map_summary(lm)
         if summary:st.caption(summary)
