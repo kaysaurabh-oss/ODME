@@ -28,7 +28,7 @@ from superbrain_edge_memory import read_edge_tape, intelligent_bias
 from superbrain_market_sessions import session_status, last_session_snapshot
 from superbrain_intelligence_history import (
     read_optional_history,
-    read_odme_snapshot_history, interpret_historical_context,
+    read_odme_snapshot_history, interpret_historical_context, formulate_market_outlook,
 )
 
 RULEBOOK_VERSION = "SB_EDGE_ODME_20261022_V2"
@@ -4082,10 +4082,11 @@ def _sb_render_edge_cash_terminal(store: Any, instrument: str, packet: Dict[str,
 
 
 def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: bool) -> None:
-    """Display one read-only market bias, not a setup or trade instruction.
+    """One preferred, conditional market forecast — DISPLAY ONLY.
 
-    The bias deliberately does not enter the EDGE/ODME setup, campaign,
-    recording or Level 2 decision paths.
+    Keep the original intelligent_bias result for all legacy campaign commentary;
+    only the visible Bias panel uses the new forecast. Neither history nor
+    forecast is passed into any entry, strike, management or order decision.
     """
     rows = packet.get("tv_rows")
     if hasattr(rows, "to_dict"):
@@ -4096,46 +4097,51 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
         tv_rows = []
     odme = _sb_odme_assessment(packet) if packet.get("odme_live") else None
     edge_row = ctx.get("row") or {}
-    symbol=str(packet.get('instrument') or edge_row.get('instrument') or '')
-    market=session_status(symbol)
-    historic=(market['state']=='CLOSED' and
-             last_session_snapshot(symbol,edge_row.get('bar_time')) and
-             str(edge_row.get('edge_tracking_state') or '').upper()=='ACTIVE' and
-             _sb_tf_key(edge_row.get('tf'))==_sb_tf_key(edge_row.get('edge_required_exec_tf') or edge_row.get('exec_tf')))
-    tape = read_edge_tape(get_store(),symbol) if (healthy or historic) else []
+    symbol = str(packet.get('instrument') or edge_row.get('instrument') or '')
+    market = session_status(symbol)
+    historic = (market['state'] == 'CLOSED' and
+                last_session_snapshot(symbol, edge_row.get('bar_time')) and
+                str(edge_row.get('edge_tracking_state') or '').upper() == 'ACTIVE' and
+                _sb_tf_key(edge_row.get('tf')) == _sb_tf_key(edge_row.get('edge_required_exec_tf') or edge_row.get('exec_tf')))
+    tape = read_edge_tape(get_store(), symbol) if (healthy or historic) else []
+    # Legacy result is preserved for the rest of SuperBrain, especially existing
+    # cash campaign descriptions. The new outlook must not rewrite it.
     result = intelligent_bias(
         edge=edge_row,
         history=tape,
         tv_rows=tv_rows,
         odme=odme,
         edge_fresh=bool(healthy or historic),
-        # Interpret optional last-session snapshots relative to that session,
-        # not the time the user opens the app hours after the exchange closed.
         now_ms=_sb_num(edge_row.get('bar_time')) if historic else None,
     )
-    # Display-only intelligence reads independently recorded optional history.
-    # No writes during scans. All failures fail open and preserve all decisions.
+    outlook = None
     if (healthy or historic) and edge_row:
         try:
-            sb_store=get_store()
-            opt_history=read_optional_history(sb_store, symbol, edge_row)
-            odme_history=read_odme_snapshot_history(
+            sb_store = get_store()
+            opt_history = read_optional_history(sb_store, symbol, edge_row)
+            odme_history = read_odme_snapshot_history(
                 sb_store, symbol, edge_row,
                 enabled=bool((packet.get('mapping') or {}).get('odme_scan_enabled')),
             )
-            long_view=interpret_historical_context(edge_row, tape, opt_history, odme_history)
-            if long_view:
-                result['commentary']=(result.get('commentary') or result.get('basis') or '') + '\n\n' + long_view
+            outlook = formulate_market_outlook(
+                edge_row, tape, opt_history, odme_history, current_odme=odme
+            )
         except Exception:
-            pass  # optional intelligence must never interfere with trade logic
+            outlook = None  # Never affect existing trade decisions.
     if historic:
-        latest=_sb_tv_close_dt('EDGE',edge_row)
-        last_at=latest.astimezone(ZoneInfo('Asia/Singapore')).strftime('%d %b %H:%M SGT') if latest else 'last recorded close'
+        latest = _sb_tv_close_dt('EDGE', edge_row)
+        last_at = latest.astimezone(ZoneInfo('Asia/Singapore')).strftime('%d %b %H:%M SGT') if latest else 'last recorded close'
         st.info(f"**MARKET CLOSED — LAST RECORDED SESSION** · {last_at}. "
                 "Bias is historical; no new entry or automatic campaign action until fresh EDGE data arrives after reopening.")
-    st.markdown(f"**SuperBrain Bias: {result['label']}**")
-    if result.get('commentary') or result.get('basis'):
-        st.write(result.get('commentary') or result.get('basis'))
+    if outlook and outlook.get('label') != 'UNAVAILABLE':
+        st.markdown(f"**SuperBrain Bias: {outlook['label']}** · "
+                    f"{str(outlook.get('evidence_quality') or 'LOW').title()} evidence agreement")
+        st.markdown(str(outlook.get('commentary') or ''))
+    else:
+        # Fallback when optional history is missing, market data is stale or an
+        # independent intelligence reader fails: do not manufacture a forecast.
+        st.markdown(f"**SuperBrain Bias: {result.get('label') or 'UNAVAILABLE'}**")
+        st.write(result.get('basis') or 'Insufficient verified history for a directional forecast.')
     return result
 
 
