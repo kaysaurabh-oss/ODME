@@ -26,6 +26,10 @@ from superbrain_bridge import (
 )
 from superbrain_edge_memory import read_edge_tape, intelligent_bias
 from superbrain_market_sessions import session_status, last_session_snapshot
+from superbrain_intelligence_history import (
+    read_optional_history,
+    read_odme_snapshot_history, interpret_historical_context,
+)
 
 RULEBOOK_VERSION = "SB_EDGE_ODME_20261022_V2"
 
@@ -4109,6 +4113,21 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
         # not the time the user opens the app hours after the exchange closed.
         now_ms=_sb_num(edge_row.get('bar_time')) if historic else None,
     )
+    # Display-only intelligence reads independently recorded optional history.
+    # No writes during scans. All failures fail open and preserve all decisions.
+    if (healthy or historic) and edge_row:
+        try:
+            sb_store=get_store()
+            opt_history=read_optional_history(sb_store, symbol, edge_row)
+            odme_history=read_odme_snapshot_history(
+                sb_store, symbol, edge_row,
+                enabled=bool((packet.get('mapping') or {}).get('odme_scan_enabled')),
+            )
+            long_view=interpret_historical_context(edge_row, tape, opt_history, odme_history)
+            if long_view:
+                result['commentary']=(result.get('commentary') or result.get('basis') or '') + '\n\n' + long_view
+        except Exception:
+            pass  # optional intelligence must never interfere with trade logic
     if historic:
         latest=_sb_tv_close_dt('EDGE',edge_row)
         last_at=latest.astimezone(ZoneInfo('Asia/Singapore')).strftime('%d %b %H:%M SGT') if latest else 'last recorded close'
