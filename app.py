@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 import json
 import uuid
+import threading
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, List
 
@@ -39,9 +40,13 @@ def _sb_rulebook_gate(store: Any) -> Dict[str, Any]:
     if _edge_policy_version != RULEBOOK_VERSION:
         return {'ok': False, 'reason': 'App and EDGE policy versions differ; both Python files must be deployed together.'}
     try:
-        sheet = store.sheet.worksheet('SUPERBRAIN_RULES')
-        version = str(sheet.acell('S2').value or '').strip()
-        state = str(sheet.acell('R2').value or '').strip().upper()
+        # One API read instead of worksheet metadata + two separate acell calls.
+        # Explicitly verify both cells; missing values fail closed.
+        response = store.sheet.values_get("'SUPERBRAIN_RULES'!R2:S2")
+        values = response.get('values') or []
+        cells = values[0] if values else []
+        state = str(cells[0] if len(cells) > 0 else '').strip().upper()
+        version = str(cells[1] if len(cells) > 1 else '').strip()
         return {'ok': version == RULEBOOK_VERSION and state == 'LOCKED',
                 'version': version, 'state': state}
     except Exception as exc:
@@ -49,6 +54,21 @@ def _sb_rulebook_gate(store: Any) -> Dict[str, Any]:
 
 
 st.set_page_config(page_title="ODME Angel", layout="wide")
+
+
+@st.cache_data(ttl=12, show_spinner=False)
+def _sb_screen_instrument_map() -> pd.DataFrame:
+    """Display selector only; pressing Scan obtains fresh Sheet evidence."""
+    return build_instrument_map(get_store())
+
+
+@st.cache_data(ttl=12, show_spinner=False)
+def _sb_screen_rulebook_gate() -> Dict[str, Any]:
+    """Short-lived display cache; Scan always independently checks the live rulebook."""
+    return _sb_rulebook_gate(get_store())
+
+
+_SB_EXPIRY_CLEANUP_LOCK = threading.Lock()
 
 
 @st.cache_resource(show_spinner=False)
@@ -438,12 +458,16 @@ def _sb_superbrain_setup_df(store: Any, instrument: str = "") -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def _sb_setup_for_trade(store: Any, trade: Dict[str, Any]) -> Dict[str, Any]:
+def _sb_setup_for_trade(store: Any, trade: Dict[str, Any],
+                        packet: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     md = _sb_json((trade or {}).get("metadata_json", ""))
     rid = str(md.get("parent_setup_id") or md.get("origin_setup_record_id") or "").strip()
     if not rid:
         return {}
-    df = _sb_superbrain_setup_df(store, str(trade.get("instrument", "") or ""))
+    if packet is not None and 'setup_rows' in packet:
+        df = pd.DataFrame(packet.get('setup_rows') or [])
+    else:
+        df = _sb_superbrain_setup_df(store, str(trade.get("instrument", "") or ""))
     if df.empty or "record_id" not in df.columns:
         return {}
     hit = df[df["record_id"].astype(str).eq(rid)]
@@ -1133,8 +1157,15 @@ def _sb_campaign_option_question(trade: Dict[str, Any], setup: Dict[str, Any]) -
     return "Check current ODME positioning against the recorded campaign thesis."
 
 
-def _sb_pending_setups(store: Any, instrument: str) -> List[Dict[str, Any]]:
-    df = _sb_superbrain_setup_df(store, instrument)
+def _sb_pending_setups(store: Any, instrument: str,
+                       packet: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    if packet is not None and 'setup_rows' in packet:
+        cached = packet.get('setup_rows')
+        if cached is None:
+            return []  # Missing current setup read: never manufacture READY.
+        df = pd.DataFrame(cached)
+    else:
+        df = _sb_superbrain_setup_df(store, instrument)
     if df.empty:
         return []
     if "status" in df.columns:
@@ -3302,7 +3333,7 @@ def _sb_render_anytime_entry(store: Any, instrument: str, packet: Dict[str,Any])
     default_type = 'CE' if option_enabled else 'CASH'
     recommended = {}
     if option_enabled and _edge_live_ok(packet) and packet.get('odme_live'):
-        pending = [r for r in _sb_pending_setups(store, instrument)
+        pending = [r for r in _sb_pending_setups(store, instrument, packet)
                    if str(r.get('status') or '').upper() == 'PENDING_ENTRY']
         if pending:
             aurora = st.selectbox('Renko AURORA at entry (manual)',
@@ -3399,253 +3430,14 @@ def _sb_render_anytime_entry(store: Any, instrument: str, packet: Dict[str,Any])
 
 
 def _sb_render_trade_confirmation(store: Any, instrument: str, packet: Dict[str, Any]) -> None:
-    """Render user-confirmed campaign recording for every persisted PENDING_ENTRY."""
-    analysis = packet.get("analysis", {}) or {}
-    plan = analysis.get("trade_plan", {}) or {}
+    """Single recording path; dead legacy form removed (no redundant Sheet reads)."""
+    _sb_render_anytime_entry(store, instrument, packet)
 
-    # Include persisted active trades as well as the current packet so a stale
-    # browser session cannot offer an already-entered setup twice.
-    linked_setup_ids = set()
-    all_open = list(packet.get("open_trades") or [])
-    try:
-        persisted = store.list_superbrain_trades(instrument=instrument, open_only=True)
-        if persisted is not None and not persisted.empty:
-            all_open.extend(persisted.to_dict("records"))
-    except Exception:
-        pass
-    for trade in all_open:
-        tmd = _sb_json((trade or {}).get("metadata_json", ""))
-        for key in ("parent_setup_id", "origin_setup_record_id", "setup_record_id"):
-            rid = str(tmd.get(key) or "").strip()
-            if rid:
-                linked_setup_ids.add(rid)
-
-    pending_rows = [
-        row for row in _sb_pending_setups(store, instrument)
-        if str(row.get("status", "") or "").upper() == "PENDING_ENTRY"
-        and str(row.get("record_id", "") or "").strip()
-        and str(row.get("record_id", "") or "").strip() not in linked_setup_ids
-    ]
-    _sb_render_anytime_entry(store,instrument,packet)
-    return  # Single recording path: no duplicate setup form / Renko confirmation.
-
-    st.divider()
-    st.caption('Alternatively, attach an executed trade to a previously saved EDGE setup:')
-    plan_setup_id = ""
-    if str(plan.get("kind", "") or "").upper() == "NEW":
-        for key in ("setup_record_id", "record_id", "parent_setup_id", "origin_setup_record_id"):
-            candidate = str(plan.get(key) or "").strip()
-            if candidate:
-                plan_setup_id = candidate
-                break
-
-    choices = []
-    for row in pending_rows:
-        rid = str(row.get("record_id", "") or "").strip()
-        md = _sb_setup_md(row)
-        evaluation = _sb_evaluate_pending_setup(row, packet)
-        readiness = str(evaluation.get("status", "PENDING") or "PENDING").upper()
-        setup_name = str(md.get("setup_name") or row.get("strategy_type") or "Setup").strip()
-        direction = str(md.get("direction") or row.get("direction") or "").upper().strip()
-        entry_ref = row.get("entry_reference")
-        label_bits = []
-        if rid == plan_setup_id:
-            label_bits.append("CURRENT NEW")
-        label_bits.extend([readiness, setup_name])
-        if direction:
-            label_bits.append(direction)
-        if entry_ref not in (None, ""):
-            label_bits.append(f"Entry {entry_ref}")
-        choices.append({
-            "record_id": rid,
-            "row": row,
-            "evaluation": evaluation,
-            "label": " · ".join(str(x) for x in label_bits if str(x).strip()),
-        })
-
-    choices.sort(key=lambda x: 0 if x["evaluation"].get("status") == "ENTRY READY" else 1)
-
-    st.markdown("### Record trade taken")
-    selected = choices[0]
-    if len(choices) > 1:
-        selected_label = st.selectbox(
-            "Which setup did you execute?",
-            [x["label"] for x in choices],
-            key=f"pending_setup_choice_{instrument}",
-        )
-        selected = next(x for x in choices if x["label"] == selected_label)
-    else:
-        st.caption(selected["label"])
-
-    evaluation = selected["evaluation"]
-    st.selectbox(
-        "Actual Renko AURORA bias (manual check)",
-        ["CHECK AURORA", "BULLISH", "NEUTRAL", "BEARISH"],
-        key=f"manual_aurora_{selected['record_id']}",
-        help="Only the user's manual choice is used; SuperBrain does not read an AURORA TV feed."
-    )
-    new_decision = _sb_new_campaign_decision(selected["row"], packet) if str(evaluation.get("status", "")).upper() == "ENTRY READY" else {}
-    if str(evaluation.get("status", "")).upper() == "ENTRY READY":
-        if new_decision.get("status") == "ENTRY READY":
-            _nd_opt = new_decision.get("option_type")
-            _nd_rank = new_decision.get("required_rank")
-            _nd_strike = new_decision.get("strike")
-            if _nd_strike is not None:
-                st.success(f"Selected setup is ENTRY READY — recommended SELL {_sb_fmt_level(_nd_strike)} {_nd_opt} at L{_nd_rank} protection.")
-            else:
-                st.warning("No qualifying protected strike is available for that selection.")
-        else:
-            st.warning("Check AURORA: no qualifying protected strike for that selection.")
-    else:
-        st.warning(
-            "Selected setup is still WAIT in SuperBrain. If you took it anyway, record the exact exposure you actually executed."
-        )
-        reason = str(evaluation.get("reason", "") or "").strip()
-        if reason:
-            st.caption(reason)
-
-    defaults = _sb_infer_entry_contract(selected["row"])
-    plan_leg = _sb_first_plan_leg(plan) if (
-        str(plan.get("kind", "") or "").upper() == "NEW"
-        and (not plan_setup_id or plan_setup_id == selected["record_id"])
-    ) else {}
-    default_side = str(("SELL" if new_decision.get("option_type") in {"CE", "PE"} else "") or plan_leg.get("side") or defaults["side"] or "SELL").upper()
-    default_type = str(
-        new_decision.get("option_type") or plan_leg.get("option_type") or plan_leg.get("option") or plan_leg.get("instrument_type")
-        or defaults["contract_type"] or "OTHER"
-    ).upper()
-    default_strike = str(new_decision.get("strike") if new_decision.get("strike") is not None else (plan_leg.get("strike", "") or ""))
-    default_expiry = str(
-        plan_leg.get("expiry")
-        or (packet.get("mapping") or {}).get("selected_expiry")
-        or _sb_first(_sb_odme_data(packet), "expiry")
-        or ""
-    )
-    default_qty = str(
-        plan_leg.get("quantity", plan_leg.get("qty", plan_leg.get("lots", plan_leg.get("size", ""))))
-        or ""
-    )
-
-    side_options = list(dict.fromkeys([default_side, "SELL", "BUY"]))
-    type_options = list(dict.fromkeys([default_type, "CE", "PE", "FUT", "CASH", "OTHER"]))
-
-    # Use normal widgets + button rather than a Streamlit form here. On mobile,
-    # a failed form submit could leave the error below the fold and look like the
-    # button did nothing. Normal widgets keep their keyed values and make the
-    # record action explicit on every rerun.
-    st.caption("Record the position actually executed. This becomes the campaign exposure SuperBrain manages.")
-    backend_name = type(store).__name__
-    st.caption(f"Storage backend: {backend_name}")
-    side = st.selectbox("Side", side_options, key=f"entry_side_{instrument}_{selected['record_id']}")
-    contract_type = st.selectbox(
-        "Contract type", type_options, key=f"entry_type_{instrument}_{selected['record_id']}"
-    )
-    strike = st.text_input(
-        "Executed strike / contract level",
-        value=default_strike,
-        key=f"entry_strike_{instrument}_{selected['record_id']}",
-        help="Required for CE/PE. For FUT/CASH/OTHER, enter a level only if useful.",
-    )
-    expiry = st.text_input(
-        "Expiry",
-        value=default_expiry,
-        key=f"entry_expiry_{instrument}_{selected['record_id']}",
-    )
-    quantity = st.text_input(
-        "Size / quantity / lots (optional)",
-        value=default_qty,
-        key=f"entry_qty_{instrument}_{selected['record_id']}",
-    )
-    note = st.text_input(
-        "Entry note (optional)",
-        value="",
-        key=f"entry_note_{instrument}_{selected['record_id']}",
-    )
-
-    ctype_now = str(contract_type or "").upper().strip()
-    strike_missing = ctype_now in {"CE", "PE"} and not str(strike or "").strip()
-    if strike_missing:
-        st.warning("Executed option strike is required before this campaign can be recorded.")
-
-    submitted = st.button(
-        "I have taken this trade — record campaign",
-        type="primary",
-        use_container_width=True,
-        disabled=strike_missing,
-        key=f"record_taken_trade_btn_{instrument}_{selected['record_id']}",
-    )
-
-    if submitted:
-        try:
-            if backend_name == "LocalStore":
-                raise RuntimeError(
-                    "SuperBrain is running on LocalStore, not the Google Sheet store. "
-                    "The campaign was not recorded because it would not be durable in superbrain_memory."
-                )
-
-            trade = _sb_record_selected_pending_entry(
-                store=store,
-                packet=packet,
-                setup_row=selected["row"],
-                evaluation=evaluation,
-                side=side,
-                contract_type=contract_type,
-                strike=strike,
-                expiry=expiry,
-                quantity=quantity,
-                note=note,
-            )
-
-            trade_id = str(trade.get("trade_id", "") or "").strip()
-            if not trade_id:
-                raise RuntimeError("The storage layer returned no trade_id after the write.")
-
-            # Hard read-back verification. Never tell the user a campaign is
-            # recorded unless the same store can immediately retrieve that TRADE.
-            verified = False
-            verify_error = ""
-            try:
-                persisted = store.list_superbrain_trades(instrument=instrument, open_only=False)
-                if persisted is not None and not persisted.empty and "trade_id" in persisted.columns:
-                    verified = bool(persisted["trade_id"].astype(str).eq(trade_id).any())
-            except Exception as verify_exc:
-                verify_error = f"{type(verify_exc).__name__}: {verify_exc}"
-
-            if not verified:
-                detail = f" Read-back error: {verify_error}" if verify_error else ""
-                raise RuntimeError(
-                    f"Trade {trade_id} was not found on read-back from {backend_name}.{detail}"
-                )
-
-            # Make the recorded campaign visible immediately; the next Scan now
-            # will refresh reasoning against this persisted exposure.
-            existing_open = [
-                x for x in (packet.get("open_trades") or [])
-                if str(x.get("trade_id", "") or "") != trade_id
-            ]
-            existing_open.append(trade)
-            packet["open_trades"] = existing_open
-            st.session_state.public_superbrain_last = packet
-            st.session_state["superbrain_notice"] = (
-                f"Campaign recorded and verified in {backend_name}: {trade_id}. "
-                "SuperBrain will manage the recorded exposure from the next scan."
-            )
-            st.session_state.pop("superbrain_error_notice", None)
-            st.rerun()
-        except Exception as exc:
-            st.session_state["superbrain_error_notice"] = (
-                f"Campaign was NOT recorded: {type(exc).__name__}: {exc}"
-            )
-            st.rerun()
-
-
-# -----------------------------------------------------------------------------
-# EDGE-ONLY FINAL POLICY (v20261018)
-# All Market Truth: live EDGE row. All options truth: fresh ODME scan.
-# Renko AURORA: user-selectable ONLY for new entries, never campaign management.
-# -----------------------------------------------------------------------------
 
 def _edge_live_ok(packet: Dict[str, Any]) -> bool:
+    # A failed fresh Scan cannot leave a prior successful scan looking live.
+    if packet.get('_scan_failed'):
+        return False
     ctx = _sb_authoritative_edge_context(packet)
     row = ctx.get("row") or {}
     if not ctx.get("available") or not ctx.get("book_available"):
@@ -4009,7 +3801,7 @@ def _sb_render_edge_cash_terminal(store: Any, instrument: str, packet: Dict[str,
         else:
             st.error('**WAIT** — EDGE feed is not live or not on its required execution timeframe.')
         return
-    pending = [s for s in _sb_pending_setups(store, instrument) if
+    pending = [s for s in _sb_pending_setups(store, instrument, packet) if
                str(s.get('status') or '').upper() == 'PENDING_ENTRY']
     if not pending:
         st.warning("**WAIT** — No current EDGE Level 2 defence or confirmed FP-break entry setup. FP touch alone is not an entry.")
@@ -4103,7 +3895,9 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
                 last_session_snapshot(symbol, edge_row.get('bar_time')) and
                 str(edge_row.get('edge_tracking_state') or '').upper() == 'ACTIVE' and
                 _sb_tf_key(edge_row.get('tf')) == _sb_tf_key(edge_row.get('edge_required_exec_tf') or edge_row.get('exec_tf')))
-    tape = read_edge_tape(get_store(), symbol) if (healthy or historic) else []
+    if (healthy or historic) and '_sb_bias_tape' not in packet:
+        packet['_sb_bias_tape'] = read_edge_tape(get_store(), symbol)
+    tape = packet.get('_sb_bias_tape') or [] if (healthy or historic) else []
     # Legacy result is preserved for the rest of SuperBrain, especially existing
     # cash campaign descriptions. The new outlook must not rewrite it.
     result = intelligent_bias(
@@ -4117,12 +3911,14 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
     outlook = None
     if (healthy or historic) and edge_row:
         try:
-            sb_store = get_store()
-            opt_history = read_optional_history(sb_store, symbol, edge_row)
-            odme_history = read_odme_snapshot_history(
-                sb_store, symbol, edge_row,
-                enabled=bool((packet.get('mapping') or {}).get('odme_scan_enabled')),
-            )
+            if '_sb_outlook_histories' not in packet:
+                sb_store = get_store()
+                packet['_sb_outlook_histories'] = (
+                    read_optional_history(sb_store, symbol, edge_row),
+                    read_odme_snapshot_history(sb_store, symbol, edge_row,
+                        enabled=bool((packet.get('mapping') or {}).get('odme_scan_enabled'))),
+                )
+            opt_history, odme_history = packet['_sb_outlook_histories']
             outlook = formulate_market_outlook(
                 edge_row, tape, opt_history, odme_history, current_odme=odme
             )
@@ -4231,12 +4027,21 @@ def render_public_superbrain() -> None:
     if err: st.error(err)
     try:
         store=get_store()
-        _run_expired_cleanup_once(store,show_notice=False)
-        instruments=build_instrument_map(store)
+        # Noncritical expiry housekeeping must not disable the market screen.
+        # The Scan itself still independently verifies current rulebook/data.
+        try:
+            _run_expired_cleanup_once(store,show_notice=False)
+        except Exception as housekeeping_error:
+            st.caption('Expiry housekeeping could not complete; market data will still be verified independently.')
+        instruments=_sb_screen_instrument_map()
     except Exception as exc:
-        st.error(f"Market data connection unavailable: {exc}")
+        if '429' in str(exc) or 'Quota exceeded' in str(exc):
+            st.error('Google Sheets read quota temporarily exhausted. SuperBrain cannot verify current data; '
+                     'no live entry or management verdict is authorised. Retry after the quota resets.')
+        else:
+            st.error(f"Market data connection unavailable: {exc}")
         return
-    rule_gate = _sb_rulebook_gate(store)
+    rule_gate = _sb_screen_rulebook_gate()
     if not rule_gate.get('ok'):
         st.error('SuperBrain rules are unavailable or stale. New entries and automatic management are PAUSED until the current locked rulebook is verified. ' +
                  str(rule_gate.get('reason') or f"Sheet version {rule_gate.get('version')}, status {rule_gate.get('state')}; app needs {RULEBOOK_VERSION}."))
@@ -4251,12 +4056,32 @@ def render_public_superbrain() -> None:
     if st.button("Scan now" if option_enabled else "Analyse EDGE",type="primary",use_container_width=True,key="scan_superbrain_public"):
         with st.spinner("Reading EDGE and scanning ODME..." if option_enabled else "Reading EDGE — no ODME scan..."):
             try:
+                # HARD GATE: current authoritative rulebook, NOT UI's 12s cache.
+                current_gate = _sb_rulebook_gate(store)
+                if not current_gate.get('ok'):
+                    prior = st.session_state.get('public_superbrain_last')
+                    if isinstance(prior, dict):
+                        prior['_scan_failed'] = True
+                    st.error('Scan paused: current locked rulebook could not be verified. ' +
+                             str(current_gate.get('reason') or f"Version {current_gate.get('version')}, status {current_gate.get('state')}."))
+                    return
                 st.session_state.public_superbrain_last=prepare_superbrain_scan(store,instrument)
             except Exception as exc:
-                st.error(f"Scan failed: {exc}")
+                prior = st.session_state.get('public_superbrain_last')
+                if isinstance(prior, dict):
+                    prior['_scan_failed'] = True
+                if '429' in str(exc) or 'Quota exceeded' in str(exc):
+                    st.error('Scan paused: Google Sheets quota exceeded. The earlier scan is NOT a live verdict; '
+                             'no entry or automatic campaign action is authorised until a fresh scan succeeds.')
+                else:
+                    st.error(f"Scan failed: {exc}")
                 return
     packet=st.session_state.get("public_superbrain_last")
     if not packet or str(packet.get("instrument"))!=instrument:return
+    option_enabled = bool((packet.get('mapping') or {}).get('odme_scan_enabled'))
+    if packet.get('_scan_failed'):
+        st.error('Previous scan shown for historical reference only; the latest refresh failed. '
+                 'Live decisions are paused until Scan now succeeds.')
     if not option_enabled:
         _sb_render_edge_cash_terminal(store,instrument,packet)
         return
@@ -4279,17 +4104,23 @@ def render_public_superbrain() -> None:
     active=[t for t in (packet.get("open_trades") or []) if str(t.get("status","ACTIVE") or "ACTIVE").upper() not in {"CLOSED","EXIT","TARGET","INVALIDATED","EXPIRED","CANCELLED"}]
     # A previously stored READY setup is never a live entry during a closure
     # or a feed outage—even if fresh ODME happened to be returned.
-    pending=_sb_pending_setups(store,instrument) if healthy else []
+    pending=_sb_pending_setups(store,instrument,packet) if healthy else []
+    if healthy and packet.get('setup_error'):
+        st.warning('Current setup records could not be verified. New entries are WAIT until a fresh Scan succeeds; '
+                   'existing campaigns remain visible.')
     if not healthy:
         st.info('**New entry: WAIT** — live session data required. Previous setups remain stored; no entry is authorised from the last-session scan.')
     if active:
         try:
-            packet['_confirmed_edge_tape'] = read_edge_tape(store, instrument, max_rows=350)
+            if '_sb_bias_tape' in packet:
+                packet['_confirmed_edge_tape'] = packet['_sb_bias_tape']
+            else:
+                packet['_confirmed_edge_tape'] = read_edge_tape(store, instrument, max_rows=350)
         except Exception:
             packet['_confirmed_edge_tape'] = []
         st.markdown("### Active campaigns")
         for trade in active:
-            setup=_sb_setup_for_trade(store,trade)
+            setup=_sb_setup_for_trade(store,trade,packet)
             st.write(f"**{trade.get('trade_id') or 'Campaign'} · {_sb_exposure_text(trade)}**")
             if not healthy:
                 st.info('**PAUSED — NOT A LIVE MANAGEMENT CALL.** Campaign remains recorded. Reassess HOLD / ROLL IN / ROLL OUT / EXIT after the market reopens and a fresh EDGE scan arrives.')
@@ -4337,30 +4168,51 @@ def render_public_superbrain() -> None:
     if pending:
         st.markdown("### New entry")
         active_setup_ids={str(_sb_json(t.get('metadata_json','')).get('parent_setup_id') or '') for t in active}
-        for setup in pending:
+        active_candidates = [s for s in pending if
+                             str(s.get('status') or '').upper() == 'PENDING_ENTRY' and
+                             str(s.get('record_id') or '') not in active_setup_ids]
+        if not active_candidates:
+            st.info('**WAIT — No currently eligible new entry.** Existing FP break-watches '
+                    'remain observational, not entry permission.')
+        for setup in active_candidates:
             if str(setup.get('record_id') or '') in active_setup_ids:continue
             if str(setup.get('status') or '').upper()!='PENDING_ENTRY':continue
             md=_sb_setup_md(setup)
             matrix=_edge_entry_matrix_for(setup,packet)
             ready=_sb_compact_manual_choices(matrix)
             opt=matrix.get('option_type') or _edge_option_for_setup(setup)
+            fp = md.get('fp') if isinstance(md.get('fp'), dict) else {}
+            side = str(fp.get('side') or '').upper()
+            lo, hi = _sb_num(fp.get('low')), _sb_num(fp.get('high'))
+            zone = (f"{_sb_fmt_level(lo)}–{_sb_fmt_level(hi)}"
+                    if lo is not None and hi is not None else 'current FP')
+            name = str(md.get('setup_name') or setup.get('strategy_type') or '').upper()
+            branch = ('Demand break' if 'DEMAND_BREAK' in name else
+                      'Supply break' if 'SUPPLY_BREAK' in name else
+                      'Demand defence' if side == 'DEMAND' else
+                      'Supply defence' if side == 'SUPPLY' else 'FP setup')
+            identity = f"{branch} {zone} · SELL {opt}"
             if ready:
-                st.success(f"**SELL {opt} — ENTRY READY** · Check Renko AURORA:")
+                st.success(f"**{identity} — CONDITIONAL ENTRY READY** · Confirm matching Renko AURORA:")
                 for choice in ready:
                     st.write(f"**{' / '.join(choice['auroras'])} → SELL {_sb_fmt_level(choice['strike'])} {opt} · L{choice['rank']}**")
             else:
                 # Avoid repeating the missing rank in warnings (including L3).
                 status=str(matrix.get('status') or 'WAIT').upper()
-                if status=='AVOID':st.error("**AVOID** — Adverse ODME expansion risk.")
+                reason=str(matrix.get('reason') or '').strip()
+                if status=='AVOID':
+                    danger = 'upside' if opt == 'CE' else 'downside' if opt == 'PE' else 'opposing'
+                    st.error(f"**AVOID {identity}** — Material {danger} ODME expansion risk against "
+                             f"the proposed short {opt}. {reason} Do not enter this leg.")
                 else:
-                    if "break is still pending" in str(matrix.get('reason') or '').lower():
-                        st.warning("**WAIT — FP break not confirmed.** The Demand/Supply breach is still being tested; no new opposite-side entry yet.")
+                    if "break is still pending" in reason.lower():
+                        st.warning(f"**WAIT {identity}** — {reason}")
                         continue
                     current_fp=_sb_short_fp_context(ctx)
                     if current_fp=='Awaiting next FP event':
-                        st.warning("**WAIT** — No current EDGE defence/break confirmation or qualified protected strike.")
+                        st.warning(f"**WAIT {identity}** — {reason or 'No current EDGE defence/break confirmation or qualifying protected strike.'}")
                     else:
-                        st.warning("**WAIT** — FP event is developing, but a sufficiently protected entry is not established.")
+                        st.warning(f"**WAIT {identity}** — {reason or 'FP event is developing, but no sufficiently protected entry is established.'}")
     elif not active:
         st.info("**WAIT** — No new EDGE FP entry setup.")
     with st.expander("View ODME levels and full structural map",expanded=False):
@@ -4375,8 +4227,13 @@ def _run_expired_cleanup_once(store: Any, show_notice: bool = True) -> None:
     india_date = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
     if st.session_state.get("last_expiry_cleanup_date") == india_date:
         return
-    cleanup = store.cleanup_expired_data(tz_name="Asia/Kolkata")
-    st.session_state["last_expiry_cleanup_date"] = india_date
+    with _SB_EXPIRY_CLEANUP_LOCK:
+        if getattr(store, '_last_expiry_cleanup_date', None) == india_date:
+            st.session_state["last_expiry_cleanup_date"] = india_date
+            return
+        cleanup = store.cleanup_expired_data(tz_name="Asia/Kolkata")
+        store._last_expiry_cleanup_date = india_date
+        st.session_state["last_expiry_cleanup_date"] = india_date
     if show_notice and (cleanup.get("deleted_snapshots", 0) or cleanup.get("cleared_scan_settings", 0)):
         st.toast(
             f"Expired ODME cleanup: {cleanup.get('deleted_snapshots', 0)} snapshot(s) deleted; "

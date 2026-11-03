@@ -886,6 +886,45 @@ class GoogleSheetStore(BaseStore):
         self._ws_cache[title] = ws
         return ws
 
+    @staticmethod
+    def _overview_frame(values: List[List[Any]]) -> pd.DataFrame:
+        """Convert a batchGet value range without changing stored cell values."""
+        if not values:
+            return pd.DataFrame()
+        headers = [str(x).strip() for x in values[0]]
+        used = [i for i, name in enumerate(headers) if name]
+        if len(set(headers[i] for i in used)) != len(used):
+            raise ValueError('Duplicate Google Sheet header names in market overview.')
+        return pd.DataFrame([
+            {headers[i]: row[i] if i < len(row) else '' for i in used}
+            for row in values[1:] if any(str(x).strip() for x in row)
+        ], columns=[headers[i] for i in used])
+
+    def load_market_overview(self) -> Dict[str, Any]:
+        """ONE live API read for the dropdown/scan map and authoritative TV rows.
+
+        Only ODME instrument column D is needed to preserve the legacy
+        odme_snapshot_match flag; never pull full historical ODME JSON merely
+        to build the instrument selector. No caching of market truth here.
+        """
+        self.ensure()
+        ranges = [
+            "'TV_TEST_CURRENT'!A1:ZZ",
+            "'instrument_settings'!A1:I",
+            "'odme_snapshots'!D2:D",
+        ]
+        response = self.sheet.values_batch_get(ranges)
+        found = response.get('valueRanges') or []
+        if len(found) != len(ranges):
+            raise RuntimeError('Incomplete Sheets market overview batch response.')
+        tv = self._overview_frame(found[0].get('values') or [])
+        settings = self._overview_frame(found[1].get('values') or [])
+        odme_instruments = {
+            str(r[0]).strip().upper() for r in (found[2].get('values') or [])
+            if r and str(r[0]).strip()
+        }
+        return {'tv': tv, 'settings': settings, 'odme_instruments': odme_instruments}
+
     def ensure(self) -> None:
         if self._ensured:
             return

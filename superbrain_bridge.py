@@ -198,14 +198,16 @@ def _open_trade_records(store: BaseStore, instrument: str) -> List[Dict[str, Any
     return _safe_records(trades)
 
 
-def build_instrument_map(store: BaseStore) -> pd.DataFrame:
-    """Build the public SuperBrain instrument list from live Sheet data only.
+def build_instrument_map(store: BaseStore, market_overview: Dict[str, Any] | None = None) -> pd.DataFrame:
+    """Build the existing exact-match map from one coherent live Sheet snapshot.
 
-    Instruments come from TV_TEST_CURRENT. ODME is attached only by exact
-    normalized instrument equality against odme_snapshots / instrument_settings.
-    No alias table or invented mapping is used.
+    No timeframe, ODME, or rule logic is changed. A LocalStore retains its
+    historical separate reads; GoogleSheetStore uses one values.batchGet.
     """
-    tv = store.load_tv_current()
+    if market_overview is None and callable(getattr(store, 'load_market_overview', None)):
+        market_overview = store.load_market_overview()
+    tv = (market_overview.get('tv', pd.DataFrame()) if market_overview is not None
+          else store.load_tv_current())
     if tv is None or tv.empty or "instrument" not in tv.columns:
         return pd.DataFrame(
             columns=[
@@ -219,18 +221,21 @@ def build_instrument_map(store: BaseStore) -> pd.DataFrame:
     tv["_instrument"] = tv["instrument"].map(_norm)
     tv = tv[tv["_instrument"].ne("")]
 
-    try:
-        odme = store.load_odme_history(limit=100000)
-    except Exception:
-        odme = pd.DataFrame()
     odme_instruments = set()
-    if odme is not None and not odme.empty and "instrument" in odme.columns:
-        odme_instruments = set(odme["instrument"].astype(str).map(_norm))
-
-    try:
-        settings = store.list_instrument_settings(active_only=False)
-    except Exception:
-        settings = pd.DataFrame()
+    if market_overview is not None:
+        odme_instruments = {_norm(v) for v in market_overview.get('odme_instruments', set())}
+        settings = market_overview.get('settings', pd.DataFrame())
+    else:
+        try:
+            odme = store.load_odme_history(limit=100000)
+        except Exception:
+            odme = pd.DataFrame()
+        if odme is not None and not odme.empty and "instrument" in odme.columns:
+            odme_instruments = set(odme["instrument"].astype(str).map(_norm))
+        try:
+            settings = store.list_instrument_settings(active_only=False)
+        except Exception:
+            settings = pd.DataFrame()
     settings_by_instrument: Dict[str, Dict[str, Any]] = {}
     if settings is not None and not settings.empty and "instrument" in settings.columns:
         for _, row in settings.iterrows():
@@ -364,7 +369,11 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
     stage = "START"
     try:
         stage = "BUILD_INSTRUMENT_MAP"
-        mapping = build_instrument_map(store)
+        # Fresh at every Scan now. Reuse this SAME observation for mapping and
+        # TV evidence; never replace it with a cached screen-view snapshot.
+        market_overview = (store.load_market_overview()
+                           if callable(getattr(store, 'load_market_overview', None)) else None)
+        mapping = build_instrument_map(store, market_overview=market_overview)
         matched = mapping[mapping["instrument"].eq(instrument)] if not mapping.empty else pd.DataFrame()
         if matched.empty:
             raise ValueError(f"{instrument} is not present in TV_TEST_CURRENT.")
@@ -374,7 +383,12 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
         open_trades = _open_trade_records(store, instrument)
 
         stage = "LOAD_TV_CURRENT"
-        tv_rows = store.load_tv_current(instrument)
+        if market_overview is not None:
+            tv_rows = market_overview['tv'].copy()
+            if 'instrument' in tv_rows.columns:
+                tv_rows = tv_rows[tv_rows['instrument'].astype(str).str.upper().str.strip().eq(instrument)].reset_index(drop=True)
+        else:
+            tv_rows = store.load_tv_current(instrument)
         if tv_rows is not None and not tv_rows.empty and "source" in tv_rows.columns:
             # EDGE is mandatory for decisions. Other source rows are optional
             # context only: stale or missing ones are silently ignored.
@@ -426,7 +440,19 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
             open_trades=open_trades,
         )
 
+        stage = "READ_SCAN_SETUP_SNAPSHOT"
+        setup_rows = None
+        setup_error = ""
+        try:
+            setup_df = store.list_superbrain_setups(instrument=instrument)
+            setup_rows = setup_df.to_dict('records') if setup_df is not None else []
+        except Exception as setup_exc:
+            # Existing exposure can still be reviewed. New entries fail closed.
+            setup_error = f'{type(setup_exc).__name__}: {setup_exc}'
+
         return {
+            "setup_rows": setup_rows,
+            "setup_error": setup_error,
             "instrument": instrument,
             "mode": mode,
             "tv_rows": tv_rows,
