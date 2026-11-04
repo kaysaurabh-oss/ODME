@@ -3956,15 +3956,54 @@ def _sb_campaign_plain_language(trade: Dict[str,Any], decision: Dict[str,Any],
     option=str(decision.get('option_type') or '').upper()
     expected='BEARISH' if option=='CE' else 'BULLISH' if option=='PE' else str(trade.get('direction') or '').upper()
     bias_name=str(bias.get('label') or '').upper()
-    market_side='BULLISH' if bias_name.startswith(('BULLISH','STRONG BULLISH')) else 'BEARISH' if bias_name.startswith(('BEARISH','STRONG BEARISH')) else ''
-    # Explain the market in ordinary language; the original risk decision and
-    # locked protection rules remain untouched. Avoid repeating MTF/OF scores.
-    if market_side and expected and market_side==expected:
-        trade_read='The current market behaviour still supports this trade.'
-    elif market_side and expected and market_side!=expected:
-        trade_read='The current market behaviour is moving against this trade.'
+    # A label such as BEARISH PRESSURE / DOWNSIDE FAILURE describes bearish
+    # *control* failing to move price. It is not a bearish price verdict.
+    pressure_failure=('DOWNSIDE FAILURE' in bias_name or 'UPSIDE FAILURE' in bias_name)
+    market_side=('' if pressure_failure else
+                 'BULLISH' if bias_name.startswith(('BULLISH','STRONG BULLISH')) else
+                 'BEARISH' if bias_name.startswith(('BEARISH','STRONG BEARISH')) else '')
+
+    # Compare the live underlying with the actual stored underlying reference,
+    # when available, BEFORE describing the market as helping/hurting the leg.
+    # This comparison is for explanation ONLY: no inferred option P&L, fresh
+    # entry permission, or alteration of HOLD/ROLL/EXIT protection rules.
+    edge_row=(_sb_authoritative_edge_context(packet).get('row') or {})
+    spot=_sb_num(edge_row.get('close'))
+    recorded=_sb_json(trade.get('market_state_json') or '')
+    record_price=_sb_num(recorded.get('recorded_underlying_price'))
+    # Some legacy user-recorded campaigns stored only `price` at recording.
+    if record_price is None and recorded.get('snapshot_at_recording') is True:
+        record_price=_sb_num(recorded.get('price'))
+    # A rolled campaign may have a different entry anchor: do not compare it
+    # against a superseded initial trade-recording price.
+    if _sb_num(md.get('management_revision')) not in (None, 0):
+        record_price=None
+    price_effect='UNKNOWN'
+    if (option in {'PE','CE'} and spot is not None and record_price is not None
+            and record_price>0 and _edge_live_ok(packet)):
+        difference=(spot-record_price)/record_price
+        if abs(difference)>=0.001:  # Ignore small changes (0.10%) around recording.
+            favourable=(difference>0) if option=='PE' else (difference<0)
+            price_effect='FAVOURABLE' if favourable else 'ADVERSE'
+        else:
+            price_effect='FLAT'
+
+    # Explain observed price progress distinctly from TradingView OF pressure.
+    # The existing EDGE intelligence narrative below supplies the OF/MTF detail.
+    if price_effect=='FAVOURABLE':
+        trade_read=(f'Underlying moved from {_sb_fmt_level(record_price)} to '
+                    f'{_sb_fmt_level(spot)}, favouring the sold {option} on price. '
+                    'This is not an option-premium P&L assessment.')
+    elif price_effect=='ADVERSE':
+        trade_read=(f'Underlying moved from {_sb_fmt_level(record_price)} to '
+                    f'{_sb_fmt_level(spot)}, against the sold {option} on price. '
+                    'Review protection even if no locked break is confirmed.')
+    elif price_effect=='FLAT':
+        trade_read='Underlying is near its recorded reference; OF alone does not establish price direction.'
+    elif pressure_failure:
+        trade_read='The earlier buying/selling pressure has failed to retain its price progress; its OF label alone is not a directional price verdict.'
     else:
-        trade_read='The market is mixed; the trade needs closer watching.'
+        trade_read='Market pressure is contextual; price impact on this exposure is not verified against a recorded underlying reference.'
     natural=str(bias.get('commentary') or '').strip()
     paragraphs=[part.strip() for part in natural.split('\n\n') if part.strip()]
     # The first paragraph explains execution control, cross-timeframe agreement
@@ -3990,8 +4029,22 @@ def _sb_campaign_plain_language(trade: Dict[str,Any], decision: Dict[str,Any],
         status='ON PLAN — INWARD ROLL OPPORTUNITY VERIFIED BY LOCKED RULES'
     elif raw_action=='HOLD / RECHECK ODME':
         status='STRUCTURE NOT CONFIRMED BROKEN — ODME UNAVAILABLE'
+    elif price_effect=='ADVERSE':
+        status='ON WATCH — UNDERLYING MOVE AGAINST THIS EXPOSURE'
+    elif price_effect=='FAVOURABLE':
+        # A recovery can favour a sold PE even while bearish OF persists.
+        # Preserve caution without claiming that the market moved against it.
+        flow=str(edge_row.get('exec_of') or '').upper()
+        of_opposes=(expected=='BULLISH' and 'BEARISH' in flow) or (expected=='BEARISH' and 'BULLISH' in flow)
+        if 'REVERSAL RISK' in bias_name:
+            status=f'ON WATCH — REVERSAL RISK; PRICE FAVOURS SOLD {option}'
+        elif of_opposes:
+            pressure='BEARISH' if expected=='BULLISH' else 'BULLISH'
+            status=f'ON WATCH — PRICE FAVOURS SOLD {option}; {pressure} OF PERSISTS'
+        else:
+            status=f'ON PLAN — UNDERLYING MOVE FAVOURS SOLD {option}'
     elif market_side and expected and market_side!=expected:
-        status='ON WATCH — MARKET JOURNEY CHALLENGES THIS EXPOSURE'
+        status='ON WATCH — OPPOSING PRESSURE; PRICE IMPACT UNVERIFIED'
     elif 'REVERSAL RISK' in bias_name:
         status='ON WATCH — REVERSAL RISK AGAINST THE PLAN'
     elif ('UPSIDE FAILURE' in bias_name and expected=='BULLISH') or (          'DOWNSIDE FAILURE' in bias_name and expected=='BEARISH'):
@@ -4000,9 +4053,9 @@ def _sb_campaign_plain_language(trade: Dict[str,Any], decision: Dict[str,Any],
         status='ON PLAN, BUT COUNTER-PRESSURE DEVELOPING'
     else:
         status='ON PLAN — NO CONFIRMED LOCKED BREAK' if raw_action=='HOLD' else 'PLAN REQUIRES ACTION'
-    if md.get('manual_anytime_entry'):
-        original=str(md.get('manual_entry_note') or '').strip()
-        if original:status+=' · USER THESIS: '+original[:100]
+    # A manual entry note is historical, not today's objective market verdict.
+    entry_thesis=(str(md.get('manual_entry_note') or '').strip()
+                  if md.get('manual_anytime_entry') else '')
     # An explicit underlying-price stop from the user has priority even when
     # FP/ODME management is otherwise HOLD. Never infer a stop from market bias.
     invalidation=_sb_num(trade.get('invalidation'))
@@ -4015,7 +4068,8 @@ def _sb_campaign_plain_language(trade: Dict[str,Any], decision: Dict[str,Any],
             reason='Current underlying price has crossed the invalidation level you recorded; do not treat the existing HOLD/roll map as permission to ignore your stop.'
     if not commentary:
         commentary='EDGE price journey is not independently verified on this scan.'
-    return {'status':status,'behavior':commentary,'action':display,'reason':reason}
+    return {'status':status,'behavior':commentary,'action':display,
+            'reason':reason,'entry_thesis':entry_thesis}
 
 
 def render_public_superbrain() -> None:
@@ -4156,6 +4210,8 @@ def render_public_superbrain() -> None:
                 readout=_sb_campaign_plain_language(trade,d,bias_result,packet)
                 st.markdown(f"**Plan:** {readout['status']}")
                 st.write(f"**Behaviour:** {readout['behavior']}")
+                if readout.get('entry_thesis'):
+                    st.caption('Entry note (historical, user-recorded): '+readout['entry_thesis'])
                 msg=f"**{readout['action']}** — {d.get('option_type')} {_sb_fmt_level(d.get('strike'))}"
                 if d.get('target') is not None:msg+=f" → {_sb_fmt_level(d['target'])}"
                 if readout['action'].startswith(('EXIT','ROLL OUT')):st.error(msg)
