@@ -7,6 +7,7 @@ No setup, strike, management, signal, broker or Telegram code imports this modul
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import json
 import math
 from typing import Any, Dict, List, Optional
@@ -278,6 +279,222 @@ def _outlook_fmt(price: float) -> str:
     return f'{price:,.2f}'.rstrip('0').rstrip('.')
 
 
+
+# Persistent explanatory location, distinct from active-TF execution authority.
+# A recorded higher-TF observation establishes the origin; a memory record only
+# carries the origin forward and is rechecked against today's authoritative EDGE.
+def evolve_strategic_context(edge: Dict[str,Any], tape: List[Dict[str,Any]],
+                             previous: Optional[Dict[str,Any]]=None) -> Dict[str,Any]:
+    now=_ms(edge.get('bar_time'));spot=_num(edge.get('close'))
+    if not now or spot is None or spot<=0:return {}
+    inst=str(edge.get('instrument') or '').upper().strip()
+    execution_tf=_num(edge.get('tf')) or 0
+    prior=previous if isinstance(previous,dict) else {}
+    roles=[]
+    for role in ('defender','challenger'):
+        side=str(edge.get(role+'_side') or '').upper()
+        tf=_num(edge.get(role+'_tf'))
+        low=_num(edge.get(role+'_low'));high=_num(edge.get(role+'_high'))
+        state=str(edge.get(role+'_state') or '').upper()
+        if (side in ('DEMAND','SUPPLY') and tf and tf>=60 and tf>=execution_tf
+                and low is not None and high is not None and 0<low<=high
+                and state not in ('RUN','BROKEN','INACTIVE')):
+            roles.append(dict(role=role,side=side,tf=int(tf),low=low,high=high))
+    candidates=[]
+    # The current EDGE row contains the authoritative higher-TF zone identity.
+    # The tape contains actual earlier closes, including previous execution TFs.
+    rows=[r for r in (tape or []) if isinstance(r,dict) and not r.get('synthetic_price_only')]
+    current_sample={'instrument':inst,'bar_ms':now,'close':spot}
+    for role in ('defender','challenger'):
+        for k in ('side','low','high'):
+            current_sample[role+'_'+k]=edge.get(role+'_'+k)
+    rows.append(current_sample)
+    for role in roles:
+        for row in rows:
+            if str(row.get('instrument') or inst).upper()!=inst:continue
+            tm=_ms(row.get('bar_ms'));px=_num(row.get('close'))
+            if not tm or px is None or tm>now or now-tm>14*86400_000:continue
+            # A zone can be recorded without a touch. Require real observed
+            # proximity before remembering it as the move's origin.
+            gap=max(role['low']-px,0,px-role['high'])
+            if gap/max(px,1)>0.004:continue
+            # Historical price cannot be attributed to a zone that only
+            # appeared later. It must already be identifiable in THAT sample.
+            prefix=role['role']+'_'
+            if str(row.get(prefix+'side') or '').upper()!=role['side']:continue
+            old_lo=_num(row.get(prefix+'low'));old_hi=_num(row.get(prefix+'high'))
+            if old_lo is None or old_hi is None:continue
+            tolerance=max(0.0004*spot,0.10*(role['high']-role['low']))
+            if min(abs(old_lo-role['low']),abs(old_hi-role['high']))>tolerance:continue
+            if min(old_hi,role['high'])<max(old_lo,role['low']):continue
+            candidates.append((tm,role,px))
+    valid_prior=False
+    if prior and prior.get('instrument')==inst:
+        tm=_ms(prior.get('origin_time'))
+        lo=_num(prior.get('low'));hi=_num(prior.get('high'))
+        valid_prior=bool(tm and 0<=now-tm<=21*86400_000 and lo and hi and lo<=hi)
+    # Retain an original verified higher-TF interaction while its structural
+    # reference is still recognizable. Do not reset to a 3m FP on handoff.
+    if valid_prior:
+        prev_role=next((r for r in roles if r['side']==prior.get('side') and
+                        abs(r['low']-float(prior['low']))/spot<0.0002 and
+                        abs(r['high']-float(prior['high']))/spot<0.0002),None)
+        if prev_role:
+            active=dict(prior)
+            active['checked_at']=now
+            active['status']=('CHALLENGED' if (spot<prev_role['low'] and prev_role['side']=='DEMAND') or
+                              (spot>prev_role['high'] and prev_role['side']=='SUPPLY') else 'RECOGNIZED')
+            return active
+    # Use the most recent verified interaction, preferring the higher TF where
+    # multiple roles are touched in the same observed window.
+    if candidates:
+        tm,role,px=max(candidates,key=lambda x:(x[0],x[1]['tf']))
+        return {'instrument':inst,'origin_time':tm,'checked_at':now,
+                'origin_price':px,'side':role['side'],'tf':role['tf'],
+                'low':role['low'],'high':role['high'],'status':'RECOGNIZED'}
+    if valid_prior:
+        carried=dict(prior);carried['checked_at']=now
+        # The original event remains historical, but without an identifiable
+        # current zone it cannot assert that the zone is still defending.
+        carried['status']='HISTORICAL_ONLY'
+        return carried
+    return {}
+
+
+def _strategic_opening(context: Dict[str,Any], side: int, spot: float) -> str:
+    if not isinstance(context,dict) or not context:return ''
+    low=_num(context.get('low'));high=_num(context.get('high'))
+    tf=_num(context.get('tf'))
+    if low is None or high is None or not tf or not spot:return ''
+    role=str(context.get('side') or '').upper()
+    status=str(context.get('status') or '').upper()
+    if role not in ('DEMAND','SUPPLY'):return ''
+    where=f'{int(tf)}m {role.lower()} around {_outlook_fmt(low)}–{_outlook_fmt(high)}'
+    if status=='HISTORICAL_ONLY':
+        return f'An earlier reaction near higher-TF {where} is part of the recorded journey; its present protection is unverified.'
+    if status=='CHALLENGED':
+        return f'The prior higher-TF {where} is now under pressure; its earlier reaction is not evidence of a continuing hold.'
+    if role=='DEMAND' and side>0 and spot>=high:
+        return f'The recovery originated near higher-TF {where}; lower-TF execution tracks its progress, not a separate trend.'
+    if role=='SUPPLY' and side<0 and spot<=low:
+        return f'The decline originated near higher-TF {where}; lower-TF execution tracks its progress, not a separate trend.'
+    return f'Price remains influenced by a recorded higher-TF {where} reaction; current execution control must confirm its next leg.'
+
+
+_IST=ZoneInfo('Asia/Kolkata')
+
+
+def _odme_session(row: Dict[str,Any]) -> Optional[str]:
+    tm=_ms(row.get('ts'))
+    return datetime.fromtimestamp(tm/1000,tz=timezone.utc).astimezone(_IST).date().isoformat() if tm else None
+
+
+def _odme_trusted_snapshot(row: Dict[str,Any]) -> bool:
+    # Explicit poor/empty listed-OI coverage cannot establish wall migration.
+    count=_num(row.get('usable_oi_count'))
+    return count is None or count>=10
+
+
+def _odme_evolution(odme: Optional[Dict[str,Any]], snapshots: List[Dict[str,Any]], edge_ms: int,
+                    side: int=0) -> Dict[str,Any]:
+    """Display-only previous-session and multi-session, SAME-EXPIRY narrative.
+
+    Do not interpret the last intraday scan as 'yesterday'. Never combine expiry
+    series or use a future saved snapshot as proof of an earlier market state.
+    """
+    live=odme if isinstance(odme,dict) else {}
+    rows=sorted((dict(r) for r in (snapshots or []) if isinstance(r,dict) and
+                 _ms(r.get('ts')) and _ms(r.get('ts'))<=edge_ms and
+                 str(r.get('expiry') or '').strip() and _odme_trusted_snapshot(r)),
+                key=lambda r:_ms(r['ts']))
+    if not rows:return {'text':'','fresh_adverse':False,'trend_side':0,'session_count':0}
+    expiry=str(live.get('expiry') or '').strip().upper()
+    if not expiry or not any(str(r.get('expiry') or '').strip().upper()==expiry for r in rows):
+        expiry=str(rows[-1].get('expiry') or '').strip().upper()
+    rows=[r for r in rows if str(r.get('expiry') or '').strip().upper()==expiry]
+    by_date={}
+    for r in rows:by_date[_odme_session(r)]=r  # last confirmed snapshot per session
+    dates=sorted(d for d in by_date if d)
+    if not dates:return {'text':'','fresh_adverse':False,'trend_side':0,'session_count':0}
+    recent=dates[-7:]
+    samples=[by_date[d] for d in recent]
+    latest=samples[-1];last_ms=_ms(latest['ts'])
+    age=(edge_ms-last_ms)/3600_000
+    if age>96:
+        return {'text':'Saved ODME history is too old to describe current positioning.',
+                'fresh_adverse':False,'trend_side':0,'session_count':len(samples),'stale':True}
+    parts=[];multi_side=0;fresh_adverse=False
+    if len(samples)>=3:
+        direction={}
+        for col in ('option_poc','pe_wall','ce_wall'):
+            vals=[_num(r.get(col)) for r in samples]
+            if any(v is None or v<=0 for v in vals):continue
+            moves=[(b>a)-(b<a) for a,b in zip(vals,vals[1:])]
+            up=moves.count(1);dn=moves.count(-1)
+            if up>=2 and dn==0:direction[col]=1
+            elif dn>=2 and up==0:direction[col]=-1
+        if direction:
+            if direction.get('option_poc')==1 and direction.get('pe_wall')==1:
+                parts.append('multi-session POC and PE-wall migration is higher')
+                multi_side=1
+            elif direction.get('option_poc')==-1 and direction.get('ce_wall')==-1:
+                parts.append('multi-session POC and CE-wall migration is lower')
+                multi_side=-1
+            elif direction.get('option_poc')==1:
+                parts.append('multi-session POC is migrating higher')
+                multi_side=1
+            elif direction.get('option_poc')==-1:
+                parts.append('multi-session POC is migrating lower')
+                multi_side=-1
+            elif direction.get('pe_wall')==1:
+                parts.append('multi-session PE wall has migrated higher')
+            elif direction.get('ce_wall')==-1:
+                parts.append('multi-session CE wall has migrated lower')
+    if len(samples)>=2:
+        prev=samples[-2]
+        day_gap=(datetime.fromisoformat(recent[-1]).date()-datetime.fromisoformat(recent[-2]).date()).days
+        # Avoid labeling a week-old sparse comparison as a fresh expansion.
+        if day_gap<=4:
+            changes=[]
+            for col,name in [('pe_wall','PE wall'),('ce_wall','CE wall'),('option_poc','POC')]:
+                x=_num(prev.get(col));y=_num(latest.get(col))
+                if x is not None and y is not None and x>0 and y>0 and x!=y:
+                    changes.append(f'{name} moved {"higher" if y>x else "lower"}')
+            exp0=_num(prev.get('expansion_score'));exp1=_num(latest.get('expansion_score'))
+            bull0=_num(prev.get('bullish_score'));bull1=_num(latest.get('bullish_score'))
+            bear0=_num(prev.get('bearish_score'));bear1=_num(latest.get('bearish_score'))
+            if exp0 is not None and exp1 is not None and exp1>exp0:
+                if bear1 is not None and bull1 is not None and bear1>bull1 and (bear0 is None or bear1>bear0):
+                    changes.insert(0,'bearish expansion pressure increased')
+                    fresh_adverse=side>0
+                elif bull1 is not None and bear1 is not None and bull1>bear1 and (bull0 is None or bull1>bull0):
+                    changes.insert(0,'bullish expansion pressure increased')
+                    fresh_adverse=side<0
+                else:
+                    changes.insert(0,'expansion score increased without clear directional dominance')
+            elif exp0 is not None and exp1 is not None and exp1<exp0:
+                changes.insert(0,'expansion pressure eased')
+            tilt0=str(prev.get('odme_tilt') or '').strip()
+            tilt1=str(latest.get('odme_tilt') or '').strip()
+            if tilt0 and tilt1 and tilt0!=tilt1 and not changes:
+                changes.append(f'ODME tilt changed from {tilt0} to {tilt1}')
+            if changes:parts.append('versus the previous recorded session, '+', '.join(changes[:2]))
+    if not parts and len(samples)==1:
+        parts.append('only one comparable saved ODME session is available')
+    elif not parts and len(samples)>1:
+        parts.append('saved ODME positioning has no clear sustained migration')
+    text='; '.join(parts)
+    # Explicitly identify historical-only context to avoid treating old snapshots
+    # as a fresh options-chain authorization.
+    if text:
+        text=('Saved ODME ('+expiry+') shows '+text+'.')
+        if not live or _outlook_side(live.get('direction'))==0:
+            text+=' Historical positioning only; current ODME support is unverified.'
+    return {'text':text,'fresh_adverse':fresh_adverse,'trend_side':multi_side,
+            'session_count':len(samples),'stale':False,'expiry':expiry,
+            'latest_age_hours':age}
+
+
 def _outlook_journey(edge: Dict[str,Any], tape: List[Dict[str,Any]]) -> Dict[str,Any]:
     """Use genuine completed observations of the current execution TF only.
 
@@ -326,7 +543,8 @@ def _outlook_journey(edge: Dict[str,Any], tape: List[Dict[str,Any]]) -> Dict[str
 
 
 def _outlook_optional(optional: List[Dict[str,Any]], edge_ms: int) -> Dict[str,Any]:
-    evidence={'aurora':None,'aurora_transition':False,'liq':None,'liq_price_response':None}
+    evidence={'aurora':None,'aurora_transition':False,'liq':None,'liq_price_response':None,
+              'aurora_asymmetry':0,'liq_sequence_side':0,'liq_sequence':''}
     for src in ('AURORA','LIQUIDITY'):
         own=[]
         for r in optional or []:
@@ -340,6 +558,16 @@ def _outlook_optional(optional: List[Dict[str,Any]], edge_ms: int) -> Dict[str,A
         if edge_ms-ms>max(2*tf*60_000,90*60_000):continue
         if src=='AURORA':
             evidence['aurora']=str(latest.get('state') or '').upper()
+            ctx=latest.get('context') or _json_obj(latest.get('context_json'))
+            up=str(ctx.get('eta_up_regime') or '').upper()
+            down=str(ctx.get('eta_down_regime') or '').upper()
+            if up=='SHARP' and down=='GRIND':evidence['aurora_asymmetry']=1
+            elif down=='SHARP' and up=='GRIND':evidence['aurora_asymmetry']=-1
+            same=0
+            for _,r in reversed(own):
+                if str(r.get('state') or '').upper()!=evidence['aurora']:break
+                same+=1
+            evidence['aurora_persistence_bars']=same
             if len(own)>=2:
                 previous=str(own[-2][1].get('state') or '').upper()
                 evidence['aurora_transition']=bool(previous and previous!=evidence['aurora'])
@@ -358,6 +586,24 @@ def _outlook_optional(optional: List[Dict[str,Any]], edge_ms: int) -> Dict[str,A
                 start=_num(first.get('price'))
                 end=_num(latest.get('price'))
                 if start and end and len(relevant)>=2:evidence['liq_price_response']=(end/start-1)*100
+            # Distinct confirmed runs, never repeated last_event carried forward
+            # on every saved observation. No inferred buy/sell aggressor volume.
+            unique={}
+            for t,r in own:
+                ev=str(r.get('last_event') or '').upper()
+                when=_ms(r.get('event_ms'))
+                if not ev or not when or when>edge_ms or edge_ms-when>12*3600_000:continue
+                unique[(ev,when)]=(ev,when)
+            ordered=sorted(unique.values(),key=lambda z:z[1])
+            recent=ordered[-6:]
+            sells=sum(x[0]=='SELL_FULL_RUN' for x in recent)
+            buys=sum(x[0]=='BUY_FULL_RUN' for x in recent)
+            if sells>=2 and sells>buys:
+                evidence['liq_sequence_side']=-1
+                evidence['liq_sequence']='Repeated accepted sell-side liquidity runs remain in the recent sequence.'
+            elif buys>=2 and buys>sells:
+                evidence['liq_sequence_side']=1
+                evidence['liq_sequence']='Repeated accepted buy-side liquidity runs remain in the recent sequence.'
     return evidence
 
 
@@ -366,7 +612,7 @@ def _outlook_odme(odme: Optional[Dict[str,Any]], snapshots: List[Dict[str,Any]],
     direction=_outlook_side(live.get('direction'))
     strength=str(live.get('strength') or '').upper()
     latest=None;old=None
-    options=[r for r in (snapshots or []) if _ms(r.get('ts')) and _ms(r.get('ts'))<=edge_ms+60_000]
+    options=[r for r in (snapshots or []) if _ms(r.get('ts')) and _ms(r.get('ts'))<=edge_ms]
     if options:
         latest=max(options,key=lambda z:_ms(z.get('ts')))
         same=[x for x in options if str(x.get('expiry') or '').upper()==str(latest.get('expiry') or '').upper() and
@@ -376,7 +622,7 @@ def _outlook_odme(odme: Optional[Dict[str,Any]], snapshots: List[Dict[str,Any]],
     tilt_change=(str(old.get('odme_tilt') or '')+' → '+tilt) if old and tilt and str(old.get('odme_tilt') or '')!=tilt else None
     return {'dir':direction,'strength':strength,'tilt':tilt,'tilt_change':tilt_change,
             'latest_age_hours':(edge_ms-_ms(latest.get('ts')))/3_600_000 if latest else None,
-            'old':old,'latest':latest}
+            'current_live':bool(live),'old':old,'latest':latest}
 
 
 def _outlook_levels(edge: Dict[str,Any], journey: Dict[str,Any], odme: Dict[str,Any]) -> Dict[str,Any]:
@@ -405,7 +651,7 @@ def _outlook_levels(edge: Dict[str,Any], journey: Dict[str,Any], odme: Dict[str,
                 add(h.get('low'),'EDGE FP hurdle',2);add(h.get('high'),'EDGE FP hurdle',2)
     # Current ODME walls are barriers, never fresh EDGE entry authority.
     latest=odme.get('latest') or {}
-    if odme.get('latest_age_hours') is not None and odme['latest_age_hours']<=24:
+    if odme.get('current_live') and odme.get('latest_age_hours') is not None and 0<=odme['latest_age_hours']<=24:
         add(latest.get('pe_wall'),'ODME PE wall',1)
         add(latest.get('ce_wall'),'ODME CE wall',1)
     lowers=sorted((x for x in candidates if x[0]<spot),key=lambda z:(spot-z[0],-z[2]))
@@ -449,7 +695,9 @@ def _outlook_historical_check(journey: Dict[str,Any], side: int) -> Dict[str,Any
 
 def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]],
                              optional_history: List[Dict[str,Any]], odme_history: List[Dict[str,Any]],
-                             current_odme: Optional[Dict[str,Any]]=None) -> Dict[str,Any]:
+                             current_odme: Optional[Dict[str,Any]]=None,
+                             strategic_context: Optional[Dict[str,Any]]=None,
+                             selected_expiry: str='') -> Dict[str,Any]:
     """Predictive *scenario* display; never modifies executable trade decisions.
 
     Combines price-effectiveness, persistent EDGE OF, FP freshness, macro/MTF
@@ -460,7 +708,13 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
     if not j.get('spot') or not j.get('now'):
         return {'label':'UNAVAILABLE','commentary':'Insufficient verified EDGE price data for a market outlook.'}
     o=_outlook_optional(optional_history,j['now'])
-    d=_outlook_odme(current_odme,odme_history,j['now'])
+    # Never explain the active contract with an older expiry's positioning.
+    # If no expiry is selected, _outlook_odme still compares only equal expiries.
+    contract=str(selected_expiry or '').strip().upper()
+    relevant_odme=[r for r in (odme_history or []) if not contract or
+                   str(r.get('expiry') or '').strip().upper()==contract]
+    d=_outlook_odme(current_odme,relevant_odme,j['now'])
+    story=strategic_context if isinstance(strategic_context,dict) else {}
     levels=_outlook_levels(edge,j,d)
     flow=j.get('dir') or _outlook_side(edge.get('exec_of'))
     macro=_outlook_side(edge.get('macro'))
@@ -515,6 +769,9 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
         if fp_favours==side:supporting.append('fresh EDGE FP event')
         elif fp_favours==-side:conflicts.append('fresh EDGE FP event')
     if o.get('aurora')=='WHITE':conflicts.append('range-state Candle AURORA')
+    # ODME trajectory is longitudinal context, not another independent live
+    # direction vote. Opposing day-on-day expansion can reduce confidence.
+    evolution=_odme_evolution(current_odme,relevant_odme,j['now'],side)
     # Confirmed liquidity RUN is useful only when price has accepted beyond the
     # reported event level; a SWEEP cannot be assumed directional from its name.
     liq_event=o.get('liq') or ''
@@ -532,12 +789,36 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
     quality='LOW'
     if has_path and j.get('duration_hours',0)>=1:
         quality='MODERATE'
-        if side and len(supporting)>=3 and not conflicts and j['real_count']>=12:
+        # Evidence families rather than number of correlated EDGE labels:
+        # price/OF progress is the base; location, live ODME and optional
+        # indicators may corroborate, each family at most once.
+        location_agrees=bool(story.get('status')=='RECOGNIZED' and
+            ((side>0 and story.get('side')=='DEMAND' and j['spot']>=(_num(story.get('high')) or float('inf'))) or
+             (side<0 and story.get('side')=='SUPPLY' and j['spot']<=(_num(story.get('low')) or 0))))
+        odme_agrees=bool(side and d.get('current_live') and d['dir']==side)
+        optional_agrees=bool(side and (aura_side==side or o.get('liq_sequence_side')==side))
+        families=sum((location_agrees,odme_agrees,optional_agrees))
+        if side and effective and families>=2 and not conflicts and j['real_count']>=12:
             quality='HIGH'
         if side and len(conflicts)>=2:quality='LOW'
     if side==0 and has_path and width and width<0.30:quality='LOW'
+    if evolution.get('fresh_adverse') and quality=='HIGH':quality='MODERATE'
+    elif evolution.get('fresh_adverse') and quality=='MODERATE':quality='LOW'
+    if (story.get('status')=='CHALLENGED' and story.get('side')=='DEMAND' and side>0) or (
+            story.get('status')=='CHALLENGED' and story.get('side')=='SUPPLY' and side<0):
+        quality='LOW'
     side_name='BULLISH' if side>0 else 'BEARISH' if side<0 else 'RANGE'
     label=f'{side_name} {kind}' if side else kind
+    if story.get('status')=='RECOGNIZED' and side>0 and story.get('side')=='DEMAND':
+        label='BULLISH RECOVERY DEVELOPING'
+    elif story.get('status')=='RECOGNIZED' and side<0 and story.get('side')=='SUPPLY':
+        label='BEARISH DECLINE DEVELOPING'
+    elif story.get('status')=='RECOGNIZED' and side<0 and story.get('side')=='DEMAND':
+        label='BEARISH PULLBACK / HIGHER-TF DEMAND UNDER TEST'
+    elif story.get('status')=='RECOGNIZED' and side>0 and story.get('side')=='SUPPLY':
+        label='BULLISH REBOUND / HIGHER-TF SUPPLY UNDER TEST'
+    elif story.get('status')=='RECOGNIZED' and not side:
+        label='PAUSE NEAR HIGHER-TF CONTEXT'
     # Main expected path, followed by only a meaningful conditional alternative.
     if side<0:
         first=(f'Sellers are making downside progress ({drift:+.2f}% in {j["duration_hours"]:.1f} observed hours).'
@@ -553,9 +834,19 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
                'Price and directional evidence are mixed; a range is more likely until a confirmed escape.')
     if side and macro==-side:first+=' The broader macro trend still opposes the move.'
     elif side and macro==side and quality=='HIGH':first+=' Higher-timeframe structure agrees.'
-    if d.get('tilt_change') and quality!='HIGH':first+=' ODME positioning has recently changed.'
+    if d.get('tilt_change') and quality!='HIGH' and not evolution.get('text'):
+        first+=' ODME positioning has recently changed.'
     if (d['dir']==-side and side and quality!='HIGH'):
         first+=' Current ODME positioning does not support the directional outlook.'
+    # The opening carries the strategic origin and ODME developing picture,
+    # while the familiar Most likely / risk / Renko statements stay unchanged.
+    origin=_strategic_opening(story,side,j['spot'])
+    if origin:first=origin+' '+first
+    if evolution.get('text'):first+=' '+evolution['text']
+    if (side and o.get('liq_sequence_side')==side and o.get('liq_sequence')):
+        first+=' '+o['liq_sequence']
+    if side and o.get('aurora_asymmetry')==-side:
+        first+=' Candle AURORA indicates a sharper opposing path; follow-through needs confirmation.'
     main=''
     alternate=''
     down=levels.get('lower');up=levels.get('upper')
@@ -592,4 +883,5 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
             'lower_level':down[0] if down else None,'upper_level':up[0] if up else None,
             'sample_size':j.get('real_count',0),
             'history_pattern':_outlook_historical_check(j,side),
+            'strategic_context':story,'odme_evolution':evolution,
             'trade_authority':'EDGE_ENTRY_AND_FRESH_ODME_ONLY'}

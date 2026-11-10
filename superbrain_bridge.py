@@ -12,6 +12,8 @@ from angel_connector import AngelConnector, load_angel_credentials
 from data_store import BaseStore
 from scan_service import run_odme_scan
 from superbrain_reasoner import analyze_market, REASONER_VERSION
+from superbrain_edge_memory import read_edge_tape
+from superbrain_intelligence_history import evolve_strategic_context
 
 SUPERBRAIN_BRIDGE_VERSION = "SB_EDGE_ODME_OPTIONAL_CONTEXT_20261018"
 
@@ -277,6 +279,7 @@ def _persist_scan_memory(
     odme_live: bool,
     odme_error: str,
     open_trades: List[Dict[str, Any]],
+    edge_tape: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     """Persist current SuperBrain evidence without creating any trade opinion.
 
@@ -313,6 +316,18 @@ def _persist_scan_memory(
     }
 
     previous_compact = _load_json_object(previous.get("market_state_json", ""))
+    # The higher-TF origin persists across execution-TF handoffs. This field
+    # is descriptive only and never enters the locked rule or trade engine.
+    edge_candidates = [r for r in tv_compact if str(r.get('source') or '').upper() == 'EDGE'
+                       and str(r.get('edge_tracking_state') or '').upper() == 'ACTIVE'
+                       and str(r.get('tf') or '') == str(r.get('edge_required_exec_tf') or r.get('exec_tf') or r.get('tf') or '')]
+    if edge_candidates:
+        edge_candidates.sort(key=lambda r: float(r.get('bar_time') or 0), reverse=True)
+        evidence['strategic_context'] = evolve_strategic_context(
+            dict(edge_candidates[0], instrument=instrument), edge_tape or [],
+            previous_compact.get('strategic_context') or {})
+    else:
+        evidence['strategic_context'] = {}
     analysis = analyze_market(evidence, previous_compact, open_trades=open_trades)
     evidence["analysis"] = analysis
 
@@ -355,6 +370,7 @@ def _persist_scan_memory(
         "prior_state": prior_row or previous,
         "input_fingerprint": fingerprint,
         "analysis": analysis,
+        "strategic_context": evidence.get("strategic_context") or {},
     }
 
 
@@ -418,6 +434,13 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
             except Exception as exc:
                 odme_error = f"{type(exc).__name__}: {exc}"
 
+        # Reuse the same historical EDGE read for the market outlook. A tape
+        # outage must never block current state, campaign protection or entries.
+        try:
+            edge_tape = read_edge_tape(store, instrument)
+        except Exception:
+            edge_tape = []
+
         stage = "LOAD_MATCHED_ODME_HISTORY"
         # In EDGE-only mode, do not read ANY ODME snapshots (even stale ones).
         latest_odme = (store.load_latest_odme_for_instrument(instrument)
@@ -438,6 +461,7 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
             odme_live=odme_live,
             odme_error=odme_error,
             open_trades=open_trades,
+            edge_tape=edge_tape,
         )
 
         stage = "READ_SCAN_SETUP_SNAPSHOT"
@@ -464,6 +488,7 @@ def prepare_superbrain_scan(store: BaseStore, instrument: str) -> Dict[str, Any]
             "odme_error": odme_error,
             "open_trades": open_trades,
             "memory": memory,
+            "_sb_bias_tape": edge_tape,
             "analysis": memory.get("analysis", {}),
             "superbrain_build": SUPERBRAIN_BRIDGE_VERSION,
         }

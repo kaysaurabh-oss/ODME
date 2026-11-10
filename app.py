@@ -3785,7 +3785,7 @@ def _sb_render_cash_confirmed_campaigns(store: Any, instrument: str, packet: Dic
 
 
 def _sb_render_edge_cash_terminal(store: Any, instrument: str, packet: Dict[str, Any]) -> None:
-    """Public SuperBrain only. Never scan or display ODME in EDGE-only mode."""
+    """Public EDGE-only mode: saved ODME history can explain bias, never authorize entries."""
     ctx = _sb_authoritative_edge_context(packet)
     row = ctx.get("row") or {}
     healthy = _edge_live_ok(packet)
@@ -3915,12 +3915,15 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
                 sb_store = get_store()
                 packet['_sb_outlook_histories'] = (
                     read_optional_history(sb_store, symbol, edge_row),
-                    read_odme_snapshot_history(sb_store, symbol, edge_row,
-                        enabled=bool((packet.get('mapping') or {}).get('odme_scan_enabled'))),
+                    # Historical snapshots are display-only context even if
+                    # fresh ODME scanning is disabled for this instrument.
+                    read_odme_snapshot_history(sb_store, symbol, edge_row, enabled=True),
                 )
             opt_history, odme_history = packet['_sb_outlook_histories']
             outlook = formulate_market_outlook(
-                edge_row, tape, opt_history, odme_history, current_odme=odme
+                edge_row, tape, opt_history, odme_history, current_odme=odme,
+                strategic_context=(packet.get('memory') or {}).get('strategic_context') or {},
+                selected_expiry=str((packet.get('mapping') or {}).get('selected_expiry') or ''),
             )
         except Exception:
             outlook = None  # Never affect existing trade decisions.
