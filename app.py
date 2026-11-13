@@ -1822,6 +1822,8 @@ def _sb_compact_manual_choices(matrix: Dict[str, Any]) -> List[Dict[str, Any]]:
     A missing map rank/strike must disappear from the presentation. We never
     render a 'missing L3' choice as an entry instruction or explanatory warning.
     """
+    if str(matrix.get('status') or '').upper() != 'ENTRY READY':
+        return []
     grouped: Dict[tuple, Dict[str, Any]]={}
     for aur,choice in (matrix.get('choices') or {}).items():
         if choice.get('status')!='ENTRY READY':continue
@@ -3492,7 +3494,7 @@ def _sb_live_break_entry_gate(setup: Dict[str, Any], packet: Dict[str, Any],
     zid = str(fp.get("zoneId") or fp.get("zone_id") or "").strip()
     lo, hi = _sb_num(fp.get("low")), _sb_num(fp.get("high"))
     if not zid or lo is None or hi is None or hi < lo:
-        return {"status": "WAIT", "reason": "Stored FP zone cannot be verified; wait for a fresh EDGE-confirmed break."}
+        return {"status": "STALE", "reason": "Stored FP zone cannot be verified; wait for a fresh EDGE-confirmed break."}
     book = raw.get("fp_hurdle_book") if isinstance(raw.get("fp_hurdle_book"), dict) else {}
     candidates = [x for x in (book.get("hurdles") or []) if isinstance(x, dict)]
     # Typed fields provide a fallback when this FP is the currently selected FP.
@@ -3519,7 +3521,7 @@ def _sb_live_break_entry_gate(setup: Dict[str, Any], packet: Dict[str, Any],
                and abs(float(z.get("low")) - lo) < 1e-7
                and abs(float(z.get("high")) - hi) < 1e-7]
     if not matched:
-        return {"status": "WAIT", "reason": "Stored FP zone is not confirmed in the current EDGE map; await a fresh setup."}
+        return {"status": "STALE", "reason": "Stored FP zone is not confirmed in the current EDGE map; await a fresh setup."}
     spot, bar_ms = _sb_num(edge.get("close")), _sb_num(edge.get("bar_time"))
     tf = _sb_num(edge.get("tf"))
     for z in matched:
@@ -3541,10 +3543,225 @@ def _sb_live_break_entry_gate(setup: Dict[str, Any], packet: Dict[str, Any],
         if spot is None or (side == "DEMAND" and spot >= lo) or (side == "SUPPLY" and spot <= hi):
             continue
         return {"status": "PASS", "reason": "Same-zone FP RUN confirmed by current EDGE."}
+    # A stale confirmed RUN is historical context. Only a presently developing
+    # BREACH_TEST remains a WAIT; neither state authorizes new entry.
+    developing = any(
+        str(z.get('event_type') or '').upper() in {'BREACH_TEST', 'BREACH_PENDING'}
+        or str(z.get('context') or z.get('context_state') or '').upper() == 'BREACH_PENDING'
+        for z in matched
+    )
+    if not developing:
+        return {"status": "STALE", "reason": "FP break was previously confirmed or has expired; await a new EDGE event."}
     return {"status": "WAIT", "reason": (
         "Demand break is still pending; wait for EDGE to confirm FP RUN before SELL CE."
         if side == "DEMAND" else
         "Supply break is still pending; wait for EDGE to confirm FP RUN before SELL PE."
+    )}
+
+
+def _sb_defence_progress_after_event(side: str, lo: float, hi: float,
+                                     spot: float, event_ms: float, edge: Dict[str, Any],
+                                     raw: Dict[str, Any], packet: Dict[str, Any],
+                                     zone: Optional[Dict[str, Any]]=None) -> Dict[str, str]:
+    """Prevent a *played-out reaction* being sold as a fresh FP entry.
+
+    Uses actual current TradingView ATR or real, continuous same-TF EDGE
+    closes; and/or a subsequent observed opposite FP RUN. This is strictly
+    a new-entry relevance filter. Original zones remain strategic context.
+    Missing evidence does NOT manufacture a price-progress verdict; the
+    separate exact-zone + recent-event gate still applies.
+    """
+    favourable = spot - hi if side == 'DEMAND' else lo - spot
+    if favourable <= 0:
+        return {'status': 'PASS', 'reason': 'Price remains near the reacting zone.'}
+
+    # EDGE's own FP hurdle export provides volatility-normalized distance.
+    # Trust the Pine-computed measure when it agrees with the current price
+    # distance; never calculate a substitute for an existing TV field.
+    observed_distance = _sb_num((zone or {}).get('distance_price'))
+    distance_atr = _sb_num((zone or {}).get('distance_atr'))
+    agrees = (observed_distance is not None and observed_distance > 0 and
+              abs(observed_distance-favourable) <= max(0.25*favourable, 0.1*(hi-lo), 1e-6))
+    if agrees and distance_atr is not None and distance_atr >= 1.5:
+        return {'status': 'PLAYED_OUT', 'reason': (
+            'The current EDGE FP book places price at least 1.5 ATR beyond the original '
+            'defence; its earlier reaction is not a fresh entry opportunity.')}
+
+    # This is an independently confirmed structural advance after the defence.
+    # It is NOT a prediction that the opposite zone would have stopped price.
+    book = raw.get('fp_hurdle_book') if isinstance(raw.get('fp_hurdle_book'), dict) else {}
+    for z in (book.get('hurdles') or []):
+        if not isinstance(z, dict) or str(z.get('side') or '').upper() != (
+                'SUPPLY' if side == 'DEMAND' else 'DEMAND'):
+            continue
+        zl, zh = _sb_num(z.get('low')), _sb_num(z.get('high'))
+        if zl is None or zh is None:
+            continue
+        ztime = _sb_num(z.get('event_time') or z.get('eventTime'))
+        now_ms = _sb_num(edge.get('bar_time'))
+        if not ztime or not now_ms or not event_ms <= ztime <= now_ms:
+            continue
+        if str(z.get('status') or '').upper() != 'RUN' or (
+                str(z.get('event_type') or z.get('eventType') or '').upper() != 'RUN_CONFIRMED'):
+            continue
+        crossed = (side == 'DEMAND' and zl > hi and spot >= zh) or (
+            side == 'SUPPLY' and zh < lo and spot <= zl)
+        if crossed:
+            return {'status': 'PLAYED_OUT', 'reason': (
+                'Price already advanced through a subsequently confirmed opposing FP hurdle; '
+                'the earlier defence remains market-history context, not a new entry trigger.')}
+
+    # TradingView/Pine ATR is authoritative. Do not recompute Pine logic.
+    atr = next((v for v in (_sb_num(raw.get(k)) for k in ('exec_atr', 'fp_atr'))
+                if v is not None and v > 0), None)
+    if atr is not None and favourable >= 1.5 * atr:
+        return {'status': 'PLAYED_OUT', 'reason': (
+            'Price has already moved at least 1.5 current EDGE ATR beyond the original defence; '
+            'a fresh retest/event is required for a new entry.')}
+
+    # If the Pine ATR is absent, real saved same-TF closes can establish
+    # a conservative volatility-relative move-away. No synthetic bars,
+    # interpolation, mixed-timeframe bars or future observations.
+    if atr is None:
+        tf = _sb_num(edge.get('tf'))
+        now = _sb_num(edge.get('bar_time'))
+        if tf and now and tf > 0:
+            rows = []
+            for item in (packet.get('_sb_bias_tape') or []):
+                if not isinstance(item, dict) or item.get('synthetic_price_only'):
+                    continue
+                if _sb_num(item.get('tf')) != tf:
+                    continue
+                t, px = _sb_num(item.get('bar_ms')), _sb_num(item.get('close'))
+                if t and px is not None and 0 <= now-t <= 20*tf*60000:
+                    rows.append((t,px))
+            rows.append((now,spot))
+            rows = sorted({t:(t,p) for t,p in rows}.values())[-18:]
+            changes = [abs(b[1]-a[1]) for a,b in zip(rows,rows[1:])
+                       if 0 < b[0]-a[0] <= 1.5*tf*60000]
+            if len(changes) >= 8:
+                changes.sort()
+                median = changes[len(changes)//2]
+                if median > 0 and favourable >= 4 * median:
+                    return {'status': 'PLAYED_OUT', 'reason': (
+                        'Price has moved substantially beyond the original defence relative '
+                        'to recent observed same-TF price changes; await a fresh interaction.')}
+
+    return {'status': 'PASS', 'reason': 'The observed move-away threshold has not been reached.'}
+
+
+def _sb_live_defence_entry_gate(setup: Dict[str, Any], packet: Dict[str, Any],
+                                ctx: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """Verify that a stored FP DEFENCE is *still* an actionable EDGE event.
+
+    Level-2 SETUP rows are a historical event journal: PENDING_ENTRY can persist
+    after the market has moved many zones away. A fresh ODME scan/strike cannot
+    reactivate an obsolete defence. This is a display/new-entry freshness check,
+    never a mutation of historical setup or existing-campaign management rules.
+    """
+    md = _sb_setup_md(setup)
+    name = str(md.get('setup_name') or setup.get('strategy_type') or '').upper()
+    if name in {'SHORT_CE_AFTER_DEMAND_BREAK', 'SHORT_PE_AFTER_SUPPLY_BREAK'}:
+        return {'status': 'PASS', 'reason': ''}  # independent RUN gate below
+    fp = md.get('fp') if isinstance(md.get('fp'), dict) else {}
+    side = str(fp.get('side') or '').upper()
+    if not ((side == 'DEMAND' and name.startswith('LONG_')) or
+            (side == 'SUPPLY' and name.startswith('SHORT_'))):
+        return {'status': 'STALE', 'reason': 'Historical setup direction/FP identity is not a current defence.'}
+
+    zid = str(fp.get('zoneId') or fp.get('zone_id') or '').strip()
+    lo, hi = _sb_num(fp.get('low')), _sb_num(fp.get('high'))
+    if not zid or lo is None or hi is None or hi < lo:
+        return {'status': 'STALE', 'reason': 'Stored FP identity or bounds are incomplete.'}
+
+    ctx = ctx if ctx is not None else _sb_authoritative_edge_context(packet)
+    edge, raw = ctx.get('row') or {}, ctx.get('raw') or {}
+    spot, bar_ms, tf = (_sb_num(edge.get('close')),
+                        _sb_num(edge.get('bar_time')), _sb_num(edge.get('tf')))
+    if spot is None or bar_ms is None or tf is None or tf <= 0:
+        return {'status': 'STALE', 'reason': 'No timestamped current EDGE observation.'}
+
+    book = raw.get('fp_hurdle_book') if isinstance(raw.get('fp_hurdle_book'), dict) else {}
+    zones = [z for z in (book.get('hurdles') or []) if isinstance(z, dict)]
+    # Use the actual current EDGE book, never the historical setup's fp snapshot.
+    # Typed fields cover the selected FP when its book row is not exported.
+    for suffix, candidate_side in (('', str(edge.get('fp_side') or '').upper()),
+                                    ('d', 'DEMAND'), ('s', 'SUPPLY')):
+        prefix = f'fp_{suffix}_' if suffix else 'fp_'
+        current_id = edge.get(prefix + 'zone_id')
+        if current_id not in (None, ''):
+            zones.append({
+                'zone_id': current_id, 'side': candidate_side,
+                'low': edge.get(prefix + 'low'), 'high': edge.get(prefix + 'high'),
+                'valid': edge.get(prefix + 'valid'),
+                'status': edge.get(prefix + 'status'),
+                'context': edge.get(prefix + 'context_state'),
+                'breach_pending': edge.get(prefix + 'breach_pending'),
+                'event_type': edge.get(prefix + 'event_type'),
+                'event_time': edge.get(prefix + 'event_time'),
+                'bars_since_event': edge.get(prefix + 'bars_since_event'),
+            })
+
+    matching = [z for z in zones if
+        str(z.get('zone_id') or z.get('zoneId') or '').strip() == zid and
+        str(z.get('side') or '').upper() == side and
+        _sb_num(z.get('low')) is not None and _sb_num(z.get('high')) is not None and
+        abs(_sb_num(z.get('low'))-lo) <= 1e-7 and
+        abs(_sb_num(z.get('high'))-hi) <= 1e-7]
+    # Fail closed on contradictory RUN/breach versus defence snapshots for the
+    # same exact FP in a single current EDGE row, rather than choosing the
+    # more convenient event and presenting a false entry suggestion.
+    if any(str(z.get('status') or '').upper() == 'RUN' or
+           str(z.get('event_type') or z.get('eventType') or '').upper() in
+               {'RUN','RUN_CONFIRMED','BREACH_TEST'} or
+           _sb_boolish(z.get('breach_pending')) or
+           str(z.get('context') or z.get('context_state') or '').upper() in
+               {'BREACH_PENDING','RUN'} for z in matching):
+        return {'status': 'STALE', 'reason': 'Current EDGE reports a RUN or breach for this FP; old defence is not live.'}
+
+    for z in matching:
+        if str(z.get('zone_id') or z.get('zoneId') or '').strip() != zid:
+            continue
+        if str(z.get('side') or '').upper() != side:
+            continue
+        zl, zh = _sb_num(z.get('low')), _sb_num(z.get('high'))
+        if zl is None or zh is None or abs(zl - lo) > 1e-7 or abs(zh - hi) > 1e-7:
+            continue
+        if z.get('valid') not in (None, '') and not _sb_boolish(z.get('valid')):
+            continue
+        status = str(z.get('status') or '').upper()
+        event = str(z.get('event_type') or z.get('eventType') or '').upper()
+        context = str(z.get('context') or z.get('context_state') or '').upper()
+        if status == 'RUN' or event in {'RUN', 'RUN_CONFIRMED', 'BREACH_TEST'}:
+            continue
+        if _sb_boolish(z.get('breach_pending')) or context in {'BREACH_PENDING', 'RUN'}:
+            continue
+        if not any(word in event for word in ('DEFENCE', 'DEFENSE', 'REJECT', 'HOLD')):
+            continue
+        age = _sb_num(z.get('bars_since_event', z.get('barsSinceEvent')))
+        event_ms = _sb_num(z.get('event_time', z.get('eventTime')))
+        # Both bar count and actual event timestamp must agree; an Apps Script
+        # rewrite of a PENDING record must not renew its historic event.
+        if age is None or not 0 <= age <= 3 or event_ms is None:
+            continue
+        elapsed = bar_ms - event_ms
+        if not 0 <= elapsed <= (age + 1.5) * tf * 60000:
+            continue
+        # Defence only remains valid on the unbroken side of the actual zone.
+        # For a demand defence, price may have bounced above its high; its
+        # bounded event age (not an arbitrary price-distance rule) limits chase.
+        if side == 'DEMAND' and spot < lo:
+            continue
+        if side == 'SUPPLY' and spot > hi:
+            continue
+        stage = _sb_defence_progress_after_event(side, lo, hi, spot, event_ms, edge, raw, packet, z)
+        if stage['status'] != 'PASS':
+            return stage
+        return {'status': 'PASS', 'reason': 'Same-zone, current EDGE defence and price response verified.'}
+
+    return {'status': 'STALE', 'reason': (
+        'Stored FP defence is broken, no longer in the current EDGE book, '
+        'or its defence event has already played out.'
     )}
 
 
@@ -3557,7 +3774,10 @@ def _edge_entry_matrix_for(row: Dict[str, Any], packet: Dict[str, Any]) -> Dict[
     ctx = _sb_authoritative_edge_context(packet)
     live_break = _sb_live_break_entry_gate(row, packet, ctx)
     if live_break["status"] != "PASS":
-        return {"status": "WAIT", "reason": live_break["reason"], "choices": {}, "option_type": opt}
+        return {"status": live_break["status"], "reason": live_break["reason"], "choices": {}, "option_type": opt}
+    live_defence = _sb_live_defence_entry_gate(row, packet, ctx)
+    if live_defence["status"] != "PASS":
+        return {"status": live_defence["status"], "reason": live_defence["reason"], "choices": {}, "option_type": opt}
     if str(row.get("status") or "").upper() != "PENDING_ENTRY":
         return {"status":"WAIT","reason":"No pending EDGE entry trigger.","choices":{}}
     lm = _sb_combined_level_ladder(packet, packet.get("analysis") or {})
@@ -4233,11 +4453,17 @@ def render_public_superbrain() -> None:
         if not active_candidates:
             st.info('**WAIT — No currently eligible new entry.** Existing FP break-watches '
                     'remain observational, not entry permission.')
+        live_candidates_shown = 0
         for setup in active_candidates:
             if str(setup.get('record_id') or '') in active_setup_ids:continue
             if str(setup.get('status') or '').upper()!='PENDING_ENTRY':continue
-            md=_sb_setup_md(setup)
+            # Archived Level-2 PENDING records are not current trade ideas.
+            # In particular, do not present stale ODME AVOID cards for old FPs.
             matrix=_edge_entry_matrix_for(setup,packet)
+            if str(matrix.get('status') or '').upper() in {'STALE', 'PLAYED_OUT'}:
+                continue
+            live_candidates_shown += 1
+            md=_sb_setup_md(setup)
             ready=_sb_compact_manual_choices(matrix)
             opt=matrix.get('option_type') or _edge_option_for_setup(setup)
             fp = md.get('fp') if isinstance(md.get('fp'), dict) else {}
@@ -4272,6 +4498,9 @@ def render_public_superbrain() -> None:
                         st.warning(f"**WAIT {identity}** — {reason or 'No current EDGE defence/break confirmation or qualifying protected strike.'}")
                     else:
                         st.warning(f"**WAIT {identity}** — {reason or 'FP event is developing, but no sufficiently protected entry is established.'}")
+        if active_candidates and not live_candidates_shown:
+            st.info('**WAIT — No fresh EDGE FP defence or break qualifies for entry.** '
+                    'Older zones and completed defence reactions remain in the market story, not offered as live setups.')
     elif not active:
         st.info("**WAIT** — No new EDGE FP entry setup.")
     with st.expander("View ODME levels and full structural map",expanded=False):

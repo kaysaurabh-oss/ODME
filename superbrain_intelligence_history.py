@@ -283,8 +283,70 @@ def _outlook_fmt(price: float) -> str:
 # Persistent explanatory location, distinct from active-TF execution authority.
 # A recorded higher-TF observation establishes the origin; a memory record only
 # carries the origin forward and is rechecked against today's authoritative EDGE.
+def _higher_tf_minutes(tf: Any) -> Optional[int]:
+    """Recognize the Pine timeframes in recorded EDGE role metadata.
+
+    A historical daily/weekly origin can coexist with a 3m execution handoff.
+    Numeric values remain minutes; no inferred timeframes from macro labels.
+    """
+    s=str(tf or '').strip().upper()
+    if s in ('D','1D'):return 1440
+    if s in ('W','1W'):return 10080
+    if s in ('M','1MO'):return 43200
+    if s.endswith('H'):
+        v=_num(s[:-1]);return int(v*60) if v and v>0 else None
+    if s.endswith('M') and s[:-1].isdigit():return int(s[:-1])
+    v=_num(s)
+    return int(v) if v and v>0 else None
+
+
+def _archived_higher_tf_reference(edge: Dict[str,Any],
+                                  historical_edge_rows: List[Dict[str,Any]],
+                                  now: int, spot: float, execution_tf: float) -> Dict[str,Any]:
+    """Recover a historical HTF reference when the capped EDGE tape lost its touch.
+
+    Unlike a VERIFIED_ORIGIN, an archived EDGE zone without an observed touch
+    is explicitly reference-only. Never promote it to a live FP defence or
+    to a directional evidence vote. The original row must actually have
+    contained the zone/TF at or before the current confirmed observation.
+    """
+    inst=str(edge.get('instrument') or '').upper()
+    choices=[]
+    for row in historical_edge_rows or []:
+        if not isinstance(row,dict) or str(row.get('source') or '').upper()!='EDGE':continue
+        if str(row.get('instrument') or '').upper()!=inst:continue
+        tm=_ms(row.get('bar_time'));old_price=_num(row.get('close'))
+        if not tm or not old_price or not 0<=now-tm<=30*86400_000:continue
+        for role in ('defender','challenger'):
+            pref=role+'_'
+            tf=_higher_tf_minutes(row.get(pref+'tf'))
+            side=str(row.get(pref+'side') or '').upper()
+            lo=_num(row.get(pref+'low'));hi=_num(row.get(pref+'high'))
+            state=str(row.get(pref+'state') or '').upper()
+            if not tf or tf<60 or tf<execution_tf or side not in ('DEMAND','SUPPLY'):
+                continue
+            if lo is None or hi is None or lo<=0 or lo>hi or state in ('RUN','BROKEN','INACTIVE','NONE'):
+                continue
+            gap=max(lo-old_price,0,old_price-hi)
+            if gap/old_price>0.02:continue  # zone must be near its archived price, not a remote map level
+            # Only an actually observed favorable displacement from the earlier
+            # snapshot can qualify it as a candidate move-away reference.
+            favorable=(side=='DEMAND' and spot>=old_price and spot>hi) or (
+                side=='SUPPLY' and spot<=old_price and spot<lo)
+            if not favorable:continue
+            choices.append((tf,tm,role,side,lo,hi,old_price))
+    if not choices:return {}
+    tf,tm,role,side,lo,hi,old_price=max(choices,key=lambda x:(x[0],x[1]))
+    return {'instrument':inst,'origin_time':tm,'checked_at':now,
+            'origin_price':old_price,'side':side,'tf':tf,'low':lo,'high':hi,
+            'origin_verified':False,'status':'REFERENCE_ONLY','phase':'MOVE_AWAY',
+            'source':'ARCHIVED_EDGE_ROLE','execution_tf':int(execution_tf) if execution_tf else None,
+            'progress_pct':round(100*(spot/old_price-1),3)}
+
+
 def evolve_strategic_context(edge: Dict[str,Any], tape: List[Dict[str,Any]],
-                             previous: Optional[Dict[str,Any]]=None) -> Dict[str,Any]:
+                             previous: Optional[Dict[str,Any]]=None,
+                             historical_edge_rows: Optional[List[Dict[str,Any]]]=None) -> Dict[str,Any]:
     now=_ms(edge.get('bar_time'));spot=_num(edge.get('close'))
     if not now or spot is None or spot<=0:return {}
     inst=str(edge.get('instrument') or '').upper().strip()
@@ -293,7 +355,7 @@ def evolve_strategic_context(edge: Dict[str,Any], tape: List[Dict[str,Any]],
     roles=[]
     for role in ('defender','challenger'):
         side=str(edge.get(role+'_side') or '').upper()
-        tf=_num(edge.get(role+'_tf'))
+        tf=_higher_tf_minutes(edge.get(role+'_tf'))
         low=_num(edge.get(role+'_low'));high=_num(edge.get(role+'_high'))
         state=str(edge.get(role+'_state') or '').upper()
         if (side in ('DEMAND','SUPPLY') and tf and tf>=60 and tf>=execution_tf
@@ -333,32 +395,83 @@ def evolve_strategic_context(edge: Dict[str,Any], tape: List[Dict[str,Any]],
         tm=_ms(prior.get('origin_time'))
         lo=_num(prior.get('low'));hi=_num(prior.get('high'))
         valid_prior=bool(tm and 0<=now-tm<=21*86400_000 and lo and hi and lo<=hi)
-    # Retain an original verified higher-TF interaction while its structural
-    # reference is still recognizable. Do not reset to a 3m FP on handoff.
+    def stage(origin: Dict[str,Any], recognized: bool) -> Dict[str,Any]:
+        record=dict(origin)
+        record['checked_at']=now
+        if record.get('origin_verified') is False:
+            # A reference never becomes a verified touch simply by persistence.
+            # Keep its phase honest when price later revisits the region.
+            lo=_num(record.get('low'));hi=_num(record.get('high'))
+            role=record.get('side')
+            record['status']='REFERENCE_ONLY'
+            record['phase']=('MOVE_AWAY' if lo is not None and hi is not None and
+                ((role=='DEMAND' and spot>hi) or (role=='SUPPLY' and spot<lo))
+                else 'REFERENCE_UNDER_TEST')
+            record['execution_tf']=int(execution_tf) if execution_tf else None
+            return record
+        role=record.get('side')
+        low=_num(record.get('low'));high=_num(record.get('high'))
+        baseline=_num(record.get('origin_price'))
+        record['execution_tf']=int(execution_tf) if execution_tf else None
+        if baseline and baseline>0:
+            record['progress_pct']=round(100*(spot/baseline-1),3)
+        if low is None or high is None:return record
+        # Crossing a distal boundary CHALLENGES the original thesis; only
+        # EDGE's separately confirmed break establishes a failed zone.
+        if (role=='DEMAND' and spot<low) or (role=='SUPPLY' and spot>high):
+            record['status']='CHALLENGED'
+            record['phase']='ORIGIN_UNDER_PRESSURE'
+        elif (role=='DEMAND' and spot>high) or (role=='SUPPLY' and spot<low):
+            record['status']='RECOGNIZED' if recognized else 'MOVE_AWAY'
+            record['phase']='MOVE_AWAY'
+        else:
+            record['status']='RECOGNIZED' if recognized else 'HISTORICAL_ONLY'
+            record['phase']='ORIGIN_TEST' if recognized else 'UNVERIFIED'
+        return record
+
+    # Remember the originally VERIFIED high-TF interaction across 3m/15m
+    # handoffs; the zone may cease to appear in current EDGE while the market
+    # is still travelling from it. Do not equate move-away with fresh entry.
     if valid_prior:
+        # An independently observed NEW higher-TF reaction may replace the old
+        # origin. A single touch of a later zone is insufficient: actual time
+        # and price progress away from the newer zone must also be present.
+        new=[]
+        old_time=_ms(prior.get('origin_time')) or 0
+        for tm,role,px in candidates:
+            different=(role['side']!=prior.get('side') or
+                       abs(role['low']-float(prior['low']))/spot>0.0002 or
+                       abs(role['high']-float(prior['high']))/spot>0.0002)
+            enough_time=tm>old_time and now-tm>=max(1,execution_tf)*2*60000
+            moved=(role['side']=='DEMAND' and spot>role['high'] or
+                   role['side']=='SUPPLY' and spot<role['low'])
+            if different and enough_time and moved:new.append((tm,role,px))
+        if new:
+            tm,role,px=max(new,key=lambda x:(x[0],x[1]['tf']))
+            return stage({'instrument':inst,'origin_time':tm,'origin_price':px,
+                          'side':role['side'],'tf':role['tf'],
+                          'low':role['low'],'high':role['high'],
+                          'origin_verified':True},recognized=True)
         prev_role=next((r for r in roles if r['side']==prior.get('side') and
                         abs(r['low']-float(prior['low']))/spot<0.0002 and
                         abs(r['high']-float(prior['high']))/spot<0.0002),None)
-        if prev_role:
-            active=dict(prior)
-            active['checked_at']=now
-            active['status']=('CHALLENGED' if (spot<prev_role['low'] and prev_role['side']=='DEMAND') or
-                              (spot>prev_role['high'] and prev_role['side']=='SUPPLY') else 'RECOGNIZED')
-            return active
-    # Use the most recent verified interaction, preferring the higher TF where
-    # multiple roles are touched in the same observed window.
+        return stage(prior, recognized=bool(prev_role))
+    # Use the most recent VERIFIED interaction, preferring higher TF if same time.
     if candidates:
         tm,role,px=max(candidates,key=lambda x:(x[0],x[1]['tf']))
-        return {'instrument':inst,'origin_time':tm,'checked_at':now,
-                'origin_price':px,'side':role['side'],'tf':role['tf'],
-                'low':role['low'],'high':role['high'],'status':'RECOGNIZED'}
-    if valid_prior:
-        carried=dict(prior);carried['checked_at']=now
-        # The original event remains historical, but without an identifiable
-        # current zone it cannot assert that the zone is still defending.
-        carried['status']='HISTORICAL_ONLY'
-        return carried
-    return {}
+        return stage({'instrument':inst,'origin_time':tm,'origin_price':px,
+                      'side':role['side'],'tf':role['tf'],
+                      'low':role['low'],'high':role['high'],
+                      'origin_verified':True},recognized=True)
+    return _archived_higher_tf_reference(edge,historical_edge_rows or [],now,spot,execution_tf)
+
+
+def _strategic_tf_label(tf: float) -> str:
+    if int(tf)==1440:return 'daily'
+    if int(tf)==10080:return 'weekly'
+    if int(tf)==43200:return 'monthly'
+    if tf>=240 and int(tf)%60==0:return f'{int(tf//60)}h'
+    return f'{int(tf)}m'
 
 
 def _strategic_opening(context: Dict[str,Any], side: int, spot: float) -> str:
@@ -368,17 +481,38 @@ def _strategic_opening(context: Dict[str,Any], side: int, spot: float) -> str:
     if low is None or high is None or not tf or not spot:return ''
     role=str(context.get('side') or '').upper()
     status=str(context.get('status') or '').upper()
+    phase=str(context.get('phase') or '').upper()
     if role not in ('DEMAND','SUPPLY'):return ''
-    where=f'{int(tf)}m {role.lower()} around {_outlook_fmt(low)}–{_outlook_fmt(high)}'
+    where=f'{_strategic_tf_label(tf)} {role.lower()} around {_outlook_fmt(low)}–{_outlook_fmt(high)}'
+    # When the saved tape has rolled off, an archived EDGE role supplies a
+    # structural reference only; never upgrade it to an observed origin touch.
+    if status=='REFERENCE_ONLY':
+        if phase=='REFERENCE_UNDER_TEST':
+            return (f'Earlier EDGE history recorded higher-TF {where}; price is now '
+                    'revisiting that region. Its current reaction needs fresh EDGE evidence.')
+        return (f'Earlier EDGE history recorded higher-TF {where}; price is now '
+                f'at {_outlook_fmt(spot)}, having moved away from that region. '
+                'This is the larger structural reference, not a fresh defence entry.')
+    # Remember the strategic origin even if its specific event has completed
+    # and no longer appears in the latest execution-TF zone list.
+    if status=='MOVE_AWAY':
+        return (f'Price has progressed away from earlier verified higher-TF {where}. '
+                'That original reaction explains the larger journey but is not a fresh entry trigger.')
     if status=='HISTORICAL_ONLY':
-        return f'An earlier reaction near higher-TF {where} is part of the recorded journey; its present protection is unverified.'
+        return f'An earlier reaction near higher-TF {where} is historical context; its present protection is unverified.'
     if status=='CHALLENGED':
         return f'The prior higher-TF {where} is now under pressure; its earlier reaction is not evidence of a continuing hold.'
-    if role=='DEMAND' and side>0 and spot>=high:
-        return f'The recovery originated near higher-TF {where}; lower-TF execution tracks its progress, not a separate trend.'
-    if role=='SUPPLY' and side<0 and spot<=low:
-        return f'The decline originated near higher-TF {where}; lower-TF execution tracks its progress, not a separate trend.'
-    return f'Price remains influenced by a recorded higher-TF {where} reaction; current execution control must confirm its next leg.'
+    if phase=='MOVE_AWAY':
+        if role=='DEMAND' and side>0:
+            return (f'The recovery has progressed away from higher-TF {where}; '
+                    'current lower-TF signals track continuation, not another entry from that original defence.')
+        if role=='SUPPLY' and side<0:
+            return (f'The decline has progressed away from higher-TF {where}; '
+                    'current lower-TF signals track continuation, not another entry from that original defence.')
+        return (f'Price has moved away from the earlier higher-TF {where} reaction; '
+                'current EDGE control determines whether that larger move continues or pulls back. '
+                'That reaction is not another entry from the original defence.')
+    return f'Price is interacting with higher-TF {where}; current execution control must confirm its next leg.'
 
 
 _IST=ZoneInfo('Asia/Kolkata')

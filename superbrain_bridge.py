@@ -323,9 +323,25 @@ def _persist_scan_memory(
                        and str(r.get('tf') or '') == str(r.get('edge_required_exec_tf') or r.get('exec_tf') or r.get('tf') or '')]
     if edge_candidates:
         edge_candidates.sort(key=lambda r: float(r.get('bar_time') or 0), reverse=True)
+        # The compact memory intentionally holds only the latest EDGE row. For
+        # strategic HISTORY ONLY, inspect older timestamped EDGE rows still
+        # present in TV_TEST_CURRENT (e.g. a 60m snapshot with a daily demand
+        # origin). Never treat them as current execution authority.
+        historical_edge_rows = []
+        for historic_row in _safe_records(tv_rows):
+            if str(historic_row.get('source') or '').upper() != 'EDGE':
+                continue
+            if str(historic_row.get('instrument') or instrument).upper() != instrument:
+                continue
+            historical_edge_rows.append({k:historic_row.get(k) for k in (
+                'source','instrument','bar_time','tf','close',
+                'defender_tf','defender_side','defender_low','defender_high','defender_state',
+                'challenger_tf','challenger_side','challenger_low','challenger_high','challenger_state'
+            )})
         evidence['strategic_context'] = evolve_strategic_context(
             dict(edge_candidates[0], instrument=instrument), edge_tape or [],
-            previous_compact.get('strategic_context') or {})
+            previous_compact.get('strategic_context') or {},
+            historical_edge_rows=historical_edge_rows)
     else:
         evidence['strategic_context'] = {}
     analysis = analyze_market(evidence, previous_compact, open_trades=open_trades)
