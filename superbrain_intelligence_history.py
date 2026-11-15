@@ -339,7 +339,8 @@ def _archived_higher_tf_reference(edge: Dict[str,Any],
     tf,tm,role,side,lo,hi,old_price=max(choices,key=lambda x:(x[0],x[1]))
     return {'instrument':inst,'origin_time':tm,'checked_at':now,
             'origin_price':old_price,'side':side,'tf':tf,'low':lo,'high':hi,
-            'origin_verified':False,'status':'REFERENCE_ONLY','phase':'MOVE_AWAY',
+            'origin_verified':False,'status':'REFERENCE_ONLY',
+            'phase':('REFERENCE_ABOVE' if spot>hi else 'REFERENCE_BELOW'),
             'source':'ARCHIVED_EDGE_ROLE','execution_tf':int(execution_tf) if execution_tf else None,
             'progress_pct':round(100*(spot/old_price-1),3)}
 
@@ -404,9 +405,12 @@ def evolve_strategic_context(edge: Dict[str,Any], tape: List[Dict[str,Any]],
             lo=_num(record.get('low'));hi=_num(record.get('high'))
             role=record.get('side')
             record['status']='REFERENCE_ONLY'
-            record['phase']=('MOVE_AWAY' if lo is not None and hi is not None and
-                ((role=='DEMAND' and spot>hi) or (role=='SUPPLY' and spot<lo))
-                else 'REFERENCE_UNDER_TEST')
+            # A snapshot above demand or below supply establishes only LOCATION.
+            # It does not establish direction of travel: BTC can be falling BACK
+            # toward that demand. No historical touch is inferred here.
+            record['phase']=('REFERENCE_ABOVE' if lo is not None and hi is not None and spot>hi
+                             else 'REFERENCE_BELOW' if lo is not None and hi is not None and spot<lo
+                             else 'REFERENCE_UNDER_TEST')
             record['execution_tf']=int(execution_tf) if execution_tf else None
             return record
         role=record.get('side')
@@ -490,9 +494,9 @@ def _strategic_opening(context: Dict[str,Any], side: int, spot: float) -> str:
         if phase=='REFERENCE_UNDER_TEST':
             return (f'Earlier EDGE history recorded higher-TF {where}; price is now '
                     'revisiting that region. Its current reaction needs fresh EDGE evidence.')
-        return (f'Earlier EDGE history recorded higher-TF {where}; price is now '
-                f'at {_outlook_fmt(spot)}, having moved away from that region. '
-                'This is the larger structural reference, not a fresh defence entry.')
+        return (f'Earlier EDGE history recorded higher-TF {where}. Price is '
+                f'currently {_outlook_fmt(spot)}; this is a structural reference, '
+                'not a verified original reaction and not a fresh defence entry.')
     # Remember the strategic origin even if its specific event has completed
     # and no longer appears in the latest execution-TF zone list.
     if status=='MOVE_AWAY':
@@ -673,7 +677,8 @@ def _outlook_journey(edge: Dict[str,Any], tape: List[Dict[str,Any]]) -> Dict[str
     return {'spot':spot,'now':now,'tf':tf,'real_count':len(contiguous),
             'duration_hours':duration_hours,'drift':drift,'width':width,
             'match':match,'dir':current_side,'recent_high':up,'recent_low':down,
-            'recent_count':len(recent),'all_closes':ordered[-600:]}
+            'recent_count':len(recent),'recent_closes':recent,
+            'all_closes':ordered[-600:]}
 
 
 def _outlook_optional(optional: List[Dict[str,Any]], edge_ms: int) -> Dict[str,Any]:
@@ -794,6 +799,68 @@ def _outlook_levels(edge: Dict[str,Any], journey: Dict[str,Any], odme: Dict[str,
     return {'lower':lowers[0] if lowers else None,'upper':uppers[0] if uppers else None,
             'below_next':lowers[1] if len(lowers)>1 else None,
             'above_next':uppers[1] if len(uppers)>1 else None}
+
+
+def _outlook_higher_tf_destination(edge: Dict[str,Any],
+                                   journey: Dict[str,Any], side: int) -> Dict[str,Any]:
+    """Find the next CURRENT EDGE higher-TF zone in the observed direction.
+
+    DISPLAY ONLY. A zone is a route destination, not a predicted reversal or
+    an entry trigger. Direction must come from a contiguous sequence of real
+    closes; the mere fact that spot is above demand cannot mean MOVE_AWAY.
+    Historical ARCHIVED_EDGE_ROLE references are not used as live destinations.
+    """
+    if not side:return {}
+    spot=_num(journey.get('spot'))
+    tf=_num(journey.get('tf'))
+    rows=journey.get('recent_closes') or []
+    drift=_num(journey.get('drift'))
+    width=_num(journey.get('width'))
+    duration=_num(journey.get('duration_hours')) or 0
+    if (not spot or not tf or len(rows)<4 or drift is None or width is None
+            or duration<0.5 or side*drift<max(0.20,0.25*width)):
+        return {}
+    starting_price=rows[0][1]
+    candidates=[]
+    for role in ('defender','challenger'):
+        side_of_zone=str(edge.get(role+'_side') or '').upper()
+        role_tf=_higher_tf_minutes(edge.get(role+'_tf'))
+        lo=_num(edge.get(role+'_low'));hi=_num(edge.get(role+'_high'))
+        state=str(edge.get(role+'_state') or '').upper()
+        if (not role_tf or role_tf<max(60,2*tf) or not lo or not hi or lo>hi or
+            state in ('','NONE','RUN','BROKEN','INACTIVE','INVALID')):
+            continue
+        if side<0 and side_of_zone=='DEMAND' and spot>=lo:
+            gap=max(0,spot-hi)
+            start_gap=max(0,starting_price-hi)
+        elif side>0 and side_of_zone=='SUPPLY' and spot<=hi:
+            gap=max(0,lo-spot)
+            start_gap=max(0,lo-starting_price)
+        else:
+            continue
+        # Genuine distance reduction must be observed, not inferred from which
+        # side of the line price happens to be on. Require reasonable proximity
+        # for a *nearby* destination-aware outlook, not an entry veto.
+        if (gap/spot>0.035 or
+                start_gap-gap<max(0.001*spot,0.07*abs(starting_price-spot))):
+            continue
+        state_name=('TESTING' if lo<=spot<=hi else 'APPROACHING')
+        zone_flow=0
+        field={15:'of_15',60:'of_60',125:'of_125',240:'of_240'}.get(role_tf)
+        if field:zone_flow=_outlook_side(edge.get(field))
+        if not zone_flow:
+            raw=_json_obj(edge.get('raw_json'))
+            for item in raw.get('edge_router_map') or []:
+                if isinstance(item,dict) and _higher_tf_minutes(item.get('tf'))==role_tf:
+                    zone_flow=_outlook_side(item.get('of_state'))
+                    break
+        candidates.append({'side':side_of_zone,'tf':role_tf,'low':lo,'high':hi,
+                           'gap':gap,'gap_pct':100*gap/spot,'phase':state_name,
+                           'flow':zone_flow,'source':'CURRENT_ACTIVE_EDGE_ROLE',
+                           'role':role,'state':state})
+    if not candidates:return {}
+    # Prefer the closest prospective barrier. Higher TF wins a near-tie.
+    return min(candidates,key=lambda x:(round(x['gap']/spot,4),-x['tf']))
 
 
 def _outlook_historical_check(journey: Dict[str,Any], side: int) -> Dict[str,Any]:
@@ -941,6 +1008,11 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
     if (story.get('status')=='CHALLENGED' and story.get('side')=='DEMAND' and side>0) or (
             story.get('status')=='CHALLENGED' and story.get('side')=='SUPPLY' and side<0):
         quality='LOW'
+    # This assessment is purely explanatory; it does not enter any gate, strike
+    # selection, Renko logic or campaign management.
+    destination=_outlook_higher_tf_destination(edge,j,side)
+    if destination and quality=='HIGH':
+        quality='MODERATE'  # confidence in *approach* is not proof of a break
     side_name='BULLISH' if side>0 else 'BEARISH' if side<0 else 'RANGE'
     label=f'{side_name} {kind}' if side else kind
     if story.get('status')=='RECOGNIZED' and side>0 and story.get('side')=='DEMAND':
@@ -953,6 +1025,11 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
         label='BULLISH REBOUND / HIGHER-TF SUPPLY UNDER TEST'
     elif story.get('status')=='RECOGNIZED' and not side:
         label='PAUSE NEAR HIGHER-TF CONTEXT'
+    if destination:
+        target_name='DEMAND' if side<0 else 'SUPPLY'
+        label=(f'{side_name} APPROACH TO HIGHER-TF {target_name}'
+               if destination['phase']=='APPROACHING'
+               else f'{side_name} TESTING HIGHER-TF {target_name}')
     # Main expected path, followed by only a meaningful conditional alternative.
     if side<0:
         first=(f'Sellers are making downside progress ({drift:+.2f}% in {j["duration_hours"]:.1f} observed hours).'
@@ -975,16 +1052,66 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
     # The opening carries the strategic origin and ODME developing picture,
     # while the familiar Most likely / risk / Renko statements stay unchanged.
     origin=_strategic_opening(story,side,j['spot'])
-    if origin:first=origin+' '+first
+    if destination:
+        zone=f'{_strategic_tf_label(destination["tf"])} {destination["side"].lower()} at '
+        zone+=f'{_outlook_fmt(destination["low"])}–{_outlook_fmt(destination["high"])}'
+        action='Sellers' if side<0 else 'Buyers'
+        flow_desc=('; higher-TF order flow still supports buyers' if side<0 else
+                   '; higher-TF order flow still supports sellers')
+        caveat=flow_desc if destination.get('flow')==-side else ''
+        if destination['phase']=='APPROACHING':
+            first=f'{action} retain near-term control, but price is approaching active {zone}{caveat}.'
+        else:
+            first=f'{action} retain near-term control as price tests active {zone}{caveat}.'
+        # A zone which explains the old journey can coexist with a *different*
+        # current destination, but repeating both makes the primary instruction
+        # unclear. Give the current destination priority in this display.
+        if o.get('liq_sequence_side')==side and o.get('liq_sequence'):
+            first+=' '+o['liq_sequence']
+        if o.get('liq')=='SELL_FULL_SWEEP' and side<0 and o.get('liq_level') and j['spot']>o['liq_level']:
+            first+=' A recent downside liquidity sweep was reclaimed, but a higher-TF reversal is not confirmed.'
+        elif o.get('liq')=='BUY_FULL_SWEEP' and side>0 and o.get('liq_level') and j['spot']<o['liq_level']:
+            first+=' A recent upside liquidity sweep reversed, but a higher-TF reversal is not confirmed.'
+    else:
+        if origin:first=origin+' '+first
+        if (side and o.get('liq_sequence_side')==side and o.get('liq_sequence')):
+            first+=' '+o['liq_sequence']
+        if side and o.get('aurora_asymmetry')==-side:
+            first+=' Candle AURORA indicates a sharper opposing path; follow-through needs confirmation.'
     if evolution.get('text'):first+=' '+evolution['text']
-    if (side and o.get('liq_sequence_side')==side and o.get('liq_sequence')):
-        first+=' '+o['liq_sequence']
-    if side and o.get('aurora_asymmetry')==-side:
-        first+=' Candle AURORA indicates a sharper opposing path; follow-through needs confirmation.'
     main=''
     alternate=''
     down=levels.get('lower');up=levels.get('upper')
-    if side<0:
+    if destination:
+        zone=f'{_strategic_tf_label(destination["tf"])} {destination["side"].lower()}'
+        boundaries=f'{_outlook_fmt(destination["low"])}–{_outlook_fmt(destination["high"])}'
+        if side<0:
+            if destination['phase']=='APPROACHING':
+                main=(f'**Most likely:** Selling may continue toward {zone} ({boundaries}). '
+                      'Avoid chasing fresh shorts into this higher-TF zone; wait for a verified '
+                      'defence or accepted break. If already short, review profit protection '
+                      'under the existing campaign rules.')
+            else:
+                main=(f'**Most likely:** The market is testing {zone} ({boundaries}). '
+                      'Do not assume either a bounce or a breakdown; wait for confirmed '
+                      'defence or accepted break. If already short, review profit protection '
+                      'under the existing campaign rules.')
+            alternate=(f'**Rebound risk:** A confirmed defence of {zone} could interrupt '
+                       'the current decline.')
+        else:
+            if destination['phase']=='APPROACHING':
+                main=(f'**Most likely:** Buying may extend toward {zone} ({boundaries}). '
+                      'Avoid chasing fresh longs into this higher-TF zone; wait for a verified '
+                      'rejection or accepted break. If already long, review profit protection '
+                      'under the existing campaign rules.')
+            else:
+                main=(f'**Most likely:** The market is testing {zone} ({boundaries}). '
+                      'Do not assume either rejection or breakout; wait for confirmed '
+                      'rejection or accepted break. If already long, review profit protection '
+                      'under the existing campaign rules.')
+            alternate=(f'**Pullback risk:** A confirmed rejection at {zone} could interrupt '
+                       'the current advance.')
+    elif side<0:
         if down:
             main=f'**Most likely:** Weakness remains favoured while below {_outlook_fmt(up[0]) if up else _outlook_fmt(j["spot"])}. A sustained break below **{_outlook_fmt(down[0])}** would strengthen downside continuation.'
             if levels.get('below_next'):main+=f' Next reference: {_outlook_fmt(levels["below_next"][0])}.'
@@ -1017,5 +1144,6 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
             'lower_level':down[0] if down else None,'upper_level':up[0] if up else None,
             'sample_size':j.get('real_count',0),
             'history_pattern':_outlook_historical_check(j,side),
-            'strategic_context':story,'odme_evolution':evolution,
+            'strategic_context':story,'higher_tf_destination':destination,
+            'odme_evolution':evolution,
             'trade_authority':'EDGE_ENTRY_AND_FRESH_ODME_ONLY'}
