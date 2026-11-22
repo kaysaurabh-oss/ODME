@@ -1147,3 +1147,443 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
             'strategic_context':story,'higher_tf_destination':destination,
             'odme_evolution':evolution,
             'trade_authority':'EDGE_ENTRY_AND_FRESH_ODME_ONLY'}
+
+
+# -----------------------------------------------------------------------------
+# MARKET JOURNEY RENKO PREFERENCE v20261122
+# DISPLAY ONLY. No imports into EDGE policy, options, campaigns or order paths.
+# The four-hour outlook above is retained as a diagnostic/backward-compatible
+# formatter. Its direction is NEVER authoritative for this preference decision.
+# -----------------------------------------------------------------------------
+_legacy_formulate_market_outlook = formulate_market_outlook
+
+
+def _mj_observed_closes(edge: Dict[str,Any], tape: List[Dict[str,Any]]) -> List[tuple]:
+    """Only confirmed, actual closes on the selected EDGE execution timeframe."""
+    now=_ms(edge.get('bar_time'))
+    tf=str(edge.get('tf') or '')
+    symbol=str(edge.get('instrument') or '').upper()
+    if not now or not tf:return []
+    rows={}
+    for r in tape or []:
+        if not isinstance(r,dict) or r.get('synthetic_price_only'):continue
+        if str(r.get('instrument') or symbol).upper()!=symbol or str(r.get('tf') or '')!=tf:continue
+        t=_ms(r.get('bar_ms'));px=_num(r.get('close'))
+        if t and px and px>0 and t<=now:rows[t]=(t,px,_outlook_side(r.get('exec_of')))
+    spot=_num(edge.get('close'))
+    if spot and spot>0:rows[now]=(now,spot,_outlook_side(edge.get('exec_of')))
+    return [rows[k] for k in sorted(rows)][-650:]
+
+
+def _mj_recent_contiguous(rows: List[tuple], tf: float) -> List[tuple]:
+    if not rows:return []
+    permitted=max(3*tf*60_000,15*60_000)
+    out=[rows[-1]]
+    for r in reversed(rows[:-1]):
+        if out[0][0]-r[0]>permitted:break
+        out.insert(0,r)
+    return out
+
+
+def _mj_aurora_phases(optional: List[Dict[str,Any]], now: int, tf: float) -> Dict[str,Any]:
+    """Compare real RED/PINK and GREEN/YELLOW campaigns, not last color alone.
+
+    No imaginary internal AURORA momentum. Price effectiveness is calculated
+    from as-of matched AURORA close observations; color is Pine-owned.
+    """
+    obs=[]
+    for r in optional or []:
+        if str(r.get('source') or '').upper()!='AURORA':continue
+        if str(r.get('tf') or '')!=str(int(tf)) and str(r.get('tf') or '')!=str(tf):continue
+        t=_ms(r.get('confirmed_close_ms'));p=_num(r.get('price'))
+        color=str(r.get('state') or '').upper()
+        if not t or not p or not now-4*86400_000<=t<=now or color not in ('RED','PINK','GREEN','YELLOW','WHITE'):continue
+        direction=-1 if color in ('RED','PINK') else 1 if color in ('GREEN','YELLOW') else 0
+        obs.append((t,p,direction,color))
+    obs=sorted({r[0]:r for r in obs}.values())
+    if not obs or now-obs[-1][0]>max(2*tf*60_000,90*60_000):return {'side':0,'relation':'UNAVAILABLE'}
+    phases=[]
+    for t,p,d,color in obs:
+        phase=phases[-1] if phases else None
+        if not phase or d!=phase['dir'] or t-phase['end']>max(3*tf*60_000,45*60_000):
+            phases.append({'dir':d,'start':t,'end':t,'first':p,'last':p,'low':p,'high':p,'n':1,'color':color})
+        else:
+            phase['end']=t;phase['last']=p;phase['n']+=1;phase['low']=min(phase['low'],p);phase['high']=max(phase['high'],p);phase['color']=color
+    # A one-candle color flicker must not erase a meaningful prior phase.
+    meaningful=[x for x in phases if x['n']>=3 and x['dir']!=0]
+    bears=[x for x in meaningful if x['dir']==-1]
+    bulls=[x for x in meaningful if x['dir']==1]
+    last=obs[-1]
+    result={'side':last[2],'state':last[3],'relation':'NEUTRAL','bear_weakening':False,'bull_weakening':False,
+            'bull_progress':False,'bear_progress':False,'as_of':last[0]}
+    if len(bears)>=2:
+        old,new=bears[-2:]
+        # Higher price low with smaller relative downside achievement despite
+        # another sustained RED/PINK phase is non-confirmation, not RSI divergence.
+        old_m=max(0,old['first']-old['low'])/old['first']
+        new_m=max(0,new['first']-new['low'])/new['first']
+        result['bear_weakening']=bool(new['low']>old['low'] and new_m<old_m*0.90)
+    if len(bulls)>=2:
+        old,new=bulls[-2:]
+        old_m=max(0,old['high']-old['first'])/old['first']
+        new_m=max(0,new['high']-new['first'])/new['first']
+        result['bull_weakening']=bool(new['high']<old['high'] and new_m<old_m*0.90)
+    if bulls:
+        x=bulls[-1];result['bull_progress']=bool(x['last']>x['first'] and (x['last']-x['first'])/x['first']>=0.0015)
+    if bears:
+        x=bears[-1];result['bear_progress']=bool(x['last']<x['first'] and (x['first']-x['last'])/x['first']>=0.0015)
+    if result['side']>0 and (result['bull_progress'] or result['bear_weakening']):result['relation']='SUPPORTS_LONG'
+    elif result['side']<0 and (result['bear_progress'] or result['bull_weakening']):result['relation']='SUPPORTS_SHORT'
+    elif result['side']>0 and result['bull_weakening']:result['relation']='OPPOSES_LONG'
+    elif result['side']<0 and result['bear_weakening']:result['relation']='OPPOSES_SHORT'
+    return result
+
+
+def _mj_liquidity_sequence(optional: List[Dict[str,Any]], now: int, spot: float, tf: float,
+                           closes: List[tuple]) -> Dict[str,Any]:
+    """Distinct source events with subsequent PRICE acceptance, not event counts."""
+    source=[]
+    for r in optional or []:
+        if str(r.get('source') or '').upper()!='LIQUIDITY':continue
+        if str(r.get('tf') or '')!=str(int(tf)) and str(r.get('tf') or '')!=str(tf):continue
+        tm=_ms(r.get('confirmed_close_ms'))
+        if tm and now-24*3600_000<=tm<=now:source.append((tm,r))
+    if not source or now-max(t for t,_ in source)>max(2*tf*60_000,90*60_000):return {'direction':0,'latest':'','accepted_buy':0,'accepted_sell':0}
+    events={}
+    for observed_at,r in source:
+        ctx=r.get('context') or _json_obj(r.get('context_json'))
+        for event in ctx.get('recent_events') or []:
+            if not isinstance(event,dict):continue
+            typ=str(event.get('type') or '').upper()
+            at=_ms(event.get('at_ms'))
+            level=_num(event.get('level'))
+            if typ not in ('BUY_FULL_RUN','SELL_FULL_RUN','BUY_FULL_SWEEP','SELL_FULL_SWEEP') or not at or not level:continue
+            if not now-12*3600_000<=at<=now or at>observed_at:continue
+            # Multiple snapshots of the same liquidity event count ONCE.
+            key=(typ,at,round(level,8))
+            events[key]={'type':typ,'at':at,'level':level}
+    sorted_events=sorted(events.values(),key=lambda x:(x['at'],x['level']))
+    if not sorted_events:return {'direction':0,'latest':'','accepted_buy':0,'accepted_sell':0}
+    # Minimum two observed recent closes on the accepted side of each level.
+    confirmed=[p for _,p,_ in closes[-4:]]
+    buy=set();sell=set()
+    for e in sorted_events:
+        if len(confirmed)<2:continue
+        if e['type']=='BUY_FULL_RUN' and all(p>e['level'] for p in confirmed[-2:]):
+            buy.add(e['at'])
+        if e['type']=='SELL_FULL_RUN' and all(p<e['level'] for p in confirmed[-2:]):
+            sell.add(e['at'])
+    b=len(buy);s=len(sell)
+    latest=sorted_events[-1]
+    # A recent upside sweep that has not been reclaimed is resistance, not proof
+    # of a new downtrend; symmetric interpretation for a downside sweep.
+    buy_rejected=latest['type']=='BUY_FULL_SWEEP' and spot<latest['level']
+    sell_reclaimed=latest['type']=='SELL_FULL_SWEEP' and spot>latest['level']
+    direction=1 if b>s and b>0 else -1 if s>b and s>0 else 0
+    return {'direction':direction,'accepted_buy':b,'accepted_sell':s,
+            'latest':latest['type'],'latest_level':latest['level'],
+            'buy_sweep_rejected':buy_rejected,'sell_sweep_reclaimed':sell_reclaimed}
+
+
+def _mj_last_fp(edge: Dict[str,Any], tape: List[Dict[str,Any]], now: int, tf: float,
+                closes: List[tuple]) -> Dict[str,Any]:
+    """Source event identity and age; no stale FP becomes a fresh entry."""
+    events={}
+    for r in list(tape or [])+[dict(edge,bar_ms=edge.get('bar_time'))]:
+        if not isinstance(r,dict) or r.get('synthetic_price_only'):continue
+        if str(r.get('instrument') or '').upper()!=str(edge.get('instrument') or '').upper():continue
+        typ=str(r.get('fp_event_type') or '').upper()
+        side=str(r.get('fp_side') or '').upper()
+        event_ms=_ms(r.get('fp_event_time'))
+        lo=_num(r.get('fp_low'));hi=_num(r.get('fp_high'))
+        if not event_ms or not 0<=now-event_ms<=14*86400_000 or not lo or not hi or not typ or side not in ('DEMAND','SUPPLY'):continue
+        key=(str(r.get('fp_zone_id') or ''),side,typ,event_ms)
+        events[key]={'at':event_ms,'side':side,'type':typ,'low':lo,'high':hi,'zone_id':str(r.get('fp_zone_id') or '')}
+    if not events:return {}
+    item=max(events.values(),key=lambda e:e['at'])
+    item['fresh']=now-item['at']<=max(3*tf*60_000,15*60_000)
+    # Confirm via actual closes only, never interpolated prices or old flags.
+    latest=[p for t,p,_ in closes[-3:] if t>=item['at']]
+    item['up_accept']=len(latest)>=2 and all(p>item['high'] for p in latest[-2:])
+    item['down_accept']=len(latest)>=2 and all(p<item['low'] for p in latest[-2:])
+    return item
+
+
+def _mj_structural_context(edge: Dict[str,Any], context: Dict[str,Any],
+                           now: int, spot: float, closes: List[tuple]) -> Dict[str,Any]:
+    """Real verified HTF origin. Selected Defender alone is never a touch."""
+    c=context if isinstance(context,dict) else {}
+    side=str(c.get('side') or '').upper()
+    lo=_num(c.get('low'));hi=_num(c.get('high'));origin=_ms(c.get('origin_time'))
+    valid=bool(c.get('origin_verified') is True and side in ('DEMAND','SUPPLY')
+               and origin and 0<=now-origin<=21*86400_000 and lo and hi and lo<hi
+               and str(c.get('status') or '').upper() in ('RECOGNIZED','MOVE_AWAY'))
+    # A real observed reaction (current close beyond the zone, corroborated by
+    # the earlier recorded touch) is stronger than mere location.
+    recovery=valid and side=='DEMAND' and spot>hi and spot>_num(c.get('origin_price') or 0)
+    decline=valid and side=='SUPPLY' and spot<lo and spot<_num(c.get('origin_price') or float('inf'))
+    dem=tf_d=None
+    touching_demand=False
+    touching_supply=False
+    for role in ('defender','challenger'):
+        rs=str(edge.get(role+'_side') or '').upper()
+        low=_num(edge.get(role+'_low'));high=_num(edge.get(role+'_high'))
+        if not low or not high or low>=high:continue
+        st=str(edge.get(role+'_state') or '').upper()
+        if st in ('RUN','BROKEN','INACTIVE','INVALID','NONE'):continue
+        if rs=='DEMAND' and spot>=low*0.995 and spot<=high*1.035:
+            touching_demand=True
+            if spot>=high:dem=max(dem or 0,high)
+        if rs=='SUPPLY' and spot>=low*0.965 and spot<=high*1.005:
+            touching_supply=True
+            if spot<=low:tf_d=min(tf_d or float('inf'),low)
+    near_demand=touching_demand or bool(dem and spot>=dem and spot/dem-1<0.035)
+    near_supply=touching_supply or bool(tf_d and tf_d>=spot and tf_d/spot-1<0.035)
+    return {'recovery':bool(recovery),'decline':bool(decline),'near_demand':near_demand,
+            'near_supply':near_supply,'origin_side':side,'origin_tf':c.get('tf'),
+            'origin_high':hi,'origin_low':lo,'origin':origin if valid else None,
+            'origin_valid':valid}
+
+
+def _mj_counter_zone_contact(edge: Dict[str,Any], context: Dict[str,Any], spot: float) -> bool:
+    """Current live FP counter-zone touch; never resurrect a historical zone."""
+    if not context.get('recovery') and not context.get('decline'):return False
+    opposite='SUPPLY' if context.get('recovery') else 'DEMAND'
+    raw=_json_obj(edge.get('raw_json'))
+    book=raw.get('fp_hurdle_book') or {}
+    candidates=list(book.get('hurdles') or []) if isinstance(book,dict) else []
+    if str(edge.get('fp_side') or '').upper()==opposite:
+        candidates.append({'side':edge.get('fp_side'), 'low':edge.get('fp_low'),
+                           'high':edge.get('fp_high'), 'status':edge.get('fp_status'),
+                           'valid':edge.get('fp_valid'), 'tf':edge.get('tf')})
+    parent_tf=_higher_tf_minutes(context.get('origin_tf')) or 10080
+    for zone in candidates:
+        if not isinstance(zone,dict):continue
+        if str(zone.get('side') or '').upper()!=opposite:continue
+        state=str(zone.get('status') or '').upper()
+        if state in ('RUN','BROKEN','INVALID','INACTIVE','NONE'):continue
+        if zone.get('valid') is False or str(zone.get('valid')).lower()=='false':continue
+        ztf=_higher_tf_minutes(zone.get('tf')) or _higher_tf_minutes(edge.get('tf')) or 15
+        if ztf>=parent_tf:continue
+        low=_num(zone.get('low'));high=_num(zone.get('high'))
+        if not low or not high or low>high:continue
+        gap=max(low-spot,0,spot-high)
+        if gap/max(spot,1)<=0.004 and (low<=spot<=high or gap/max(spot,1)<=0.004):return True
+    return False
+
+
+def _mj_direction(edge: Dict[str,Any], tape: List[Dict[str,Any]],
+                  optional: List[Dict[str,Any]], context: Dict[str,Any],
+                  current_odme: Optional[Dict[str,Any]]) -> Dict[str,Any]:
+    """Branch-gated directional *preference*, separate from trade authorization.
+
+    Event location -> expected/actual -> price/OF -> optional corroboration ->
+    route. Missing optional evidence stays neutral, never a veto.
+    """
+    now=_ms(edge.get('bar_time'));tf=_num(edge.get('tf'))
+    spot=_num(edge.get('close'));symbol=str(edge.get('instrument') or '')
+    if not now or not tf or not spot or spot<=0:return {'side':0,'reason':'Current EDGE state is unavailable.','confidence':'LOW'}
+    seq=_mj_observed_closes(edge,tape)
+    recent=_mj_recent_contiguous(seq,tf)
+    flow=_outlook_side(edge.get('exec_of'))
+    context_state=_mj_structural_context(edge,context,now,spot,seq)
+    fp=_mj_last_fp(edge,tape,now,tf,recent)
+    aura=_mj_aurora_phases(optional,now,tf)
+    liq=_mj_liquidity_sequence(optional,now,spot,tf,recent)
+    odme_side=_outlook_side((current_odme or {}).get('direction')) if isinstance(current_odme,dict) else 0
+    history_ok=len(recent)>=6 and recent[-1][0]-recent[0][0]>=3*tf*60_000
+    # The observed path is judged in adaptive episodes, not a fixed four-hour
+    # percentage movement; old cases cannot be silently reused after a gap.
+    prior=recent[-min(17,len(recent)):] if history_ok else []
+    start=prior[0][1] if prior else spot
+    up=bool(prior and spot>start and spot>min(p for _,p,_ in prior)+0.002*spot)
+    down=bool(prior and spot<start and spot<max(p for _,p,_ in prior)-0.002*spot)
+    # Last meaningful accepted FP break or failed break is stronger than color.
+    failed_demand_break=bool(fp.get('type')=='RUN_CONFIRMED' and fp.get('side')=='DEMAND' and fp.get('up_accept'))
+    failed_supply_break=bool(fp.get('type')=='RUN_CONFIRMED' and fp.get('side')=='SUPPLY' and fp.get('down_accept'))
+    long_break=bool(fp.get('fresh') and fp.get('side')=='SUPPLY' and fp.get('type')=='RUN_CONFIRMED' and fp.get('up_accept'))
+    short_break=bool(fp.get('fresh') and fp.get('side')=='DEMAND' and fp.get('type')=='RUN_CONFIRMED' and fp.get('down_accept'))
+    long_defence=bool(fp.get('fresh') and fp.get('side')=='DEMAND' and fp.get('type')=='DEFENCE_CONFIRMED' and up and spot>fp.get('high',float('inf')))
+    short_defence=bool(fp.get('fresh') and fp.get('side')=='SUPPLY' and fp.get('type')=='DEFENCE_CONFIRMED' and down and spot<fp.get('low',0))
+    # Current confirmed response is essential; an earlier zone hold or optional
+    # color alone never grants a directional preference.
+    long_struct=context_state['recovery'] or long_break or long_defence or failed_demand_break
+    short_struct=context_state['decline'] or short_break or short_defence or failed_supply_break
+    bull=bool(up or long_break or long_defence or failed_demand_break or
+              (context_state['recovery'] and len(recent)>=2 and all(p>context_state['origin_high'] for _,p,_ in recent[-2:])))
+    bear=bool(down or short_break or short_defence or failed_supply_break or
+              (context_state['decline'] and len(recent)>=2 and all(p<context_state['origin_low'] for _,p,_ in recent[-2:])))
+    # Active HTF recovery protects its direction: lower-TF supply alone must NOT
+    # automatically trigger shorts. Only confirmed structural rejection can.
+    protect_long=bool(context_state['recovery'] or context_state['near_demand'])
+    protect_short=bool(context_state['decline'] or context_state['near_supply'])
+    confirmed_short=bool(short_break or short_defence or
+                         (short_struct and down and liq['accepted_sell']>=1 and not protect_long))
+    confirmed_long=bool(long_break or long_defence or
+                        (long_struct and up and liq['accepted_buy']>=1 and not protect_short))
+    if protect_long and not confirmed_short:short_struct=False
+    if protect_short and not confirmed_long:long_struct=False
+    if not history_ok and not (long_break or short_break or long_defence or short_defence):
+        return {'side':0,'reason':'Wait for confirmed EDGE price behaviour.','confidence':'LOW',
+                'context':context_state,'aurora':aura,'liquidity':liq,'fp':fp}
+    def aur_side(s):return 1 if aura.get('relation')=='SUPPORTS_LONG' and s==1 else -1 if aura.get('relation')=='SUPPORTS_SHORT' and s==-1 else 0
+    long_support=(1 if long_struct else 0)+(1 if bull else 0)+(1 if liq.get('accepted_buy') else 0)+(1 if aur_side(1) else 0)+(1 if odme_side>0 else 0)
+    short_support=(1 if short_struct else 0)+(1 if bear else 0)+(1 if liq.get('accepted_sell') else 0)+(1 if aur_side(-1) else 0)+(1 if odme_side<0 else 0)
+    # Opposing active HTF location outweighs a lower-TF OF number or AURORA
+    # color. The protected opposite branch must earn confirmed rejection.
+    long_eligible=long_struct and bull and long_support>=2
+    short_eligible=short_struct and bear and short_support>=2
+    if protect_long and not confirmed_short:short_eligible=False
+    if protect_short and not confirmed_long:long_eligible=False
+    if short_defence and down and short_eligible:
+        # A freshly confirmed supply rejection is a new structural event, not
+        # the old demand rebound's countertrend OF reading.
+        long_eligible=False
+    if long_defence and up and long_eligible:
+        short_eligible=False
+    if long_eligible and short_eligible:
+        # In ambiguity, do not choose by a few correlated votes.
+        side=0
+    elif long_eligible:side=1
+    elif short_eligible:side=-1
+    elif not long_struct and not short_struct:
+        # EDGE-only continuing trends away from strategic conflict may still
+        # yield useful preference without optional feeds. Require real progress
+        # and aligned persistent execution OF, not the last four-hour drift.
+        if not protect_long and not protect_short and flow>0 and up and len(prior)>=8 and odme_side>=0:side=1
+        elif not protect_long and not protect_short and flow<0 and down and len(prior)>=8 and odme_side<=0:side=-1
+        else:side=0
+    else:side=0
+    # Adverse fresh ODME context reduces confidence but does not overwrite EDGE
+    # trading authority; existing short-option gates remain separate.
+    confidence='MODERATE' if side else 'LOW'
+    if side and ((side==1 and (liq['accepted_buy'] or aura.get('relation')=='SUPPORTS_LONG')) or
+                 (side==-1 and (liq['accepted_sell'] or aura.get('relation')=='SUPPORTS_SHORT'))):
+        confidence='MODERATE'  # Optional evidence does not manufacture HIGH confidence.
+    if side and odme_side and odme_side==-side:confidence='LOW'
+    context_side=1 if context_state['recovery'] else -1 if context_state['decline'] else 0
+    if side>0:
+        reason=('Higher-timeframe demand recovery is holding.' if context_side==1 else
+                'A confirmed demand defence or supply break supports the upside.' if long_struct else
+                'EDGE price progress and order flow favour the upside.')
+        if liq['accepted_buy']:reason+=' Accepted buy-side liquidity runs support continuation.'
+        if aura.get('relation')=='SUPPORTS_LONG':reason+=' Candle AURORA supports the upward view.'
+        elif aura.get('relation')=='OPPOSES_LONG':reason+=' Candle AURORA remains mixed.'
+        if liq.get('buy_sweep_rejected'):reason+=' Recent upside liquidity rejection calls for a fresh Renko entry.'
+    elif side<0:
+        reason=('Higher-timeframe supply rejection is holding.' if context_side==-1 else
+                'A confirmed supply defence or demand break supports downside.' if short_struct else
+                'EDGE price progress and order flow favour downside.')
+        if liq['accepted_sell']:reason+=' Accepted sell-side liquidity runs support continuation.'
+        if aura.get('relation')=='SUPPORTS_SHORT':reason+=' Candle AURORA supports the downward view.'
+        elif aura.get('relation')=='OPPOSES_SHORT':reason+=' Candle AURORA remains mixed.'
+    elif protect_long:
+        reason='Avoid fresh shorts against higher-timeframe demand recovery. Bullish entry evidence is not yet sufficient.'
+    elif protect_short:
+        reason='Avoid fresh longs against higher-timeframe supply rejection. Bearish entry evidence is not yet sufficient.'
+    else:reason='Neither direction has enough confirmed price and structural support.'
+    counter_zone=_mj_counter_zone_contact(edge,context_state,spot)
+    return {'side':side,'reason':reason,'confidence':confidence,'context':context_state,'aurora':aura,
+            'counter_zone_contact':counter_zone,
+            'liquidity':liq,'fp':fp,'protect_long':protect_long,'protect_short':protect_short,
+            'price_up':up,'price_down':down,'flow':flow,'long_evidence':long_support,
+            'short_evidence':short_support,'confirmed_short':confirmed_short,'confirmed_long':confirmed_long,
+            'odme_side':odme_side}
+
+
+def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]],
+                             optional_history: List[Dict[str,Any]],
+                             odme_history: List[Dict[str,Any]],
+                             current_odme: Optional[Dict[str,Any]]=None,
+                             strategic_context: Optional[Dict[str,Any]]=None,
+                             selected_expiry: str='') -> Dict[str,Any]:
+    """Event-led, location-aware RENKO preference; exact existing screen layout.
+
+    A preferred Renko direction is NOT an executable trade. Existing manual
+    Renko, ODME, strike, FP and campaign gates are completely unchanged.
+    """
+    base=_legacy_formulate_market_outlook(edge,edge_tape,optional_history,odme_history,
+                current_odme=current_odme,strategic_context=strategic_context,
+                selected_expiry=selected_expiry)
+    if base.get('label')=='UNAVAILABLE':return base
+    j=_outlook_journey(edge,edge_tape)
+    spot=_num(edge.get('close'))
+    if not spot:return base
+    decision=_mj_direction(edge,edge_tape,optional_history,strategic_context or {},current_odme)
+    side=decision['side'];context=decision.get('context') or {}
+    # Preserve existing structural label taxonomy, while eliminating the
+    # four-hour-only bias flip as a source of directional authority.
+    dest=(_outlook_higher_tf_destination(edge,j,side) if side else
+          (base.get('higher_tf_destination') or {}))
+    if side>0:
+        label='BULLISH RECOVERY DEVELOPING' if context.get('recovery') else 'BULLISH CONTINUATION'
+    elif side<0:
+        label='BEARISH DECLINE DEVELOPING' if context.get('decline') else 'BEARISH CONTINUATION'
+    else:
+        label=('PAUSE NEAR HIGHER-TF '+str(dest.get('side')) if dest else
+               'PAUSE NEAR HIGHER-TF CONTEXT' if context.get('near_demand') or context.get('near_supply') or context.get('recovery') or context.get('decline')
+               else 'RANGE / CONSOLIDATION')
+    # Keep the earlier highly useful destination label, but only when that
+    # destination is real and current; don't turn it into an entry preference.
+    if dest and side:
+        zone='DEMAND' if side<0 else 'SUPPLY'
+        label=f'{"BEARISH" if side<0 else "BULLISH"} {"APPROACH TO" if dest.get("phase")=="APPROACHING" else "TESTING"} HIGHER-TF {zone}'
+    levels=_outlook_levels(edge,j,_outlook_odme(current_odme,[],j['now']))
+    down=levels.get('lower');up=levels.get('upper')
+    origin=_strategic_opening(strategic_context or {},side,spot)
+    first=origin or decision['reason']
+    # Keep narrative concise and the exact familiar sections. Where origin
+    # exists add only the decision's short explanation, avoiding duplicate prose.
+    if origin and decision['reason'] and not (side==0 and 'Avoid fresh' in decision['reason']):
+        first+=' '+decision['reason']
+    if side>0:
+        if up:
+            main=(f'**Most likely:** Further upside is favoured while above '
+                  f'{_outlook_fmt(down[0]) if down else _outlook_fmt(spot)}. '
+                  f'A sustained reclaim above **{_outlook_fmt(up[0])}** would strengthen the rebound.')
+            if levels.get('above_next'):main+=f' Next reference: {_outlook_fmt(levels["above_next"][0])}.'
+        else:main='**Most likely:** Upside remains favoured, but no reliable nearby breakout level is available.'
+        risk=f'**Downside risk:** Losing **{_outlook_fmt(down[0])}** would challenge the rebound.' if down else '**Downside risk:** A confirmed reversal of the recovered structure would challenge the upside.'
+        renko='**Renko AURORA:** Prefer bullish Renko. Use a fresh Renko entry and stop.'
+        if decision.get('liquidity',{}).get('buy_sweep_rejected'):
+            renko='**Renko AURORA:** Prefer bullish Renko on a fresh pullback; do not chase the rejected upside sweep.'
+        if context.get('recovery') and decision.get('counter_zone_contact'):
+            renko+=' Lower-timeframe supply may give way; shorts need confirmed rejection.'
+    elif side<0:
+        if down:
+            main=(f'**Most likely:** Further downside is favoured while below '
+                  f'{_outlook_fmt(up[0]) if up else _outlook_fmt(spot)}. '
+                  f'A sustained break below **{_outlook_fmt(down[0])}** would strengthen the decline.')
+            if levels.get('below_next'):main+=f' Next reference: {_outlook_fmt(levels["below_next"][0])}.'
+        else:main='**Most likely:** Downside remains favoured, but no reliable nearby break level is available.'
+        risk=f'**Rebound risk:** Reclaiming **{_outlook_fmt(up[0])}** would challenge the decline.' if up else '**Rebound risk:** A confirmed bullish recovery would challenge the downside.'
+        renko='**Renko AURORA:** Prefer bearish Renko. Use a fresh Renko entry and stop.'
+        if context.get('decline') and decision.get('counter_zone_contact'):
+            renko+=' Lower-timeframe demand may give way; longs need confirmed defence.'
+    else:
+        if down and up:
+            main=(f'**Most likely:** Price needs confirmation beyond **{_outlook_fmt(down[0])}–{_outlook_fmt(up[0])}** '
+                  'before a directional opportunity is preferred.')
+        else:main='**Most likely:** Wait for confirmed structural progress before selecting a direction.'
+        if context.get('recovery') or context.get('near_demand'):
+            risk='**Downside risk:** A confirmed failure of higher-timeframe demand would restore the bearish case.'
+        elif context.get('decline') or context.get('near_supply'):
+            risk='**Rebound risk:** A confirmed reclaim of higher-timeframe supply would restore the bullish case.'
+        else:risk='**Risk:** Both directions remain unresolved.'
+        renko='**Renko AURORA:** No trade preferred. Await a fresh qualified Renko setup.'
+    if dest:
+        zone=f'{_strategic_tf_label(dest["tf"])} {dest["side"].lower()} {_outlook_fmt(dest["low"])}–{_outlook_fmt(dest["high"])}'
+        if side<0 or (side==0 and dest['side']=='DEMAND'):
+            main=f'**Most likely:** Price is {"approaching" if dest["phase"]=="APPROACHING" else "testing"} {zone}. Avoid chasing fresh shorts into higher-timeframe demand.'
+            renko='**Renko AURORA:** No trade preferred near higher-timeframe demand. Wait for a confirmed defence or break.'
+        else:
+            main=f'**Most likely:** Price is {"approaching" if dest["phase"]=="APPROACHING" else "testing"} {zone}. Avoid chasing fresh longs into higher-timeframe supply.'
+            renko='**Renko AURORA:** No trade preferred near higher-timeframe supply. Wait for a confirmed rejection or break.'
+        if dest['phase']=='TESTING' and side==0:main+=' Do not assume either a bounce or a breakdown.'
+    base.update({'label':label,'commentary':'\n\n'.join([first,main,risk,renko]),
+                 'evidence_quality':decision['confidence'],'side':side,
+                 'scenario':'JOURNEY_PREFERENCE','higher_tf_destination':dest,
+                 'renko_preference':'BULLISH' if side>0 and not dest else 'BEARISH' if side<0 and not dest else 'WAIT',
+                 'journey_evidence':decision,
+                 'trade_authority':'EDGE_ENTRY_AND_FRESH_ODME_ONLY'})
+    return base

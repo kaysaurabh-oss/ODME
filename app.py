@@ -4153,7 +4153,11 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
         st.info(f"**MARKET CLOSED — LAST RECORDED SESSION** · {last_at}. "
                 "Bias is historical; no new entry or automatic campaign action until fresh EDGE data arrives after reopening.")
     if outlook and outlook.get('label') != 'UNAVAILABLE':
-        st.markdown(f"**SuperBrain Bias: {outlook['label']}** · "
+        # Exact existing headline layout; append the price of this confirmed
+        # EDGE observation, never a previous saved scan or live option quote.
+        edge_price = _sb_num(edge_row.get('close'))
+        price_text = (f" · {symbol} {_fmt_num(edge_price, decimals=2)}" if edge_price is not None and symbol else "")
+        st.markdown(f"**SuperBrain Bias: {outlook['label']}{price_text}** · "
                     f"{str(outlook.get('evidence_quality') or 'LOW').title()} evidence agreement")
         st.markdown(str(outlook.get('commentary') or ''))
     else:
