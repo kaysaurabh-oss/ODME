@@ -41,7 +41,8 @@ def jsondict(v: Any) -> Dict[str, Any]:
         return {}
 
 
-def read_edge_tape(store: Any, instrument: str, max_rows: int=9000) -> List[Dict[str, Any]]:
+def read_edge_tape(store: Any, instrument: str, max_rows: int=9000,
+                   include_fp_journey: bool=False) -> List[Dict[str, Any]]:
     """Bounded read, fail silent if local-only or tab isn't ready.
 
     The Sheet is provisioned separately; NEVER create or rewrite it from the app.
@@ -54,17 +55,45 @@ def read_edge_tape(store: Any, instrument: str, max_rows: int=9000) -> List[Dict
         cols=34
         headers=ws.row_values(1)[:cols]
         if len(headers)!=cols or headers[0]!='captured_at' or headers[2]!='bar_ms':return []
-        # AH contains large JSON FP-hurdle lists; journey reasoning does not
-        # use it. Reading A:AG substantially reduces payload and scan latency.
+        # AH holds potentially large FP hurdle JSON. Do not load an entire
+        # shared 9000-row sheet including AH; read it selectively below.
         values=ws.get(f'A{start}:AG{last}')
         wanted=str(instrument or '').strip().upper()
-        rows=[]
-        for row in values:
+        paired=[]
+        for i,row in enumerate(values):
             if len(row)>2 and str(row[1]).strip().upper()==wanted:
-                d={headers[i]:row[i] if i<len(row) else '' for i in range(cols)}
-                if num(d.get('bar_ms')) is not None and num(d.get('close')) is not None:rows.append(d)
-        rows.sort(key=lambda r:num(r.get('bar_ms')) or 0)
-        return rows[-650:]
+                d={headers[j]:row[j] if j<len(row) else '' for j in range(cols)}
+                if num(d.get('bar_ms')) is not None and num(d.get('close')) is not None:
+                    paired.append((start+i,d))
+        paired.sort(key=lambda x:num(x[1].get('bar_ms')) or 0)
+        paired=paired[-650:]
+        if include_fp_journey and paired and hasattr(ws,'batch_get'):
+            # Small bounded set of archived event snapshots: distinct selected
+            # FP event transitions, plus periodic source-hurdle checkpoints.
+            # Preserves older non-selected FP events as observed, NOT inferred.
+            # Failure never removes the original A:AG tape or affects gates.
+            try:
+                picks=[];prev_event=None;prev_window=None
+                for idx,(sheet_row,d) in enumerate(paired):
+                    event=(str(d.get('fp_zone_id') or ''),str(d.get('fp_side') or ''),
+                           str(d.get('fp_event_type') or ''),str(d.get('fp_event_time') or ''))
+                    tm=num(d.get('bar_ms')) or 0
+                    window=int(tm//(6*3600_000)) if tm else None
+                    if event!=prev_event and event[2] and event[3]:
+                        picks.append((idx,sheet_row))
+                    if window!=prev_window:
+                        picks.append((idx,sheet_row))
+                    prev_event=event;prev_window=window
+                picks.extend((idx,paired[idx][0]) for idx in range(max(0,len(paired)-3),len(paired)))
+                chosen=sorted({row:(idx,row) for idx,row in picks}.values())[-48:]
+                cells=ws.batch_get([f'AH{row}:AH{row}' for _,row in chosen])
+                if len(cells)==len(chosen):
+                    for (idx,_),v in zip(chosen,cells):
+                        if v and v[0] and isinstance(v[0][0],str):
+                            paired[idx][1]['fp_hurdles_json']=v[0][0]
+            except Exception:
+                pass
+        return [d for _,d in paired]
     except Exception:
         return []
 

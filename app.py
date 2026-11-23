@@ -4116,7 +4116,7 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
                 str(edge_row.get('edge_tracking_state') or '').upper() == 'ACTIVE' and
                 _sb_tf_key(edge_row.get('tf')) == _sb_tf_key(edge_row.get('edge_required_exec_tf') or edge_row.get('exec_tf')))
     if (healthy or historic) and '_sb_bias_tape' not in packet:
-        packet['_sb_bias_tape'] = read_edge_tape(get_store(), symbol)
+        packet['_sb_bias_tape'] = read_edge_tape(get_store(), symbol, include_fp_journey=True)
     tape = packet.get('_sb_bias_tape') or [] if (healthy or historic) else []
     # Legacy result is preserved for the rest of SuperBrain, especially existing
     # cash campaign descriptions. The new outlook must not rewrite it.

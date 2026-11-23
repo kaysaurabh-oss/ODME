@@ -1491,6 +1491,304 @@ def _mj_direction(edge: Dict[str,Any], tape: List[Dict[str,Any]],
             'odme_side':odme_side}
 
 
+
+# -----------------------------------------------------------------------------
+# FP EVENT JOURNEY v20261123 — display-only, source-verified event sequencing.
+# An FP event is an execution structure. Challenger/Defender is strategic
+# location. Do not replace either authority with a price/ATR-distance vote.
+# -----------------------------------------------------------------------------
+def _mj_fp_sequence(edge: Dict[str,Any], tape: List[Dict[str,Any]],
+                    strategic: Dict[str,Any]) -> Dict[str,Any]:
+    """Remember distinct, source-confirmed FP holds/breaks since an origin.
+
+    Selected FP and currently emitted FP hurdle events are observable; an FP
+    absent from the tape is UNKNOWN, never inferred to have broken or held.
+    Multiple tape snapshots of one source event count once. All evidence is
+    as-of the confirmed EDGE candle, on the same actual execution timeframe.
+    """
+    now=_ms(edge.get('bar_time')) or 0
+    tf=str(edge.get('tf') or '')
+    symbol=str(edge.get('instrument') or '').upper()
+    origin_at=_ms(strategic.get('origin') or strategic.get('origin_time')) if strategic.get('origin_valid') else None
+    floor=max(now-14*86400_000, origin_at or 0)
+    found={}
+    def take(z:Dict[str,Any], recorded_at:int, fields:bool=False):
+        typ=str(z.get('event_type') if not fields else z.get('fp_event_type') or '').upper()
+        if typ not in ('DEFENCE_CONFIRMED','RUN_CONFIRMED'):return
+        side=str(z.get('side') if not fields else z.get('fp_side') or '').upper()
+        zone=str(z.get('zone_id') if not fields else z.get('fp_zone_id') or '').strip()
+        at=_ms(z.get('event_time') if not fields else z.get('fp_event_time'))
+        low=_num(z.get('low') if not fields else z.get('fp_low'))
+        high=_num(z.get('high') if not fields else z.get('fp_high'))
+        if not at or at<floor or at>recorded_at or at>now or not zone or side not in ('DEMAND','SUPPLY'):
+            return
+        if low is None or high is None or low>high:return
+        # Confirmed SUPPLY break and DEMAND defence favour higher prices.
+        direction=(1 if (side=='SUPPLY') == (typ=='RUN_CONFIRMED') else -1)
+        kind='BREAK' if typ=='RUN_CONFIRMED' else 'HOLD'
+        key=(side,zone,typ,at)
+        found[key]={'at':at,'zone_id':zone,'side':side,'type':typ,
+                    'kind':kind,'direction':direction,'low':low,'high':high}
+    records=list(tape or [])+[dict(edge,bar_ms=edge.get('bar_time'))]
+    for r in records:
+        if not isinstance(r,dict) or r.get('synthetic_price_only'):continue
+        if str(r.get('instrument') or '').upper()!=symbol or str(r.get('tf') or '')!=tf:continue
+        seen=_ms(r.get('bar_ms'))
+        if not seen or seen>now or seen<floor:continue
+        take(r,seen,True)
+        raw=_json_obj(r.get('raw_json'))
+        hurdle=r.get('fp_hurdles_json') or raw.get('fp_hurdle_book')
+        if isinstance(hurdle,str):
+            try:hurdle=json.loads(hurdle)
+            except (ValueError,TypeError):hurdle={}
+        # Archived AH is a JSON *array*; current raw EDGE payload is a book.
+        emitted=(hurdle if isinstance(hurdle,list) else
+                 hurdle.get('hurdles') if isinstance(hurdle,dict) else [])
+        for z in emitted or []:
+            if isinstance(z,dict):take(z,seen)
+    # Reduce repeated observations and status revisions to the latest event
+    # per zone, without losing the chronological outcomes of different zones.
+    byzone={}
+    for e in sorted(found.values(),key=lambda x:(x['at'],x['zone_id'],x['type'])):
+        byzone[(e['side'],e['zone_id'])]=e
+    ordered=sorted(byzone.values(),key=lambda x:(x['at'],x['zone_id']))
+    recent=ordered[-12:]
+    pos=sum(e['direction']>0 for e in recent)
+    neg=sum(e['direction']<0 for e in recent)
+    latest=recent[-1] if recent else None
+    cutoff=now-max(3*(_num(tf) or 15)*60_000,15*60_000)
+    fresh=bool(latest and latest['at']>=cutoff)
+    spot=_num(edge.get('close'))
+    # An old confirmed hold/break is a fact, but may no longer be *respected*.
+    # The source event remains in history; the live preference cannot blindly
+    # reuse it after present price has moved through its opposite boundary.
+    latest_failed=False
+    if latest and spot is not None:
+        if latest['kind']=='HOLD':
+            latest_failed=(spot>latest['high'] if latest['side']=='SUPPLY'
+                           else spot<latest['low'])
+        else:
+            latest_failed=(spot<latest['low'] if latest['side']=='SUPPLY'
+                           else spot>latest['high'])
+    # A confirmed HOLD may remain valid past its event candle only when
+    # observed, continuous same-TF closes have respected its far boundary.
+    # Never silently reactivate a hold after an intervening confirmed breach.
+    respected=False
+    if latest and latest['kind']=='HOLD':
+        observations=_mj_recent_contiguous(_mj_observed_closes(edge,tape),_num(tf) or 15)
+        after=[(t,px) for t,px,_ in observations if t>=latest['at']]
+        if len(after)>=2:
+            if latest['side']=='SUPPLY':
+                respected=(all(px<=latest['high'] for _,px in after)
+                           and all(px<latest['low'] for _,px in after[-2:]))
+            else:
+                respected=(all(px>=latest['low'] for _,px in after)
+                           and all(px>latest['high'] for _,px in after[-2:]))
+    # 'Reversal' needs multiple distinct opposing FP results; one defence is
+    # a reaction, not proof that the origin's entire journey has reversed.
+    tail=recent[-3:]
+    opposite_persistent=(len(tail)>=2 and tail[-1]['direction']==tail[-2]['direction']
+                         and tail[-1]['zone_id']!=tail[-2]['zone_id']
+                         and any(e['kind']=='BREAK' for e in tail[-2:]))
+    return {'events':recent,'latest':latest,'fresh':fresh,'hold_still_respected':respected,
+            'latest_failed':latest_failed,'bull_events':pos,
+            'bear_events':neg,'opposite_persistent':opposite_persistent,
+            'history_available':bool(ordered),'since_origin':bool(origin_at),
+            'coverage':'SELECTED_AND_EMITTED_FP_ONLY'}
+
+
+def _mj_fp_route(edge: Dict[str,Any], structural: Dict[str,Any], side:int) -> Dict[str,Any]:
+    """FP barriers vs same-side strategic Challenger/Defender, never vs exec TF.
+
+    No ATR, traveled-percent or false count of unrecorded zones. Current live
+    FP hurdle book can be truncated; output is deliberately an observed count.
+    """
+    spot=_num(edge.get('close')) or 0
+    if not spot or side==0:return {}
+    opposing='SUPPLY' if side>0 else 'DEMAND'
+    roles=[]
+    for role in ('defender','challenger'):
+        if str(edge.get(role+'_side') or '').upper()!=opposing:continue
+        lo=_num(edge.get(role+'_low'));hi=_num(edge.get(role+'_high'))
+        tf=_higher_tf_minutes(edge.get(role+'_tf'))
+        status=str(edge.get(role+'_state') or '').upper()
+        if lo is None or hi is None or lo>=hi or not tf or status in ('RUN','BROKEN','INACTIVE','INVALID','NONE'):continue
+        if side>0 and hi<spot or side<0 and lo>spot:continue
+        gap=max(0,lo-spot) if side>0 else max(0,spot-hi)
+        roles.append({'role':role,'tf':tf,'side':opposing,'low':lo,'high':hi,'gap':gap})
+    opponent=min(roles,key=lambda x:(x['gap'],-x['tf'])) if roles else None
+    origin_tf=_higher_tf_minutes(structural.get('origin_tf')) if structural.get('origin_valid') else None
+    relative=('STRONGER_OR_EQUAL' if opponent and origin_tf and opponent['tf']>=origin_tf else
+              'LOWER_THAN_ORIGIN' if opponent and origin_tf else 'UNVERIFIED')
+    raw=_json_obj(edge.get('raw_json'))
+    book=_json_obj(raw.get('fp_hurdle_book'))
+    zones=[];seen=set()
+    for z in book.get('hurdles') or []:
+        if not isinstance(z,dict) or str(z.get('side') or '').upper()!=opposing:continue
+        if str(z.get('status') or '').upper() in ('RUN','BROKEN','INACTIVE','INVALID','NONE'):continue
+        if str(z.get('event_type') or '').upper()=='RUN_CONFIRMED':continue
+        if z.get('valid') is False or str(z.get('valid') or '').lower()=='false':continue
+        lo=_num(z.get('low'));hi=_num(z.get('high'))
+        if lo is None or hi is None or lo>=hi:continue
+        key=str(z.get('zone_id') or '') or f'{lo}:{hi}'
+        if key in seen:continue
+        seen.add(key)
+        if side>0 and hi<spot or side<0 and lo>spot:continue
+        if opponent and ((side>0 and lo>opponent['high']) or (side<0 and hi<opponent['low'])):continue
+        gap=max(0,lo-spot) if side>0 else max(0,spot-hi)
+        if opponent:
+            distance_to_anchor=max(0,opponent['low']-hi,lo-opponent['high'])
+            anchor_width=opponent['high']-opponent['low']
+            near_anchor=distance_to_anchor<=max(2*anchor_width,opponent['gap']*0.20)
+        else:near_anchor=False
+        zones.append({'zone_id':key,'low':lo,'high':hi,'gap':gap,
+                      'near_structural_opposition':near_anchor,
+                      'touching':lo<=spot<=hi})
+    zones.sort(key=lambda z:z['gap'])
+    # Overlapping zones form one obstacle, though their individual IDs remain
+    # available for the event ledger and diagnostics.
+    clusters=[]
+    for z in sorted(zones,key=lambda x:x['low']):
+        if not clusters or z['low']>clusters[-1][1]:clusters.append([z['low'],z['high']])
+        else:clusters[-1][1]=max(clusters[-1][1],z['high'])
+    return {'opposing_zone':opponent,'relative_tf':relative,'origin_tf':origin_tf,
+            'observed_fp_zones':len(zones),'observed_fp_barriers':len(clusters),
+            'near_anchor':any(z['near_structural_opposition'] for z in zones),
+            'touching_fp':any(z['touching'] for z in zones),
+            'truncated':bool(book.get('supply_truncated') if side>0 else book.get('demand_truncated')),
+            'zones':zones[:8]}
+
+
+
+def _mj_origin_relative_destination(edge: Dict[str,Any], decision: Dict[str,Any]) -> Dict[str,Any]:
+    """Opposing strategic zone relative to verified origin, NOT execution TF.
+
+    Only a genuine moving-away journey may receive the origin advantage.
+    Location/proximity is geometry, not evidence of a hold or break.
+    """
+    context=decision.get('context') or {}
+    if not context.get('origin_valid') or not (context.get('recovery') or context.get('decline')):
+        return {}
+    # During a tactical reaction the verified origin belongs to the *other*
+    # direction; do not pretend it is the source of the tactical move.
+    if decision.get('tactical_reaction') or decision.get('structural_reversal'):
+        return {}
+    if decision.get('side')!=(1 if context.get('recovery') else -1):return {}
+    route=decision.get('fp_route') or {}
+    z=route.get('opposing_zone')
+    if not z:return {}
+    spot=_num(edge.get('close'))
+    if not spot:return {}
+    directional_gap=(max(0,z['low']-spot) if decision['side']>0
+                     else max(0,spot-z['high']))
+    high=_num(context.get('origin_high'));low=_num(context.get('origin_low'))
+    if high is None or low is None:return {}
+    origin_to_opposition=(abs(z['low']-high) if decision['side']>0
+                          else abs(low-z['high']))
+    # Last part of the structural route, not a percent move from an arbitrary
+    # four-hour anchor. No label near a remote structural level.
+    if directional_gap>0.25*max(origin_to_opposition,1) and not z['low']<=spot<=z['high']:
+        return {}
+    return dict(z,phase='TESTING' if z['low']<=spot<=z['high'] else 'APPROACHING',
+                relative_to_origin=route.get('relative_tf'),
+                origin_tf=route.get('origin_tf'),
+                source='STRUCTURAL_ORIGIN_RELATIVE')
+
+def _mj_event_direction(edge: Dict[str,Any], tape: List[Dict[str,Any]],
+                        optional: List[Dict[str,Any]], context: Dict[str,Any],
+                        current_odme: Optional[Dict[str,Any]]) -> Dict[str,Any]:
+    """Source-FP sequence is primary; old price drift is only an EDGE-only fallback.
+
+    A confirmed opposing HOLD can support a *tactical* Renko preference even
+    when the larger verified origin still controls. No automatic stop/target
+    modification and no trading gate changes occur in this display-only layer.
+    """
+    base=_mj_direction(edge,tape,optional,context,current_odme)
+    now=_ms(edge.get('bar_time')) or 0
+    spot=_num(edge.get('close')) or 0
+    structure=_mj_structural_context(edge,context,now,spot,_mj_observed_closes(edge,tape))
+    seq=_mj_fp_sequence(edge,tape,structure)
+    active_origin=(1 if structure.get('recovery') else -1 if structure.get('decline') else 0)
+    last=seq.get('latest')
+    route=_mj_fp_route(edge,structure,active_origin if active_origin else (base.get('side') or 0))
+    result=dict(base,fp_sequence=seq,fp_route=route,active_origin_side=active_origin,
+                tactical_reaction=False,verified_fp_reaction=False,structural_reversal=False)
+    if not last:
+        # No fabricated FP successes; keep EDGE-only/ODME preference usable.
+        return result
+    fp_side=last['direction']
+    fresh=seq['fresh']
+    if seq.get('latest_failed'):
+        # The recorded event is preserved, but it cannot confer present
+        # control after price has rejected its expected outcome.
+        result.update(verified_fp_reaction=False,fp_outcome_failed=True,
+                      confidence='LOW')
+        if active_origin and fp_side==-active_origin:
+            result.update(side=active_origin,
+                          reason=('The opposing FP response has failed. The verified structural origin remains the reference.'))
+        else:
+            result.update(side=0,
+                          reason=('The last supporting FP hold or break has failed. Await a new confirmed FP event.'))
+        return result
+    # A newly confirmed opposite FP hold is a tradeable reaction, not a claim
+    # that a Weekly/Daily origin stopped controlling the full campaign.
+    if (active_origin and fp_side==-active_origin and last['kind']=='HOLD'
+            and not seq['opposite_persistent'] and (fresh or seq['hold_still_respected'])):
+        result.update(side=fp_side,tactical_reaction=True,verified_fp_reaction=True,
+                      reason=('FP Supply defence is confirmed during the larger Demand recovery.'
+                              if fp_side<0 else 'FP Demand defence is confirmed during the larger Supply decline.'),
+                      confidence='LOW')
+        return result
+    # Persistent adverse confirmed FP events, including a break, show the
+    # origin's control is being challenged. Source-confirmed, not inferred.
+    if active_origin and fp_side==-active_origin and seq['opposite_persistent']:
+        result.update(side=fp_side,structural_reversal=True,
+                      verified_fp_reaction=True,confidence='MODERATE',
+                      reason=('Confirmed FP defences and breaks now favour downside.' if fp_side<0
+                              else 'Confirmed FP defences and breaks now favour upside.'))
+        return result
+    # A fresh opposite FP break alone is consequential but does not erase the
+    # strategic origin until further confirmed sequence evidence develops.
+    if active_origin and fp_side==-active_origin and last['kind']=='BREAK':
+        result.update(side=active_origin,confidence='LOW',verified_fp_reaction=True,
+                      reason=('Demand recovery remains the structural reference, but a newer FP Demand has broken.'
+                              if active_origin>0 else 'Supply decline remains the structural reference, but a newer FP Supply has broken.'),
+                      counter_fp_break=True)
+        return result
+    if active_origin and (fp_side==active_origin or not seq['opposite_persistent']):
+        # Maintain control across temporary color/OF swings; don't require a
+        # fixed-price move from the origin or count every FP event equally.
+        result.update(side=active_origin,verified_fp_reaction=True,
+                      confidence='MODERATE' if fp_side==active_origin else 'LOW',
+                      reason=(('FP Supply breaks and holding Demand support the recovery.'
+                               if fp_side==active_origin else
+                               'Demand recovery remains constructive, but a prior FP Supply defence warrants caution.')
+                              if active_origin>0 else
+                              ('FP Demand breaks and holding Supply support the decline.'
+                               if fp_side==active_origin else
+                               'Supply-led decline remains constructive, but a prior FP Demand defence warrants caution.')))
+        return result
+    # Without a verified structural origin, the latest source-confirmed FP
+    # interaction still offers directional information, but not HTF authority.
+    if (fresh or seq['hold_still_respected']) and last['kind']=='HOLD':
+        result.update(side=fp_side,verified_fp_reaction=True,tactical_reaction=True,
+                      confidence='LOW',
+                      reason=('FP Supply defence is confirmed. The bearish reaction may be temporary.'
+                              if fp_side<0 else 'FP Demand defence is confirmed. The bullish reaction may be temporary.'))
+        return result
+    if fresh and last['kind']=='BREAK':
+        result.update(side=fp_side,verified_fp_reaction=True,confidence='MODERATE',
+                      reason=('Confirmed FP Supply break favours further upside.'
+                              if fp_side>0 else 'Confirmed FP Demand break favours further downside.'))
+        return result
+    # When recent independent FP events agree, retain the direction across
+    # subsequent scans even when the selected FP disappears from the live map.
+    if seq['opposite_persistent']:
+        result.update(side=fp_side,verified_fp_reaction=True,confidence='MODERATE',
+                      reason=('Confirmed FP Supply breaks and Demand holds support upside.' if fp_side>0
+                              else 'Confirmed FP Demand breaks and Supply holds support downside.'))
+    return result
+
 def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]],
                              optional_history: List[Dict[str,Any]],
                              odme_history: List[Dict[str,Any]],
@@ -1509,12 +1807,17 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
     j=_outlook_journey(edge,edge_tape)
     spot=_num(edge.get('close'))
     if not spot:return base
-    decision=_mj_direction(edge,edge_tape,optional_history,strategic_context or {},current_odme)
+    decision=_mj_event_direction(edge,edge_tape,optional_history,strategic_context or {},current_odme)
     side=decision['side'];context=decision.get('context') or {}
     # Preserve existing structural label taxonomy, while eliminating the
     # four-hour-only bias flip as a source of directional authority.
-    dest=(_outlook_higher_tf_destination(edge,j,side) if side else
-          (base.get('higher_tf_destination') or {}))
+    # Verified origin: compare *source* Challenger/Defender timeframes and
+    # location. Unverified origin: preserve the established destination warning.
+    if context.get('origin_valid'):
+        dest=_mj_origin_relative_destination(edge,decision)
+    else:
+        dest=(_outlook_higher_tf_destination(edge,j,side) if side else
+              (base.get('higher_tf_destination') or {}))
     if side>0:
         label='BULLISH RECOVERY DEVELOPING' if context.get('recovery') else 'BULLISH CONTINUATION'
     elif side<0:
@@ -1523,15 +1826,34 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
         label=('PAUSE NEAR HIGHER-TF '+str(dest.get('side')) if dest else
                'PAUSE NEAR HIGHER-TF CONTEXT' if context.get('near_demand') or context.get('near_supply') or context.get('recovery') or context.get('decline')
                else 'RANGE / CONSOLIDATION')
+    if decision.get('tactical_reaction'):
+        label=('BEARISH REACTION AT SUPPLY' if side<0 else 'BULLISH REACTION AT DEMAND')
     # Keep the earlier highly useful destination label, but only when that
     # destination is real and current; don't turn it into an entry preference.
-    if dest and side:
+    if dest and side and not decision.get('verified_fp_reaction') and not context.get('origin_valid'):
         zone='DEMAND' if side<0 else 'SUPPLY'
         label=f'{"BEARISH" if side<0 else "BULLISH"} {"APPROACH TO" if dest.get("phase")=="APPROACHING" else "TESTING"} HIGHER-TF {zone}'
     levels=_outlook_levels(edge,j,_outlook_odme(current_odme,[],j['now']))
     down=levels.get('lower');up=levels.get('upper')
     origin=_strategic_opening(strategic_context or {},side,spot)
+    # A short reaction inside an intact bullish journey is not a new bearish
+    # higher-TF origin. Avoid describing it as one.
+    if decision.get('tactical_reaction') or decision.get('structural_reversal'):
+        origin=''
     first=origin or decision['reason']
+    # Optional Candle AURORA / liquidity evidence may explain a preference but
+    # never overrides source-confirmed FP events or becomes a mandatory gate.
+    opt=decision.get('aurora') or {}
+    liq=decision.get('liquidity') or {}
+    if decision.get('verified_fp_reaction'):
+        notes=[]
+        if side>0 and liq.get('accepted_buy'):notes.append('Buy-side liquidity runs support the upside.')
+        elif side<0 and liq.get('accepted_sell'):notes.append('Sell-side liquidity runs support downside.')
+        if opt.get('relation')==('SUPPORTS_LONG' if side>0 else 'SUPPORTS_SHORT'):
+            notes.append('Candle AURORA supports the direction.')
+        elif opt.get('relation')==('SUPPORTS_SHORT' if side>0 else 'SUPPORTS_LONG'):
+            notes.append('Candle AURORA opposes this move.')
+        if notes:first+=' '+' '.join(notes)
     # Keep narrative concise and the exact familiar sections. Where origin
     # exists add only the decision's short explanation, avoiding duplicate prose.
     if origin and decision['reason'] and not (side==0 and 'Avoid fresh' in decision['reason']):
@@ -1571,7 +1893,41 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
             risk='**Rebound risk:** A confirmed reclaim of higher-timeframe supply would restore the bullish case.'
         else:risk='**Risk:** Both directions remain unresolved.'
         renko='**Renko AURORA:** No trade preferred. Await a fresh qualified Renko setup.'
-    if dest:
+    if decision.get('tactical_reaction'):
+        active_origin=decision.get('active_origin_side') or 0
+        if side<0:
+            main=('**Most likely:** A bearish reaction from the confirmed FP Supply. The larger Demand recovery is not yet reversed.'
+                  if active_origin>0 else
+                  '**Most likely:** A bearish reaction from confirmed FP Supply. Wider structural control remains unverified.')
+            risk='**Rebound risk:** A renewed break above that Supply would weaken the short reaction.'
+            renko=('**Renko AURORA:** Prefer bearish Renko for a short reaction only. '
+                   'Keep the valid Renko stop tight and use a conservative nearby target; never widen the stop.')
+        else:
+            main=('**Most likely:** A bullish reaction from the confirmed FP Demand. The larger Supply decline is not yet reversed.'
+                  if active_origin<0 else
+                  '**Most likely:** A bullish reaction from confirmed FP Demand. Wider structural control remains unverified.')
+            risk='**Downside risk:** A confirmed break below that Demand would weaken the long reaction.'
+            renko=('**Renko AURORA:** Prefer bullish Renko for a brief rebound only. '
+                   'Keep the valid Renko stop tight and use a conservative nearby target; never widen the stop.')
+    elif side and decision.get('counter_fp_break'):
+        renko+=(' Recent FP Demand break calls for conservative longs.' if side>0
+                else ' Recent FP Supply break calls for conservative shorts.')
+    if (side and not decision.get('tactical_reaction') and dest
+            and dest.get('source')=='STRUCTURAL_ORIGIN_RELATIVE'):
+        if dest.get('relative_to_origin')=='LOWER_THAN_ORIGIN':
+            renko+=(' Intermediate Supply may give way during the Demand recovery; shorts need confirmed rejection.'
+                    if side>0 else
+                    ' Intermediate Demand may give way during the Supply decline; longs need confirmed defence.')
+        elif dest.get('relative_to_origin')=='STRONGER_OR_EQUAL':
+            renko+=' Comparable or stronger opposing structure ahead; keep execution conservative.'
+    # Do not turn remote future FP clusters into immediate caution. The
+    # proximity qualifier applies only in the last part of a VERIFIED route.
+    if (side and not decision.get('tactical_reaction') and dest
+            and dest.get('source')=='STRUCTURAL_ORIGIN_RELATIVE'
+            and dest.get('relative_to_origin')=='STRONGER_OR_EQUAL'
+            and decision.get('fp_route',{}).get('near_anchor')):
+        renko+=' FP barriers near the opposing strategic zone warrant conservative entries.'
+    if dest and not decision.get('verified_fp_reaction') and not context.get('origin_valid'):
         zone=f'{_strategic_tf_label(dest["tf"])} {dest["side"].lower()} {_outlook_fmt(dest["low"])}–{_outlook_fmt(dest["high"])}'
         if side<0 or (side==0 and dest['side']=='DEMAND'):
             main=f'**Most likely:** Price is {"approaching" if dest["phase"]=="APPROACHING" else "testing"} {zone}. Avoid chasing fresh shorts into higher-timeframe demand.'
@@ -1582,8 +1938,8 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
         if dest['phase']=='TESTING' and side==0:main+=' Do not assume either a bounce or a breakdown.'
     base.update({'label':label,'commentary':'\n\n'.join([first,main,risk,renko]),
                  'evidence_quality':decision['confidence'],'side':side,
-                 'scenario':'JOURNEY_PREFERENCE','higher_tf_destination':dest,
-                 'renko_preference':'BULLISH' if side>0 and not dest else 'BEARISH' if side<0 and not dest else 'WAIT',
+                 'scenario':'FP_EVENT_JOURNEY','higher_tf_destination':dest,
+                 'renko_preference':'BULLISH' if side>0 and (not dest or decision.get('verified_fp_reaction') or context.get('origin_valid')) else 'BEARISH' if side<0 and (not dest or decision.get('verified_fp_reaction') or context.get('origin_valid')) else 'WAIT',
                  'journey_evidence':decision,
                  'trade_authority':'EDGE_ENTRY_AND_FRESH_ODME_ONLY'})
     return base
