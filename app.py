@@ -4140,8 +4140,23 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
                     read_odme_snapshot_history(sb_store, symbol, edge_row, enabled=True),
                 )
             opt_history, odme_history = packet['_sb_outlook_histories']
+            # Only the display-only outlook receives current options levels.
+            # All existing bias, strikes and campaign decisions retain the
+            # original ODME assessment and locked trading authority.
+            outlook_odme = None
+            if odme:
+                outlook_odme = dict(odme)
+                live_odme = ((packet.get('odme_outcome') or {}).get('result') or {})
+                snapshot = _sb_odme_data(packet)
+                if isinstance(live_odme, dict) and isinstance(snapshot, dict):
+                    for field in ('ts','expiry','odme_tilt','option_poc',
+                                  'active_ce_wall','active_pe_wall','ce_wall',
+                                  'pe_wall','bullish_score','bearish_score',
+                                  'expansion_score','usable_oi_count'):
+                        if _sb_has_value(snapshot.get(field)):
+                            outlook_odme[field] = snapshot[field]
             outlook = formulate_market_outlook(
-                edge_row, tape, opt_history, odme_history, current_odme=odme,
+                edge_row, tape, opt_history, odme_history, current_odme=outlook_odme,
                 strategic_context=(packet.get('memory') or {}).get('strategic_context') or {},
                 selected_expiry=str((packet.get('mapping') or {}).get('selected_expiry') or ''),
             )
@@ -4160,6 +4175,11 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
         st.markdown(f"**SuperBrain Bias: {outlook['label']}{price_text}** · "
                     f"{str(outlook.get('evidence_quality') or 'LOW').title()} evidence agreement")
         st.markdown(str(outlook.get('commentary') or ''))
+        # Independent short explanation: the four existing narrative sections
+        # remain byte-for-byte owned by the outlook module.
+        if outlook.get('why_commentary'):
+            st.markdown('**Why this view?**')
+            st.markdown(str(outlook['why_commentary']))
     else:
         # Fallback when optional history is missing, market data is stale or an
         # independent intelligence reader fails: do not manufacture a forecast.

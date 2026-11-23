@@ -1789,6 +1789,140 @@ def _mj_event_direction(edge: Dict[str,Any], tape: List[Dict[str,Any]],
                               else 'Confirmed FP Demand breaks and Supply holds support downside.'))
     return result
 
+def _mj_verified_live_odme(edge: Dict[str,Any], current_odme: Optional[Dict[str,Any]],
+                           selected_expiry: str='') -> Dict[str,Any]:
+    """Accept only a contemporary ODME snapshot of the matching contract.
+
+    This is display evidence, not a trading-authorisation or option-pricing
+    substitute. Historical or expiry-mismatched options must not be presented
+    as current confirmation of EDGE control.
+    """
+    d=current_odme if isinstance(current_odme,dict) else {}
+    t=_ms(d.get('ts'));bar=_ms(edge.get('bar_time'))
+    tf=_higher_tf_minutes(edge.get('tf')) or 15
+    if not t or not bar:return {}
+    # A freshly scanned option chain may be later than the last completed bar.
+    # An old snapshot cannot corroborate newly formed EDGE structure.
+    if not (-max(30,tf+10)*60_000 <= bar-t <= max(45,2*tf)*60_000):return {}
+    chosen=str(selected_expiry or '').replace(' ','').upper()
+    got=str(d.get('expiry') or '').replace(' ','').upper()
+    if not got or (chosen and got!=chosen):return {}
+    if not _odme_trusted_snapshot(d):return {}
+    useful=('direction','odme_tilt','bullish_score','bearish_score','option_poc',
+            'active_ce_wall','active_pe_wall','ce_wall','pe_wall')
+    return d if any(d.get(k) not in (None,'') for k in useful) else {}
+
+
+def _mj_odme_sentence(live_odme: Dict[str,Any], side: int) -> str:
+    """An understated, three-way ODME observation in the existing introduction.
+
+    The app supplies its existing ODME assessment (direction/regime), preserving
+    its prior mixed-control vs directional-score distinction. No re-scoring.
+    """
+    if not live_odme:return ''
+    direction=_outlook_side(live_odme.get('direction'))
+    if not direction:
+        # Explicit single-sided ODME tilt is valid; a mixed headline is not.
+        tilt=str(live_odme.get('odme_tilt') or '').upper()
+        if 'MIXED' not in tilt and 'NO CLEAN EDGE' not in tilt:
+            direction=_outlook_side(tilt)
+    if not direction or not side:
+        return ' Option positioning is not clear on direction.'
+    qualifier=', although control remains mixed' if ('MIXED' in str(live_odme.get('odme_tilt') or '').upper()
+                or 'NO CLEAN EDGE' in str(live_odme.get('odme_tilt') or '').upper()
+                or str(live_odme.get('control_quality') or '').upper()=='MIXED') else ''
+    if direction==side:
+        return (' Option positioning supports this view'+qualifier+'.')
+    return (' Option positioning opposes this view'+qualifier+'.')
+
+
+def _mj_why_view(edge: Dict[str,Any], decision: Dict[str,Any],
+                 dest: Dict[str,Any], live_odme: Dict[str,Any]) -> str:
+    """Distinct, concise factual WHY paragraph. Never alters execution gates.
+
+    Explain verified source location, most relevant FP outcome and next mapped
+    obstacle. Unverified historical origins stay explicitly unverified.
+    """
+    parts=[]
+    ctx=decision.get('context') or {}
+    side=decision.get('side') or 0
+    if ctx.get('origin_valid'):
+        lo=_num(ctx.get('origin_low'));hi=_num(ctx.get('origin_high'))
+        tf=_higher_tf_minutes(ctx.get('origin_tf'))
+        if lo is not None and hi is not None and tf:
+            action='recovery' if ctx.get('recovery') else 'decline' if ctx.get('decline') else 'move'
+            parts.append(f'{_strategic_tf_label(tf)} {str(ctx.get("origin_side") or "").title()} '
+                         f'**{_outlook_fmt(lo)}–{_outlook_fmt(hi)}** started the verified {action}.')
+    elif str(ctx.get('origin_side') or '').upper() in ('DEMAND','SUPPLY'):
+        parts.append('The earlier structural reaction is historical context, not a freshly verified defence.')
+
+    seq=decision.get('fp_sequence') or {}
+    last=seq.get('latest') or {}
+    if last:
+        lo=_num(last.get('low'));hi=_num(last.get('high'))
+        side_name=str(last.get('side') or '').title()
+        verb='held' if last.get('kind')=='HOLD' else 'broke'
+        zone=f'**{_outlook_fmt(lo)}–{_outlook_fmt(hi)}**' if lo is not None and hi is not None else ''
+        description=f'FP {side_name} {zone} {verb}'.replace('  ',' ')
+        if seq.get('latest_failed'):
+            description+=' but its subsequent failure removes that confirmation.'
+        elif decision.get('tactical_reaction'):
+            description+=('; this may be a temporary bearish reaction, not a larger reversal.' if side<0
+                          else '; this may be a temporary bullish reaction, not a larger reversal.')
+        elif decision.get('structural_reversal'):
+            description+='; successive confirmed FP results now challenge the earlier direction.'
+        elif seq.get('opposite_persistent'):
+            description+='; the verified FP sequence favours this direction.'
+        else:
+            description+='; follow-through is still important.'
+        parts.append(description)
+    else:
+        # Do not imply that an incomplete archive proved no intervening breaks.
+        parts.append('No complete confirmed FP sequence is available for this journey.')
+
+    opponent=(decision.get('fp_route') or {}).get('opposing_zone') or {}
+    if opponent and side:
+        lo=_num(opponent.get('low'));hi=_num(opponent.get('high'))
+        tf=_higher_tf_minutes(opponent.get('tf'))
+        if lo is not None and hi is not None and tf:
+            text=(f'Next structural obstacle: {_strategic_tf_label(tf)} '
+                  f'{str(opponent.get("side") or "").title()} **{_outlook_fmt(lo)}–{_outlook_fmt(hi)}**.')
+            relative=(decision.get('fp_route') or {}).get('relative_tf')
+            if relative=='LOWER_THAN_ORIGIN':
+                text+=' It is below the verified origin timeframe; one hold is a caution, not a reversal.'
+            elif relative=='STRONGER_OR_EQUAL':
+                text+=' Its structural importance calls for a conservative entry.'
+            parts.append(text)
+    elif dest:
+        lo=_num(dest.get('low'));hi=_num(dest.get('high'))
+        if lo is not None and hi is not None:
+            parts.append(f'Mapped {str(dest.get("side") or "").title()} ahead: '
+                         f'**{_outlook_fmt(lo)}–{_outlook_fmt(hi)}**. A test alone does not confirm a hold or break.')
+    else:
+        # Factual structural reference even without an opposing destination.
+        for role in ('defender','challenger'):
+            lo=_num(edge.get(role+'_low'));hi=_num(edge.get(role+'_high'))
+            if lo is not None and hi is not None and lo<hi:
+                parts.append(f'Current {role.title()}: {str(edge.get(role+"_side") or "").title()} '
+                             f'**{_outlook_fmt(lo)}–{_outlook_fmt(hi)}**.')
+                break
+
+    # Concrete options reference only if the current scan has a valid contract.
+    if live_odme:
+        expiry=str(live_odme.get('expiry') or '')
+        poc=_num(live_odme.get('option_poc'))
+        ce=_num(live_odme.get('active_ce_wall'))
+        if ce is None:ce=_num(live_odme.get('ce_wall'))
+        pe=_num(live_odme.get('active_pe_wall'))
+        if pe is None:pe=_num(live_odme.get('pe_wall'))
+        levels=[]
+        if poc is not None:levels.append(f'POC {_outlook_fmt(poc)}')
+        if ce is not None:levels.append(f'CE wall {_outlook_fmt(ce)}')
+        if pe is not None:levels.append(f'PE wall {_outlook_fmt(pe)}')
+        if levels:parts.append(f'ODME ({expiry}): '+', '.join(levels)+'. These are reference levels, not targets.')
+    return ' '.join(parts[:4])
+
+
 def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]],
                              optional_history: List[Dict[str,Any]],
                              odme_history: List[Dict[str,Any]],
@@ -1858,6 +1992,8 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
     # exists add only the decision's short explanation, avoiding duplicate prose.
     if origin and decision['reason'] and not (side==0 and 'Avoid fresh' in decision['reason']):
         first+=' '+decision['reason']
+    fresh_odme=_mj_verified_live_odme(edge,current_odme,selected_expiry)
+    first+=_mj_odme_sentence(fresh_odme,side)
     if side>0:
         if up:
             main=(f'**Most likely:** Further upside is favoured while above '
@@ -1936,7 +2072,9 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
             main=f'**Most likely:** Price is {"approaching" if dest["phase"]=="APPROACHING" else "testing"} {zone}. Avoid chasing fresh longs into higher-timeframe supply.'
             renko='**Renko AURORA:** No trade preferred near higher-timeframe supply. Wait for a confirmed rejection or break.'
         if dest['phase']=='TESTING' and side==0:main+=' Do not assume either a bounce or a breakdown.'
+    why=_mj_why_view(edge,decision,dest or {},fresh_odme)
     base.update({'label':label,'commentary':'\n\n'.join([first,main,risk,renko]),
+                 'why_commentary':why,
                  'evidence_quality':decision['confidence'],'side':side,
                  'scenario':'FP_EVENT_JOURNEY','higher_tf_destination':dest,
                  'renko_preference':'BULLISH' if side>0 and (not dest or decision.get('verified_fp_reaction') or context.get('origin_valid')) else 'BEARISH' if side<0 and (not dest or decision.get('verified_fp_reaction') or context.get('origin_valid')) else 'WAIT',
