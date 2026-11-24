@@ -87,7 +87,7 @@ def read_optional_history(store: Any, instrument: str, edge_row: Dict[str,Any]) 
                 t=_ms(d['confirmed_close_ms'])
                 if (str(d['instrument']).upper()==wanted and
                     str(d['source']).upper() in ('AURORA','LIQUIDITY') and
-                    t and edge_ms-MAX_AGE_MS<=t<=edge_ms):
+                    t and t<=edge_ms):
                     d['context']=_json_obj(d['context_json'])
                     out.append(d)
             end=start-1

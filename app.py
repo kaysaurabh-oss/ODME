@@ -27,6 +27,8 @@ from superbrain_bridge import (
 )
 from superbrain_edge_memory import read_edge_tape, intelligent_bias
 from superbrain_zone_forecast import read_level2_history
+from superbrain_journey_monitor import JourneyJournal, enhance_outlook
+from superbrain_intelligence_history import _mj_verified_live_odme
 from superbrain_market_sessions import session_status, last_session_snapshot
 from superbrain_intelligence_history import (
     read_optional_history,
@@ -4166,6 +4168,20 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
                 selected_expiry=str((packet.get('mapping') or {}).get('selected_expiry') or ''),
                 l2_history=packet.get('_sb_l2_journey') or [],
             )
+            # Display-only monitor; journal live observations only. Fail back to
+            # the original narrative if disk or optional memory is unavailable.
+            try:
+                journal = None
+                if healthy and not historic:
+                    try: journal = JourneyJournal()
+                    except Exception: pass  # commentary can still use retained Sheet history
+                fresh = _mj_verified_live_odme(edge_row, outlook_odme, str((packet.get('mapping') or {}).get('selected_expiry') or ''))
+                outlook = enhance_outlook(outlook, edge_row, tape, opt_history, odme_history,
+                    packet.get('_sb_l2_journey') or [], fresh, journal=journal,
+                    asof=int(datetime.now(timezone.utc).timestamp()*1000) if healthy and not historic else None)
+            except Exception:
+                pass
+
         except Exception:
             outlook = None  # Never affect existing trade decisions.
     if historic:

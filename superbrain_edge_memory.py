@@ -77,27 +77,10 @@ def read_edge_tape(store: Any, instrument: str, max_rows: int=9000,
         if not include_fp_journey:
             paired=paired[-650:]
         if include_fp_journey and paired and hasattr(ws,'batch_get'):
-            # Small bounded set of archived event snapshots: distinct selected
-            # FP event transitions, plus periodic source-hurdle checkpoints.
-            # Preserves older non-selected FP events as observed, NOT inferred.
-            # Failure never removes the original A:AG tape or affects gates.
+            # Read all retained hurdle snapshots for the selected instrument.
+            # Nonselected FP transitions can occur between selected events.
             try:
-                picks=[];prev_event=None;prev_window=None
-                for idx,(sheet_row,d) in enumerate(paired):
-                    event=(str(d.get('fp_zone_id') or ''),str(d.get('fp_side') or ''),
-                           str(d.get('fp_event_type') or ''),str(d.get('fp_event_time') or ''))
-                    tm=num(d.get('bar_ms')) or 0
-                    window=int(tm//(6*3600_000)) if tm else None
-                    if event!=prev_event and event[2] and event[3]:
-                        picks.append((idx,sheet_row))
-                    if window!=prev_window:
-                        picks.append((idx,sheet_row))
-                    prev_event=event;prev_window=window
-                picks.extend((idx,paired[idx][0]) for idx in range(max(0,len(paired)-3),len(paired)))
-                # No arbitrary last-48 cutoff for the display-only journey.
-                # Read only meaningful snapshots to avoid transferring every
-                # repeated large AH JSON blob; use batches for API safety.
-                chosen=sorted({row:(idx,row) for idx,row in picks}.values())
+                chosen=[(idx,row) for idx,(row,_) in enumerate(paired)]
                 for offset in range(0,len(chosen),60):
                     chunk=chosen[offset:offset+60]
                     cells=ws.batch_get([f'AH{row}:AH{row}' for _,row in chunk])

@@ -534,7 +534,8 @@ def _prior_cases(ledger:List[Dict[str,Any]],tape:List[Dict[str,Any]],asof:int,
 def forecast_zone_encounter(edge:Dict[str,Any],tape:List[Dict[str,Any]],
                             l2_events:List[Dict[str,Any]],odme_history:List[Dict[str,Any]],
                             fresh_odme:Dict[str,Any],structural:Dict[str,Any],
-                            current_side:int,optional_context:Optional[Dict[str,Any]]=None) -> Dict[str,Any]:
+                            current_side:int,optional_context:Optional[Dict[str,Any]]=None, *,
+                            target_override:Optional[Dict[str,Any]]=None) -> Dict[str,Any]:
     """Pre-zone forecast, never a trading gate or guaranteed price outcome."""
     now=_ms(edge.get('bar_time')) or 0
     if not now or _n(edge.get('close')) is None:return {}
@@ -553,12 +554,21 @@ def forecast_zone_encounter(edge:Dict[str,Any],tape:List[Dict[str,Any]],
     roles=_roles(edge)
     route=_approach(edge,book,direction,roles)
     target=route.get('target')
+    if target_override is not None:
+        # Direction-specific display forecast, never a synthetic live zone.
+        target=dict(target_override)
+        target['stage']='TESTING' if target.get('distance')==0 else 'BEFORE_TOUCH'
+        target['directional_approach']=True
+        matches=[r for r in roles if r['side']==target['side'] and max(r['low'],target['low'])<=min(r['high'],target['high'])]
+        if matches:target['structural_overlap']=matches[0]
+        route=dict(route,target=target)
     if not target:return {'available':False,'direction':direction,
                           'summary':'No current live FP or structural destination is mapped.',
                           'events':len(ledger)}
     style=_style(edge,book,ledger,direction,origin_at,target)
     odme=_odme_check(fresh_odme,odme_history,target,direction,now)
-    cases=_prior_cases(ledger,tape,now,target,direction,style['name'])
+    cases=(_prior_cases(ledger,tape,now,target,direction,style['name']) if target_override is None
+           else {'comparable_cases':0,'sample_sufficient':False,'calibration_deferred':True})
     co=target.get('structural_overlap') or {}
     stage=target.get('stage') or 'BEFORE_TOUCH'
     # A current or earlier selected event might already be a touch; no pre-
@@ -652,7 +662,7 @@ def forecast_zone_encounter(edge:Dict[str,Any],tape:List[Dict[str,Any]],
     if aur_aligned and attack>=2 and defence==0 and not convergence:
         if resolution=='CONTESTED' and not odme.get('opposes'):
             resolution='BREAK_FAVOURED'
-    if cases.get('sample_sufficient'):
+    if cases.get('sample_sufficient') and target_override is None:
         if cases['first_reaction_rate']>=0.7 and reaction=='FIRST_REACTION_POSSIBLE':
             reaction='FIRST_REACTION_FAVOURED'
         elif cases['first_break_rate']>=0.7 and resolution=='CONTESTED' and not convergence:
