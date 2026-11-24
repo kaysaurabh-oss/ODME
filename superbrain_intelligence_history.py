@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import json
 import math
 from typing import Any, Dict, List, Optional
+from superbrain_zone_forecast import forecast_zone_encounter
 
 OPTIONAL_TAB = "SB_OPTIONAL_TAPE"
 OPTIONAL_HEADERS = [
@@ -19,7 +20,7 @@ OPTIONAL_HEADERS = [
     "last_event", "event_ms", "context_json",
 ]
 MAX_SCAN_HISTORY = 15000  # supports EDGE-style 600 per instrument+source across many instruments
-MAX_ODME_HISTORY = 10000
+MAX_ODME_HISTORY = 1000000  # load every retained ODME snapshot, then filter by symbol/as-of
 MAX_AGE_MS = 90 * 24 * 3600 * 1000
 
 
@@ -76,7 +77,7 @@ def read_optional_history(store: Any, instrument: str, edge_row: Dict[str,Any]) 
         out=[]
         wanted=str(instrument).upper()
         end=count
-        floor=max(2,count-MAX_SCAN_HISTORY+1)
+        floor=2  # Entire retained optional tape; source TF preserved.
         while end>=floor:
             start=max(floor,end-1999)
             rows=ws.get(f'A{start}:M{end}')
@@ -88,20 +89,11 @@ def read_optional_history(store: Any, instrument: str, edge_row: Dict[str,Any]) 
                     t and edge_ms-MAX_AGE_MS<=t<=edge_ms):
                     d['context']=_json_obj(d['context_json'])
                     out.append(d)
-            if sum(str(r['source']).upper()=='AURORA' for r in out)>=180 and \
-               sum(str(r['source']).upper()=='LIQUIDITY' for r in out)>=180:
-                break
             end=start-1
         out.sort(key=lambda x:int(x['confirmed_close_ms']))
-        # No false AURORA state changes across source-timeframe migrations.
-        selected=[]
-        for src in ('AURORA','LIQUIDITY'):
-            own=[r for r in out if str(r['source']).upper()==src]
-            if own:
-                latest_tf=str(own[-1]['tf'])
-                selected+= [r for r in own if str(r['tf'])==latest_tf][-180:]
-        selected.sort(key=lambda x:int(x['confirmed_close_ms']))
-        return selected
+        # Retain all observed source TFs. Individual optional interpreters
+        # still require their own confirmed source/TF chronology.
+        return out
     except Exception:return []
 
 
@@ -120,9 +112,9 @@ def read_odme_snapshot_history(store: Any, instrument: str,
             if str(r.get('instrument') or '').upper()!=instrument.upper() or not ms:
                 continue
             # Never read a future ODME reading into a historical as-of EDGE candle.
-            if edge_ms-MAX_AGE_MS<=ms<=edge_ms+max(60_000,int((_num(edge_row.get('tf')) or 15)*60_000)):arr.append(dict(r, _ts_ms=ms))
+            if ms<=edge_ms+max(60_000,int((_num(edge_row.get('tf')) or 15)*60_000)):arr.append(dict(r, _ts_ms=ms))
         arr.sort(key=lambda x:x['_ts_ms'])
-        return arr[-45:]
+        return arr
     except Exception:return []
 
 
@@ -1928,7 +1920,8 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
                              odme_history: List[Dict[str,Any]],
                              current_odme: Optional[Dict[str,Any]]=None,
                              strategic_context: Optional[Dict[str,Any]]=None,
-                             selected_expiry: str='') -> Dict[str,Any]:
+                             selected_expiry: str='',
+                             l2_history: Optional[List[Dict[str,Any]]]=None) -> Dict[str,Any]:
     """Event-led, location-aware RENKO preference; exact existing screen layout.
 
     A preferred Renko direction is NOT an executable trade. Existing manual
@@ -1943,6 +1936,25 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
     if not spot:return base
     decision=_mj_event_direction(edge,edge_tape,optional_history,strategic_context or {},current_odme)
     side=decision['side'];context=decision.get('context') or {}
+    fresh_odme=_mj_verified_live_odme(edge,current_odme,selected_expiry)
+    # Predict next FP encounter BEFORE it happens; no event lookahead, no
+    # changes to eligibility/campaigns. `None` disables the enhancement for
+    # older integrations; [] means the live log was empty/unavailable.
+    forecast=(forecast_zone_encounter(edge,edge_tape,l2_history or [],odme_history,
+                 fresh_odme,context,side,decision) if l2_history is not None else {})
+    # A well-observed cross-TF FP sequence may offer a directional preference
+    # even after an execution-TF handoff. Never supersede a confirmed tactical
+    # reaction or structural reversal with this pre-touch hypothesis.
+    if (forecast.get('available') and not decision.get('verified_fp_reaction')
+            and not decision.get('tactical_reaction') and not decision.get('structural_reversal')
+            and forecast.get('direction') and forecast.get('direction')!=side):
+        st=forecast.get('style') or {}
+        if st.get('favour_events',0)>=2 and st.get('against_events',0)==0:
+            side=forecast['direction']
+            decision=dict(decision,side=side,
+                          reason=('The cross-timeframe FP journey favours upside.' if side>0
+                                  else 'The cross-timeframe FP journey favours downside.'),
+                          confidence='MODERATE')
     # Preserve existing structural label taxonomy, while eliminating the
     # four-hour-only bias flip as a source of directional authority.
     # Verified origin: compare *source* Challenger/Defender timeframes and
@@ -1992,7 +2004,6 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
     # exists add only the decision's short explanation, avoiding duplicate prose.
     if origin and decision['reason'] and not (side==0 and 'Avoid fresh' in decision['reason']):
         first+=' '+decision['reason']
-    fresh_odme=_mj_verified_live_odme(edge,current_odme,selected_expiry)
     first+=_mj_odme_sentence(fresh_odme,side)
     if side>0:
         if up:
@@ -2072,12 +2083,94 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
             main=f'**Most likely:** Price is {"approaching" if dest["phase"]=="APPROACHING" else "testing"} {zone}. Avoid chasing fresh longs into higher-timeframe supply.'
             renko='**Renko AURORA:** No trade preferred near higher-timeframe supply. Wait for a confirmed rejection or break.'
         if dest['phase']=='TESTING' and side==0:main+=' Do not assume either a bounce or a breakdown.'
+    # Pre-encounter forecast is primary intelligence for the next mapped FP
+    # barrier, but never treats a predicted break/hold as a verified trigger.
+    # If FP has *already* defended, the existing tactical reaction wins.
+    if (forecast.get('available') and not decision.get('tactical_reaction')
+            and not decision.get('structural_reversal')
+            and forecast.get('stage') in ('BEFORE_TOUCH','RETEST','TESTING')
+            and (forecast.get('target') or {}).get('directional_approach')):
+        primary=forecast['primary']
+        main='**Most likely:** '+primary+' '+forecast['reaction_text']
+        if forecast.get('risk')=='BREAKOUT_WITHOUT_NEW_SUPPORT':
+            risk=('**Downside risk:** A sharp pullback can reach deeper support because '
+                  'no newly formed FP Demand is visible in the recorded hurdle book.' if side>0 else
+                  '**Rebound risk:** A sharp rebound can reach higher Supply because '
+                  'no newly formed FP Supply is visible in the recorded hurdle book.')
+        elif forecast.get('risk')=='OPPOSING_STRUCTURAL_LOCATION':
+            risk=('**Downside risk:** Opposing structural Supply could produce a larger reaction.' if side>0
+                  else '**Rebound risk:** Opposing structural Demand could produce a larger reaction.')
+        if forecast.get('resolution')=='HOLD_FAVOURED':
+            if side>0:
+                renko=('**Renko AURORA:** Prefer bullish Renko only on a qualified pullback. '
+                       'Supply defence is favoured; avoid chasing longs into it. '
+                       'A verified rejection may offer a short reaction with tight valid stops and nearby targets.')
+            elif side<0:
+                renko=('**Renko AURORA:** Prefer bearish Renko only on a qualified rebound. '
+                       'Demand defence is favoured; avoid chasing shorts into it. '
+                       'A verified bounce may offer a long reaction with tight valid stops and nearby targets.')
+        elif forecast.get('resolution')=='BREAK_FAVOURED':
+            if side>0:
+                renko=('**Renko AURORA:** Prefer bullish Renko. Next FP Supply appears vulnerable; '
+                       'a fresh qualified Renko entry remains necessary.'
+                       +(' Do not chase an unsupported advance.' if forecast.get('risk')=='BREAKOUT_WITHOUT_NEW_SUPPORT' else ''))
+            elif side<0:
+                renko=('**Renko AURORA:** Prefer bearish Renko. Next FP Demand appears vulnerable; '
+                       'a fresh qualified Renko entry remains necessary.'
+                       +(' Do not chase an unsupported decline.' if forecast.get('risk')=='BREAKOUT_WITHOUT_NEW_SUPPORT' else ''))
+        else:
+            if side>0:
+                renko=('**Renko AURORA:** Prefer bullish Renko with caution approaching Supply. '
+                       'Only a verified defence warrants a conservative tactical short.')
+            elif side<0:
+                renko=('**Renko AURORA:** Prefer bearish Renko with caution approaching Demand. '
+                       'Only a verified defence warrants a conservative tactical long.')
+    # A pre-confirmation first-touch forecast is valuable even when the last
+    # confirmed FP event does not yet authorize a directional preference.
+    # Give a *conditional* tactical Renko watch instead of a generic no-trade
+    # message. No entry gate, stop rule or confirmed-defence claim is changed.
+    if (forecast.get('available') and side==0
+            and forecast.get('first_reaction')=='FIRST_REACTION_FAVOURED'
+            and forecast.get('resolution')!='BREAK_FAVOURED'
+            and not decision.get('verified_fp_reaction')):
+        target=forecast.get('target') or {}
+        if target.get('side')=='SUPPLY':
+            label='SUPPLY REACTION WATCH'
+            renko=('**Renko AURORA:** Watch bearish Renko for a tactical Supply reaction. '
+                   'No confirmed FP defence yet: take a trade only if existing entry rules qualify. '
+                   'Keep the valid stop tight and use a conservative mapped target.')
+        elif target.get('side')=='DEMAND':
+            label='DEMAND REACTION WATCH'
+            renko=('**Renko AURORA:** Watch bullish Renko for a tactical Demand rebound. '
+                   'No confirmed FP defence yet: take a trade only if existing entry rules qualify. '
+                   'Keep the valid stop tight and use a conservative mapped target.')
+        first=first.replace('Wait for confirmed EDGE price behaviour.',
+                            'The approaching zone favours a tactical reaction, not yet a confirmed reversal.')
     why=_mj_why_view(edge,decision,dest or {},fresh_odme)
+    if forecast.get('available'):
+        seq=forecast.get('style') or {}
+        if ((seq.get('confirmed_events') or seq.get('prior_regime_opposing_results')) and
+                'No complete confirmed FP sequence is available for this journey.' in why):
+            old='No complete confirmed FP sequence is available for this journey.'
+            new=('The selected-timeframe FP tape is incomplete; confirmed Level 2 events '
+                 'from earlier execution timeframes add broader journey evidence.'
+                 if seq.get('favour_events') or seq.get('against_events') else
+                 'No confirmed post-origin FP result is available yet; earlier Level 2 events describe the prior regime.')
+            why=why.replace(old,new)
+        t=forecast.get('target') or {}
+        text='**Next-zone expectation:** '+forecast['primary']+' '+forecast['reaction_text']
+        text+=' **Evidence:** '+forecast.get('why','')
+        if forecast.get('stage')=='RETEST':
+            text+=' This is a previously interacted zone, not a first untouched test.'
+        if not (t.get('directional_approach')):
+            text+=' Direction to this barrier is not yet independently established.'
+        why+='\n\n'+text
     base.update({'label':label,'commentary':'\n\n'.join([first,main,risk,renko]),
                  'why_commentary':why,
                  'evidence_quality':decision['confidence'],'side':side,
                  'scenario':'FP_EVENT_JOURNEY','higher_tf_destination':dest,
                  'renko_preference':'BULLISH' if side>0 and (not dest or decision.get('verified_fp_reaction') or context.get('origin_valid')) else 'BEARISH' if side<0 and (not dest or decision.get('verified_fp_reaction') or context.get('origin_valid')) else 'WAIT',
                  'journey_evidence':decision,
+                 'zone_forecast':forecast,
                  'trade_authority':'EDGE_ENTRY_AND_FRESH_ODME_ONLY'})
     return base

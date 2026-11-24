@@ -51,22 +51,31 @@ def read_edge_tape(store: Any, instrument: str, max_rows: int=9000,
         ws=store.sheet.worksheet(TAPE_TAB)
         last=len(ws.col_values(1))
         if last<=1:return []
-        start=max(2,last-max_rows+1)
+        # Display-only FP journey reads every retained candle for the selected
+        # instrument, across all real execution TFs. Normal execution/legacy
+        # paths retain their prior bounded reader behaviour.
+        start=2 if include_fp_journey else max(2,last-max_rows+1)
         cols=34
         headers=ws.row_values(1)[:cols]
         if len(headers)!=cols or headers[0]!='captured_at' or headers[2]!='bar_ms':return []
         # AH holds potentially large FP hurdle JSON. Do not load an entire
         # shared 9000-row sheet including AH; read it selectively below.
-        values=ws.get(f'A{start}:AG{last}')
         wanted=str(instrument or '').strip().upper()
         paired=[]
-        for i,row in enumerate(values):
-            if len(row)>2 and str(row[1]).strip().upper()==wanted:
-                d={headers[j]:row[j] if j<len(row) else '' for j in range(cols)}
-                if num(d.get('bar_ms')) is not None and num(d.get('close')) is not None:
-                    paired.append((start+i,d))
+        # Read the complete retained Sheet in API-friendly chunks. Filtering
+        # happens per chunk, so no global 650-/9000-row ceiling hides older
+        # events when the display-only journey is requested.
+        for first in range(start,last+1,1500):
+            end=min(last,first+1499)
+            values=ws.get(f'A{first}:AG{end}')
+            for i,row in enumerate(values):
+                if len(row)>2 and str(row[1]).strip().upper()==wanted:
+                    d={headers[j]:row[j] if j<len(row) else '' for j in range(cols)}
+                    if num(d.get('bar_ms')) is not None and num(d.get('close')) is not None:
+                        paired.append((first+i,d))
         paired.sort(key=lambda x:num(x[1].get('bar_ms')) or 0)
-        paired=paired[-650:]
+        if not include_fp_journey:
+            paired=paired[-650:]
         if include_fp_journey and paired and hasattr(ws,'batch_get'):
             # Small bounded set of archived event snapshots: distinct selected
             # FP event transitions, plus periodic source-hurdle checkpoints.
@@ -85,10 +94,15 @@ def read_edge_tape(store: Any, instrument: str, max_rows: int=9000,
                         picks.append((idx,sheet_row))
                     prev_event=event;prev_window=window
                 picks.extend((idx,paired[idx][0]) for idx in range(max(0,len(paired)-3),len(paired)))
-                chosen=sorted({row:(idx,row) for idx,row in picks}.values())[-48:]
-                cells=ws.batch_get([f'AH{row}:AH{row}' for _,row in chosen])
-                if len(cells)==len(chosen):
-                    for (idx,_),v in zip(chosen,cells):
+                # No arbitrary last-48 cutoff for the display-only journey.
+                # Read only meaningful snapshots to avoid transferring every
+                # repeated large AH JSON blob; use batches for API safety.
+                chosen=sorted({row:(idx,row) for idx,row in picks}.values())
+                for offset in range(0,len(chosen),60):
+                    chunk=chosen[offset:offset+60]
+                    cells=ws.batch_get([f'AH{row}:AH{row}' for _,row in chunk])
+                    if len(cells)!=len(chunk):continue
+                    for (idx,_),v in zip(chunk,cells):
                         if v and v[0] and isinstance(v[0][0],str):
                             paired[idx][1]['fp_hurdles_json']=v[0][0]
             except Exception:

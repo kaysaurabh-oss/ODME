@@ -26,6 +26,7 @@ from superbrain_bridge import (
     prepare_superbrain_scan,
 )
 from superbrain_edge_memory import read_edge_tape, intelligent_bias
+from superbrain_zone_forecast import read_level2_history
 from superbrain_market_sessions import session_status, last_session_snapshot
 from superbrain_intelligence_history import (
     read_optional_history,
@@ -4131,8 +4132,8 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
     outlook = None
     if (healthy or historic) and edge_row:
         try:
+            sb_store = get_store()
             if '_sb_outlook_histories' not in packet:
-                sb_store = get_store()
                 packet['_sb_outlook_histories'] = (
                     read_optional_history(sb_store, symbol, edge_row),
                     # Historical snapshots are display-only context even if
@@ -4140,6 +4141,10 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
                     read_odme_snapshot_history(sb_store, symbol, edge_row, enabled=True),
                 )
             opt_history, odme_history = packet['_sb_outlook_histories']
+            if '_sb_l2_journey' not in packet:
+                # All retained Level 2 FP events across actual TF handoffs;
+                # alert/watcher behaviour is untouched. No new sheet writes.
+                packet['_sb_l2_journey'] = read_level2_history(sb_store, symbol, edge_row)
             # Only the display-only outlook receives current options levels.
             # All existing bias, strikes and campaign decisions retain the
             # original ODME assessment and locked trading authority.
@@ -4159,6 +4164,7 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
                 edge_row, tape, opt_history, odme_history, current_odme=outlook_odme,
                 strategic_context=(packet.get('memory') or {}).get('strategic_context') or {},
                 selected_expiry=str((packet.get('mapping') or {}).get('selected_expiry') or ''),
+                l2_history=packet.get('_sb_l2_journey') or [],
             )
         except Exception:
             outlook = None  # Never affect existing trade decisions.
