@@ -12,6 +12,7 @@ import json
 import math
 from typing import Any, Dict, List, Optional
 from superbrain_zone_forecast import forecast_zone_encounter
+from superbrain_journey_destinations import journey_destinations
 
 OPTIONAL_TAB = "SB_OPTIONAL_TAPE"
 OPTIONAL_HEADERS = [
@@ -2146,6 +2147,19 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
                    'Keep the valid stop tight and use a conservative mapped target.')
         first=first.replace('Wait for confirmed EDGE price behaviour.',
                             'The approaching zone favours a tactical reaction, not yet a confirmed reversal.')
+    # Display-only route levels: the active direction gets its own mapped
+    # destination; the opposing route is explicitly conditional.
+    journey=journey_destinations(edge,edge_tape,side,decision)
+    if journey:
+        main+=' '+journey['primary']
+        risk+=' '+journey['alternative']
+        if side and not decision.get('tactical_reaction'):
+            renko+=' '+journey['continuation_watch']
+        elif side and decision.get('tactical_reaction'):
+            renko+=(' Do not chase a subsequent break; after verified confirmation, '
+                    'prefer a qualifying new FP zone or a confirmed failed retest for continuation.')
+        if journey.get('book_truncated'):
+            risk+=' The live FP hurdle book is truncated; closer omitted levels cannot be ruled out.'
     why=_mj_why_view(edge,decision,dest or {},fresh_odme)
     if forecast.get('available'):
         seq=forecast.get('style') or {}
@@ -2159,7 +2173,8 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
             why=why.replace(old,new)
         t=forecast.get('target') or {}
         text='**Next-zone expectation:** '+forecast['primary']+' '+forecast['reaction_text']
-        text+=' **Evidence:** '+forecast.get('why','')
+        # Detailed quantitative evidence remains in the forecast object for audit,
+        # but is deliberately not dumped into the trader-facing commentary.
         if forecast.get('stage')=='RETEST':
             text+=' This is a previously interacted zone, not a first untouched test.'
         if not (t.get('directional_approach')):
@@ -2171,6 +2186,6 @@ def formulate_market_outlook(edge: Dict[str,Any], edge_tape: List[Dict[str,Any]]
                  'scenario':'FP_EVENT_JOURNEY','higher_tf_destination':dest,
                  'renko_preference':'BULLISH' if side>0 and (not dest or decision.get('verified_fp_reaction') or context.get('origin_valid')) else 'BEARISH' if side<0 and (not dest or decision.get('verified_fp_reaction') or context.get('origin_valid')) else 'WAIT',
                  'journey_evidence':decision,
-                 'zone_forecast':forecast,
+                 'zone_forecast':forecast,'journey_destinations':journey,
                  'trade_authority':'EDGE_ENTRY_AND_FRESH_ODME_ONLY'})
     return base
