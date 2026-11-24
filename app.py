@@ -28,6 +28,7 @@ from superbrain_bridge import (
 from superbrain_edge_memory import read_edge_tape, intelligent_bias
 from superbrain_zone_forecast import read_level2_history
 from superbrain_journey_monitor import JourneyJournal, enhance_outlook
+from superbrain_gpt_handoff import build_row as _gpt_build_row, publish as _gpt_publish, chatgpt_url as _gpt_url, recent_receipt as _gpt_recent
 from superbrain_intelligence_history import _mj_verified_live_odme
 from superbrain_market_sessions import session_status, last_session_snapshot
 from superbrain_intelligence_history import (
@@ -4000,6 +4001,7 @@ def _sb_render_cash_confirmed_campaigns(store: Any, instrument: str, packet: Dic
             opposes=('BULLISH' in bias_name and side=='BEARISH') or ('BEARISH' in bias_name and side=='BULLISH')
             status='ON WATCH — OPPOSING EDGE JOURNEY' if opposes else 'ON PLAN — STOP NOT CROSSED'
             call='HOLD / REVIEW' if opposes else 'HOLD'
+        packet.setdefault('_gpt_campaign_reference',[]).append({'trade':trade,'plan':status,'action':call,'bias':bias_name})
         st.markdown(f'**Plan:** {status}')
         st.write(f'**Behaviour:** {bias_name}. Current EDGE journey is informational; the user-recorded invalidation is the only executable risk boundary available for this cash/futures campaign.')
         st.info(f'**{call}** · No option-roll recommendation applies.')
@@ -4083,6 +4085,7 @@ def _sb_render_edge_cash_terminal(store: Any, instrument: str, packet: Dict[str,
                          format_func=lambda a: 'Check AURORA' if a=='CHECK' else a.title(),
                          key=f'cash_aurora_{instrument}_{key}')
         dec=_edge_cash_entry_signal(name,values,ctx.get('price'),healthy,aur)
+        packet.setdefault('_gpt_entry_reference',[]).append({'setup':setup,'current_fp':values,'manual_renko':aur,'decision':dec})
         if dec.get('status')=='WAIT':
             st.warning(f"**WAIT** — {dec['reason']}")
         elif dec.get('status')=='ENTRY READY':
@@ -4189,6 +4192,8 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
         last_at = latest.astimezone(ZoneInfo('Asia/Singapore')).strftime('%d %b %H:%M SGT') if latest else 'last recorded close'
         st.info(f"**MARKET CLOSED — LAST RECORDED SESSION** · {last_at}. "
                 "Bias is historical; no new entry or automatic campaign action until fresh EDGE data arrives after reopening.")
+    # Reference only: independent ChatGPT reasoning can compare the actual app outlook.
+    packet['_gpt_outlook_reference'] = outlook or {}
     if outlook and outlook.get('label') != 'UNAVAILABLE':
         # Exact existing headline layout; append the price of this confirmed
         # EDGE observation, never a previous saved scan or live option quote.
@@ -4341,6 +4346,83 @@ def _sb_campaign_plain_language(trade: Dict[str,Any], decision: Dict[str,Any],
             'reason':reason,'entry_thesis':entry_thesis}
 
 
+def _sb_render_ask_gpt(slot: Any, store: Any, packet: Dict[str, Any]) -> None:
+    """Optional GPT handoff; never modifies trading policy, alerts or campaign records."""
+    from html import escape
+    with slot.container():
+        if packet.get('_scan_failed') or not packet.get('_gpt_scan_id'):
+            st.caption('Ask GPT: scan again to prepare a verified handoff.')
+            return
+        if not _gpt_recent(packet.get('_gpt_completed_at')):
+            st.caption('Ask GPT: scan again; the five-minute handoff window has elapsed.')
+            return
+        if not packet.get('_gpt_prompt'):
+            try:
+                ctx=_sb_authoritative_edge_context(packet)
+                # Raw book is already inside the selected EDGE row. Remove its
+                # duplicate parsed representation to stay within Sheet limits.
+                edge={k:v for k,v in ctx.items() if k!='raw'}
+                live=((packet.get('odme_outcome') or {}).get('result') or {}) if packet.get('odme_live') else {}
+                fields=('ts','tilt','spot','poc','value_area_low','value_area_high','ce_wall','pe_wall',
+                        'safer_sell_ce','safer_sell_pe','scores','poc_move','ce_wall_move','pe_wall_move',
+                        'range_move','hvn','lvn','key_strikes','commentary','final_action','hero_action',
+                        'premium_alert','itm_caution','path_risk','ce_action','pe_action','future_ltp',
+                        'future_symbol','future_expiry','future_feed_time','future_trade_time',
+                        'future_mapping_reason','option_expiry_used_for_mapping','anchor_snapshot_ts')
+                summary={k:live[k] for k in fields if k in live}
+                option_enabled=bool((packet.get('mapping') or {}).get('odme_scan_enabled'))
+                active=[t for t in packet.get('open_trades') or [] if str(t.get('status','ACTIVE')).upper() not in {'CLOSED','EXIT','TARGET','INVALIDATED','EXPIRED','CANCELLED'}]
+                outlook=packet.get('_gpt_outlook_reference') or {}
+                # Export the app's actual prose and monitor reconciliation; the
+                # independently retrieved history remains primary evidence.
+                outlook_ref={k:outlook[k] for k in ('label','commentary','why_commentary','evidence_quality','renko_preference','higher_tf_destination','journey_destinations') if k in outlook}
+                monitor=outlook.get('journey_monitor') or {}
+                outlook_ref['journey_monitor']={k:monitor[k] for k in ('version','reconciliation','memory_ok','calibration') if k in monitor}
+                # Compact, source-grounded encounter paths from the app's SQLite-aware monitor.
+                outlook_ref['journey_monitor']['paths']={str(k):{f:v[f] for f in ('zone','expected','state','approaching','notes','pressure','asof') if f in v} for k,v in (monitor.get('paths') or {}).items() if isinstance(v,dict)}
+                # Only export real quotes needed by app choices and existing campaigns.
+                expiry=str((packet.get('mapping') or {}).get('selected_expiry') or '')
+                pairs=set()
+                for entry in packet.get('_gpt_entry_reference') or []:
+                    opt=(entry.get('matrix') or {}).get('option_type')
+                    for choice in entry.get('display_choices') or []:
+                        pairs.add((opt,choice.get('strike')))
+                for trade in active:
+                    for item in _sb_active_leg_rows(trade):
+                        leg=item['leg']
+                        if str(leg.get('expiry') or '').upper()==expiry.upper():
+                            pairs.add((str(leg.get('option_type') or '').upper(),_sb_num(leg.get('strike'))))
+                for rec in packet.get('_gpt_campaign_reference') or []:
+                    d=rec.get('decision') or {}
+                    if d.get('target') is not None:pairs.add((d.get('option_type'),d.get('target')))
+                summary['verified_quotes']=[q for opt,strike in sorted(pairs,key=str)
+                    if opt in {'CE','PE'} and strike is not None
+                    for q in [_sb_entry_quote(packet,opt,strike,expiry)] if q]
+                row=_gpt_build_row(packet,rulebook_version=RULEBOOK_VERSION,edge=edge,
+                    edge_live=_edge_live_ok(packet),odme_summary=summary,
+                    assessment=_sb_odme_assessment(packet) if option_enabled else {},
+                    level_map=_sb_combined_level_ladder(packet,packet.get('analysis') or {}) if option_enabled else {},
+                    entries=packet.get('_gpt_entry_reference') or [],
+                    campaigns={'trades':active,'app_management':packet.get('_gpt_campaign_reference') or []},
+                    context={'session':session_status(str(packet.get('instrument') or '')),
+                             'outlook_reference':outlook_ref},
+                    strikes=_sb_live_option_strikes(packet) if option_enabled else [])
+                packet['_gpt_prompt']=_gpt_publish(store,row)
+                packet['_gpt_receipt_status']=row[9]
+            except Exception as exc:
+                st.caption('Ask GPT handoff unavailable ('+type(exc).__name__+'). Existing app analysis is unaffected; scan again to retry.')
+                return
+        url=escape(_gpt_url(packet['_gpt_prompt']),quote=True)
+        st.markdown(f'<a href="{url}" target="_blank" rel="noopener noreferrer" '
+                    'style="display:block;text-align:center;background:#1677e8;color:white;'
+                    'padding:.65rem;border-radius:.5rem;font-weight:600;text-decoration:none;">Ask GPT</a>',
+                    unsafe_allow_html=True)
+        if packet.get('_gpt_receipt_status')!='READY':
+            st.caption('Review only: live data or ODME not verified.')
+        with st.expander('Copy prompt if ChatGPT does not prefill',expanded=False):
+            st.code(packet['_gpt_prompt'],language=None)
+
+
 def render_public_superbrain() -> None:
     """One-screen EDGE + ODME terminal. Existing recording functions remain in place."""
     st.subheader("SuperBrain")
@@ -4388,7 +4470,10 @@ def render_public_superbrain() -> None:
                     st.error('Scan paused: current locked rulebook could not be verified. ' +
                              str(current_gate.get('reason') or f"Version {current_gate.get('version')}, status {current_gate.get('state')}."))
                     return
-                st.session_state.public_superbrain_last=prepare_superbrain_scan(store,instrument)
+                fresh_packet=prepare_superbrain_scan(store,instrument)
+                fresh_packet['_gpt_scan_id']=uuid.uuid4().hex
+                fresh_packet['_gpt_completed_at']=datetime.now(timezone.utc).isoformat()
+                st.session_state.public_superbrain_last=fresh_packet
             except Exception as exc:
                 prior = st.session_state.get('public_superbrain_last')
                 if isinstance(prior, dict):
@@ -4399,14 +4484,18 @@ def render_public_superbrain() -> None:
                 else:
                     st.error(f"Scan failed: {exc}")
                 return
+    gpt_slot=st.empty()  # Blue Ask GPT immediately below Scan, filled after evidence is rendered.
     packet=st.session_state.get("public_superbrain_last")
     if not packet or str(packet.get("instrument"))!=instrument:return
+    packet['_gpt_entry_reference']=[]
+    packet['_gpt_campaign_reference']=[]
     option_enabled = bool((packet.get('mapping') or {}).get('odme_scan_enabled'))
     if packet.get('_scan_failed'):
         st.error('Previous scan shown for historical reference only; the latest refresh failed. '
                  'Live decisions are paused until Scan now succeeds.')
     if not option_enabled:
         _sb_render_edge_cash_terminal(store,instrument,packet)
+        _sb_render_ask_gpt(gpt_slot,store,packet)
         return
     _sb_render_freshness(packet)
     ctx=_sb_authoritative_edge_context(packet)
@@ -4477,6 +4566,7 @@ def render_public_superbrain() -> None:
                 st.warning('**REVIEW** — This exposure is not a managed short CE/PE. Record adjustments manually; no automated protective-level verdict is available.')
             for d in decisions:
                 readout=_sb_campaign_plain_language(trade,d,bias_result,packet)
+                packet['_gpt_campaign_reference'].append({'trade_id':trade.get('trade_id'),'decision':d,'display':readout})
                 st.markdown(f"**Plan:** {readout['status']}")
                 st.write(f"**Behaviour:** {readout['behavior']}")
                 if readout.get('entry_thesis'):
@@ -4511,6 +4601,7 @@ def render_public_superbrain() -> None:
             live_candidates_shown += 1
             md=_sb_setup_md(setup)
             ready=_sb_compact_manual_choices(matrix)
+            packet['_gpt_entry_reference'].append({'setup':setup,'matrix':{k:v for k,v in matrix.items() if k!='level_map'},'display_choices':ready})
             opt=matrix.get('option_type') or _edge_option_for_setup(setup)
             fp = md.get('fp') if isinstance(md.get('fp'), dict) else {}
             side = str(fp.get('side') or '').upper()
@@ -4555,6 +4646,7 @@ def render_public_superbrain() -> None:
         _sb_render_odme(packet)
     with st.expander("Record trade taken (anytime — including WAIT)",expanded=False):
         _sb_render_trade_confirmation(store,instrument,packet)
+    _sb_render_ask_gpt(gpt_slot,store,packet)
 
 def _run_expired_cleanup_once(store: Any, show_notice: bool = True) -> None:
     """Automatically remove finished-expiry ODME snapshots once per India date."""
