@@ -1,15 +1,11 @@
 """Display-only journey quality and immutable pre-arrival forecast journal.
 
 No new trade signal, order, campaign or Telegram authority. Forecasts are
-qualitative hypotheses, not calibrated probabilities. Local archive grows on
-successful live scans; no historical scan is backdated into the journal.
+qualitative hypotheses, not calibrated probabilities. Sheet ledger records
+only genuine live forecasts and outcomes; no raw history duplication.
 """
 from __future__ import annotations
 import json
-import os
-import sqlite3
-from pathlib import Path
-from contextlib import contextmanager
 from typing import Any
 from superbrain_zone_forecast import (_n, _ms, _roles, _current_book, _fmt,
     _tf, fp_event_ledger, forecast_zone_encounter)
@@ -147,73 +143,81 @@ def _quality(edge,z,rows,events,forecast,roles,now):
                 encounter=enc,forecast=forecast,pressure=pressure,asof=now)
 
 
+LEDGER_TAB='SB_JOURNEY_LEDGER'
+LEDGER_HEADERS=['event_key','instrument','record_type','zone_key','forecast_bar','observed_bar','created_ms','version','payload_json']
+
+
+def ledger_row(symbol, kind, zone, bar, observed, created, version, payload):
+    # Stable identity; first issued forecast is immutable even on rerenders.
+    import hashlib
+    identity=json.dumps([symbol,kind,zone,int(bar),int(observed),version],separators=(',',':'))
+    key=hashlib.sha256(identity.encode()).hexdigest()
+    encoded=json.dumps(payload,default=str,separators=(',',':'))
+    if len(encoded)>49000:raise ValueError('Journey ledger payload exceeds cell limit')
+    return [key,symbol,kind,zone,int(bar),int(observed),int(created),version,encoded]
+
+
 class JourneyJournal:
-    """SQLite append-only raw observation/forecast archive; WAL, no fixed cap."""
-    def __init__(self,path=None):
-        self.path=Path(path or os.environ.get('SB_JOURNEY_DB','data/superbrain_journey.sqlite3'))
-        self.path.parent.mkdir(parents=True,exist_ok=True)
-        with self.connect() as c:
-            c.executescript('''CREATE TABLE IF NOT EXISTS obs (symbol TEXT,source TEXT,k TEXT,known INTEGER,payload TEXT, PRIMARY KEY(symbol,source,k));
-                CREATE TABLE IF NOT EXISTS forecasts (symbol TEXT,zone TEXT,bar INTEGER,created INTEGER,version TEXT,payload TEXT,PRIMARY KEY(symbol,zone,bar,version));
-                CREATE TABLE IF NOT EXISTS reconciliation (symbol TEXT,zone TEXT,forecast_bar INTEGER,observed_bar INTEGER,version TEXT,payload TEXT,PRIMARY KEY(symbol,zone,forecast_bar,observed_bar,version));
-                CREATE INDEX IF NOT EXISTS obs_symbol_source ON obs(symbol,source,known);
-                CREATE INDEX IF NOT EXISTS forecast_recent ON forecasts(symbol,created);''')
-    @contextmanager
-    def connect(self):
-        c=sqlite3.connect(self.path,timeout=8)
-        try:
-            c.execute('PRAGMA journal_mode=WAL')
-            with c:yield c
-        finally:c.close()
-    def archive(self,symbol,edge,tape,optional,odme,l2,asof):
-        data=[]
-        def add(source,k,known,r):
-            if known and known<=asof and k:data.append((symbol,source,str(k),known,json.dumps(r,default=str,separators=(',',':'))))
-        current=dict(edge,bar_ms=edge.get('bar_time'),captured_at=asof)
-        for r in list(tape)+[current]:
-            if r.get('synthetic_price_only') or str(r.get('instrument') or '').upper()!=symbol:continue
-            t=_ms(r.get('bar_ms'));known=_ms(r.get('captured_at')) or t
-            if t and t<=asof:add('EDGE',f'{r.get("tf")}|{t}|'+('scan' if r is current else 'tape'),known,r)
-        for r in optional:
-            if str(r.get('instrument') or '').upper()!=symbol:continue
-            t=_ms(r.get('confirmed_close_ms'));known=_ms(r.get('recorded_at')) or t
-            if t and t<=asof:add('OPTIONAL',r.get('observation_key') or f'{r.get("source")}|{r.get("tf")}|{t}',known,r)
-        for r in odme:
-            if str(r.get('instrument') or '').upper()!=symbol:continue
-            t=_ms(r.get('ts'));add('ODME',r.get('snapshot_id') or f'{r.get("expiry")}|{t}',t,r)
-        for r in l2:
-            t=_ms(r.get('known_at'));add('L2',r.get('key') or f'{r.get("tf")}|{r.get("zone_id")}|{r.get("type")}|{r.get("at")}',t,r)
-        with self.connect() as c:
-            c.executemany('INSERT OR IGNORE INTO obs VALUES (?,?,?,?,?)',data)
-    def history(self,symbol,source,asof):
-        with self.connect() as c:return [json.loads(r[0]) for r in c.execute('SELECT payload FROM obs WHERE symbol=? AND source=? AND known<=? ORDER BY known',(symbol,source,asof))]
+    """Append-only Sheet forecast ledger. Existing tapes remain raw history.
+
+    No tab creation, edits, orders, or SQLite dependency in the live app.
+    Duplicate physical rows (e.g. ambiguous network retry/concurrent sessions)
+    are read as one logical record, preserving the earliest recorded forecast.
+    """
+    def __init__(self,store):
+        self.ws=store.sheet.worksheet(LEDGER_TAB)
+        if self.ws.row_values(1)!=LEDGER_HEADERS:
+            raise ValueError('Journey ledger schema mismatch')
+        self.records=None
+
+    def load(self):
+        if self.records is None:
+            rows=self.ws.get_all_values()[1:]
+            records={}
+            for r in rows:
+                if not r or not r[0]:continue
+                if len(r)!=len(LEDGER_HEADERS):raise ValueError('Incomplete journey ledger record')
+                d=dict(zip(LEDGER_HEADERS,r))
+                for f in ('forecast_bar','observed_bar','created_ms'):d[f]=int(d[f])
+                d['payload']=json.loads(d['payload_json'])
+                k=d['event_key']
+                if k not in records or d['created_ms']<records[k]['created_ms']:records[k]=d
+            self.records=records
+        return self.records
+
+    def append(self,row):
+        records=self.load()
+        if row[0] in records:return
+        self.ws.append_row(row,value_input_option='RAW')
+        d=dict(zip(LEDGER_HEADERS,row));d['payload']=json.loads(d['payload_json'])
+        records[row[0]]=d
+
+    def forecasts(self,symbol,bar,asof):
+        records=(d for d in self.load().values() if d['instrument']==symbol and d['record_type']=='FORECAST' and d['version']==VERSION and d['forecast_bar']<bar and d['created_ms']<asof)
+        return sorted(records,key=lambda d:d['created_ms'],reverse=True)
+
     def previous(self,symbol,z,bar,asof):
-        with self.connect() as c:
-            # Only genuinely issued earlier forecasts. Never let an earlier
-            # rerender of the same bar masquerade as pre-arrival guidance.
-            rs=c.execute('SELECT payload FROM forecasts WHERE symbol=? AND zone=? AND bar<? AND created<? AND version=? ORDER BY created DESC',(symbol,_key(z),bar,asof,VERSION))
-            for (p,) in rs:
-                f=json.loads(p)
-                if _matching(f['zone'],z):return f
+        for d in self.forecasts(symbol,bar,asof):
+            f=d['payload']
+            if d['zone_key']==_key(z) and _matching(f['zone'],z):return f
         return None
+
     def recent(self,symbol,bar,asof):
-        with self.connect() as c:
-            rs=c.execute('SELECT payload FROM forecasts WHERE symbol=? AND bar<? AND created<? AND version=? ORDER BY created DESC',(symbol,bar,asof,VERSION))
-            # At most one forecast per overlapping physical zone for current
-            # reconciliation; older issued forecasts remain stored unchanged.
-            result=[]
-            for (p,) in rs:
-                f=json.loads(p);tf=_n(f['zone'].get('tf'))
-                if not tf or bar-f['bar']>8*tf*60000:continue
-                if not any(_matching(x['zone'],f['zone']) for x in result):result.append(f)
-            return result
-    def save_reconciliation(self,symbol,f,now,note):
+        result=[]
+        for d in self.forecasts(symbol,bar,asof):
+            f=d['payload'];tf=_n(f['zone'].get('tf'))
+            if not tf or bar-f['bar']>8*tf*60000:continue
+            if not any(_matching(x['zone'],f['zone']) for x in result):result.append(f)
+        return result
+
+    def save_reconciliation(self,symbol,f,now,note,asof=None):
         if not note:return
-        with self.connect() as c:c.execute('INSERT OR IGNORE INTO reconciliation VALUES (?,?,?,?,?,?)',
-            (symbol,_key(f['zone']),f['bar'],now,VERSION,json.dumps({'forecast':f,'observed_bar':now,'note':note},separators=(',',':'))))
+        payload={'forecast':f,'observed_bar':now,'note':note}
+        self.append(ledger_row(symbol,'RECONCILIATION',_key(f['zone']),f['bar'],now,asof or now,VERSION,payload))
+
     def record(self,symbol,z,bar,asof,q):
         f={'zone':z,'bar':bar,'created':asof,'expected':q['expected'],'notes':q['notes'],'opposing_destination':q.get('opposing_destination'),'resolution':(q.get('forecast') or {}).get('resolution'),'rulebook':RULEBOOK_VERSION,'version':VERSION}
-        with self.connect() as c:c.execute('INSERT OR IGNORE INTO forecasts VALUES (?,?,?,?,?,?)',(symbol,_key(z),bar,asof,VERSION,json.dumps(f,separators=(',',':'))))
+        self.append(ledger_row(symbol,'FORECAST',_key(z),bar,0,asof,VERSION,f))
 
 
 def reconcile(previous,q,now):
@@ -251,13 +255,11 @@ def enhance_outlook(outlook,edge,tape,optional,odme,l2,live_odme,*,journal=None,
     memory_ok=False
     if journal:
         try:
-            journal.archive(symbol,edge,tape,optional,odme,l2,asof)
-            tape=journal.history(symbol,'EDGE',asof)+list(tape)
-            optional=journal.history(symbol,'OPTIONAL',asof)
-            odme=journal.history(symbol,'ODME',asof)
-            l2=journal.history(symbol,'L2',asof)
+            # Raw observations are already in the continuous Sheet tapes.
+            # The journal stores only forecasts/outcomes, never duplicate bars.
+            journal.load()
             memory_ok=True
-        except (OSError,sqlite3.Error,ValueError,TypeError):journal=None
+        except Exception:journal=None
     rows=_rows(edge,tape,asof)
     odme=[r for r in odme if (_ms(r.get('ts')) or asof+1)<=asof]
     # Actual visibility cutoff; only retained observations known by this scan.
@@ -317,15 +319,15 @@ def enhance_outlook(outlook,edge,tape,optional,odme,l2,live_odme,*,journal=None,
         previous=None; memory_note=''
         if journal:
             try:previous=journal.previous(symbol,failed,now,asof)
-            except (sqlite3.Error,OSError,ValueError):memory_ok=False
+            except Exception:memory_ok=False
         if previous and br['at']>previous['created'] and now-previous['bar']<=8*tf*60000:
             if previous['expected']=='REACTION_WATCH':
                 held=any(e['type']=='DEFENCE_CONFIRMED' and _matching(e,failed) and previous['created']<e['at']<br['at'] for e in events)
                 memory_note=(' The earlier reaction occurred, but the zone has now broken.' if held else ' The earlier reaction watch has been invalidated by the confirmed break.')
             elif previous['expected']=='PENETRATION_WATCH':memory_note=' The earlier penetration watch is confirmed by EDGE.'
         if journal and previous and memory_note:
-            try:journal.save_reconciliation(symbol,previous,now,memory_note.strip())
-            except (sqlite3.Error,OSError,ValueError):memory_ok=False
+            try:journal.save_reconciliation(symbol,previous,now,memory_note.strip(),asof)
+            except Exception:memory_ok=False
         first=outlook['commentary'].split('\n\n')[0]
         main=f'**Most likely:** Confirmed break of {failed_name} favours local {"bearish" if bd<0 else "bullish"} continuation towards {dest_name}.'+memory_note
         risk=f'**Alternative route:** Reclaim of the broken zone would challenge continuation.'+(f' Opposing mapped barrier: {_name(alt["zone"])}.' if alt else '')
@@ -340,7 +342,7 @@ def enhance_outlook(outlook,edge,tape,optional,odme,l2,live_odme,*,journal=None,
         try:
             prior=journal.previous(symbol,z,now,asof);recon=reconcile(prior,active,now)
             if active['approaching'] and active['state']=='APPROACH':journal.record(symbol,z,now,asof,active)
-        except (sqlite3.Error,OSError,ValueError):memory_ok=False
+        except Exception:memory_ok=False
     # Reconcile prior encounters even when the next mapped destination has
     # changed. Only actual source events and contiguous closes may add progress.
     if journal:
@@ -363,9 +365,9 @@ def enhance_outlook(outlook,edge,tape,optional,odme,l2,live_odme,*,journal=None,
                             if any(d0*(r['close']-level)>=0 for r in seg):message+=' Its first mapped destination was reached on a recorded close.'
                             else:message+=' The earlier mapped destination was '+_name(target)+'; arrival is not yet established.'
                 if message:
-                    journal.save_reconciliation(symbol,f,now,message)
+                    journal.save_reconciliation(symbol,f,now,message,asof)
                     if not recon or _matching(old,z):recon=message
-        except (sqlite3.Error,OSError,ValueError,TypeError):memory_ok=False
+        except Exception:memory_ok=False
     state=active['state'];expected=active['expected'];pressure=active['pressure'];notes=active['notes']
     # Preserve structural statement and verified live options sentence, but
     # replace verbose duplicated route/forecast sections with a single route.

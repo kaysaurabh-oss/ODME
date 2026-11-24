@@ -4171,12 +4171,12 @@ def _sb_show_market_bias(packet: Dict[str, Any], ctx: Dict[str, Any], healthy: b
                 selected_expiry=str((packet.get('mapping') or {}).get('selected_expiry') or ''),
                 l2_history=packet.get('_sb_l2_journey') or [],
             )
-            # Display-only monitor; journal live observations only. Fail back to
-            # the original narrative if disk or optional memory is unavailable.
+            # Display-only monitor; journal genuine live forecasts only. Fail back to
+            # the original narrative if Sheet ledger or optional memory is unavailable.
             try:
                 journal = None
                 if healthy and not historic:
-                    try: journal = JourneyJournal()
+                    try: journal = JourneyJournal(sb_store)
                     except Exception: pass  # commentary can still use retained Sheet history
                 fresh = _mj_verified_live_odme(edge_row, outlook_odme, str((packet.get('mapping') or {}).get('selected_expiry') or ''))
                 outlook = enhance_outlook(outlook, edge_row, tape, opt_history, odme_history,

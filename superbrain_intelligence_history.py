@@ -20,7 +20,6 @@ OPTIONAL_HEADERS = [
     "bar_ms", "confirmed_close_ms", "price", "state", "change",
     "last_event", "event_ms", "context_json",
 ]
-MAX_SCAN_HISTORY = 15000  # supports EDGE-style 600 per instrument+source across many instruments
 MAX_ODME_HISTORY = 1000000  # load every retained ODME snapshot, then filter by symbol/as-of
 MAX_AGE_MS = 90 * 24 * 3600 * 1000
 
@@ -66,31 +65,45 @@ def read_optional_history(store: Any, instrument: str, edge_row: Dict[str,Any]) 
     """READ ONLY. Return confirmed, nonfuture optional history; no app-side writes.
 
     Read in reverse chunks to avoid fetching a large shared tape unnecessarily.
-    The tape retains up to 600 rows per (instrument, source) upstream.
+    The tape retains up to 5000 rows per (instrument, source) upstream.
     """
     edge_ms=_ms(edge_row.get('bar_time'))
     if not edge_ms:return []
     try:
         ws=store.sheet.worksheet(OPTIONAL_TAB)
         if ws.row_values(1)[:len(OPTIONAL_HEADERS)]!=OPTIONAL_HEADERS:return []
-        count=len(ws.col_values(1))
-        if count<=1:return []
-        out=[]
+        # Index on instrument only; avoid downloading other symbols' JSON.
+        instruments=ws.col_values(3)
+        if len(instruments)<=1:return []
         wanted=str(instrument).upper()
-        end=count
-        floor=2  # Entire retained optional tape; source TF preserved.
-        while end>=floor:
-            start=max(floor,end-1999)
-            rows=ws.get(f'A{start}:M{end}')
-            for v in rows:
-                d={k:v[i] if i<len(v) else '' for i,k in enumerate(OPTIONAL_HEADERS)}
-                t=_ms(d['confirmed_close_ms'])
-                if (str(d['instrument']).upper()==wanted and
-                    str(d['source']).upper() in ('AURORA','LIQUIDITY') and
-                    t and t<=edge_ms):
-                    d['context']=_json_obj(d['context_json'])
-                    out.append(d)
-            end=start-1
+        selected=[i for i,v in enumerate(instruments,1) if i>1 and str(v).upper()==wanted]
+        out=[]
+        # Contiguous ranges reduce HTTP overhead; bridge small gaps safely and
+        # filter again. Cap ranges AND rows per request to bound JSON payload.
+        spans=[]
+        for row in selected:
+            if spans and row-spans[-1][1]<=2 and row-spans[-1][0]<500:
+                spans[-1][1]=row
+            else:spans.append([row,row])
+        batch=[];size=0
+        def consume(ranges):
+            if not ranges:return
+            chunks=ws.batch_get(ranges) if hasattr(ws,'batch_get') else [ws.get(r) for r in ranges]
+            if len(chunks)!=len(ranges):raise ValueError('Incomplete optional history response')
+            for rows in chunks:
+                for v in rows:
+                    d={k:v[i] if i<len(v) else '' for i,k in enumerate(OPTIONAL_HEADERS)}
+                    t=_ms(d['confirmed_close_ms'])
+                    if (str(d['instrument']).upper()==wanted and
+                        str(d['source']).upper() in ('AURORA','LIQUIDITY') and t and t<=edge_ms):
+                        d['context']=_json_obj(d['context_json'])
+                        out.append(d)
+        for first,last in spans:
+            n=last-first+1
+            if batch and (len(batch)>=200 or size+n>2000):
+                consume(batch);batch=[];size=0
+            batch.append(f'A{first}:M{last}');size+=n
+        consume(batch)
         out.sort(key=lambda x:int(x['confirmed_close_ms']))
         # Retain all observed source TFs. Individual optional interpreters
         # still require their own confirmed source/TF chronology.
@@ -1165,7 +1178,7 @@ def _mj_observed_closes(edge: Dict[str,Any], tape: List[Dict[str,Any]]) -> List[
         if t and px and px>0 and t<=now:rows[t]=(t,px,_outlook_side(r.get('exec_of')))
     spot=_num(edge.get('close'))
     if spot and spot>0:rows[now]=(now,spot,_outlook_side(edge.get('exec_of')))
-    return [rows[k] for k in sorted(rows)][-650:]
+    return [rows[k] for k in sorted(rows)][-5000:]
 
 
 def _mj_recent_contiguous(rows: List[tuple], tf: float) -> List[tuple]:

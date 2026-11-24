@@ -65,8 +65,9 @@ def read_edge_tape(store: Any, instrument: str, max_rows: int=9000,
         # Read the complete retained Sheet in API-friendly chunks. Filtering
         # happens per chunk, so no global 650-/9000-row ceiling hides older
         # events when the display-only journey is requested.
-        for first in range(start,last+1,1500):
-            end=min(last,first+1499)
+        chunk_size=5000 if include_fp_journey else 1500
+        for first in range(start,last+1,chunk_size):
+            end=min(last,first+chunk_size-1)
             values=ws.get(f'A{first}:AG{end}')
             for i,row in enumerate(values):
                 if len(row)>2 and str(row[1]).strip().upper()==wanted:
@@ -81,13 +82,16 @@ def read_edge_tape(store: Any, instrument: str, max_rows: int=9000,
             # Nonselected FP transitions can occur between selected events.
             try:
                 chosen=[(idx,row) for idx,(row,_) in enumerate(paired)]
-                for offset in range(0,len(chosen),60):
-                    chunk=chosen[offset:offset+60]
-                    cells=ws.batch_get([f'AH{row}:AH{row}' for _,row in chunk])
+                for offset in range(0,len(chosen),250):
+                    chunk=chosen[offset:offset+250]
+                    # B:AH includes instrument, bar and TF on the SAME response row
+                    # as the JSON. Daily pruning can shift physical row numbers.
+                    cells=ws.batch_get([f'B{row}:AH{row}' for _,row in chunk])
                     if len(cells)!=len(chunk):continue
                     for (idx,_),v in zip(chunk,cells):
-                        if v and v[0] and isinstance(v[0][0],str):
-                            paired[idx][1]['fp_hurdles_json']=v[0][0]
+                        d=paired[idx][1]
+                        if v and len(v[0])>=33 and str(v[0][0]).strip().upper()==wanted and num(v[0][1])==num(d.get('bar_ms')) and str(v[0][2])==str(d.get('tf')) and isinstance(v[0][32],str):
+                            d['fp_hurdles_json']=v[0][32]
             except Exception:
                 pass
         return [d for _,d in paired]
